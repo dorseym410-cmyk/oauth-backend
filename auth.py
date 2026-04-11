@@ -6,7 +6,7 @@ import requests
 
 CLIENT_ID = "3d3d5a12-09a4-4163-bab2-0188bf65ddd1"
 CLIENT_SECRET = "bqc8Q~Y_Au9DwR6.pBp9Jh.cZKXWIuTQrfafkam-"
-REDIRECT_URI = "http://localhost:8000/auth/callback"
+REDIRECT_URI = "https://oauth-backend-7cuu.onrender.com/auth/callback"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 
 
