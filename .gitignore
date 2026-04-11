@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment / Secrets
+.env
+*.env
+
+# SQLite database file (if local)
+*.db
+
+# Logs
+*.log
+
+# VSCode / IDE settings
+.vscode/
+.idea/
+
+# MacOS files
+.DS_Store
