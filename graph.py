@@ -292,3 +292,28 @@ def mark_as_read(user_id, session_id, message_id, is_read=True):
         raise Exception(res.text)
 
     return {"status": "Updated"}
+
+
+# =========================
+# MOVE EMAIL TO FOLDER (FIXED)
+# =========================
+def move_email_to_folder(user_id, session_id, message_id, target_folder_id):
+    access_token = get_valid_token(user_id, session_id)
+
+    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/move"
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "destinationId": target_folder_id
+    }
+
+    res = requests.post(url, headers=headers, json=payload)
+
+    if res.status_code not in [200, 201]:
+        raise Exception(f"Move failed: {res.text}")
+
+    return {"status": "Moved"}

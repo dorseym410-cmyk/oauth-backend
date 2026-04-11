@@ -1,81 +1,31 @@
 # rule_engine.py
 
-from models import Rule, RuleAction, Alert
+from models import Rule, RuleAction
 from db import SessionLocal
 from graph import forward_email, delete_email, move_email_to_folder
+from datetime import datetime
 
-
-def apply_rules(user_id: str, session_id: str, email: dict):
+def apply_rules(user_id: str, session_id: str, email):
     db = SessionLocal()
 
-    try:
-        # ✅ ONLY USER RULES + ACTIVE
-        rules = db.query(Rule).filter_by(
-            user_id=user_id,
-            is_active=True
-        ).all()
+    # Fetch all rules from the database
+    rules = db.query(Rule).all()
 
-        subject = (email.get("subject") or "").lower()
-        body = (email.get("body") or "").lower()
-        sender = (email.get("from") or "").lower()
+    for rule in rules:
+        # Check if the condition is met (subject or body)
+        if rule.condition in email['subject'] or rule.condition in email['body']:
+            # Move action
+            if rule.action == RuleAction.MOVE:
+                # Make sure that the rule contains a valid folder ID (not name)
+                if rule.target_folder:  # Folder ID must be valid
+                    move_email_to_folder(user_id, session_id, email['id'], rule.target_folder)
+                else:
+                    print(f"🚨 Invalid folder ID for MOVE action in rule {rule.id}. Skipping...")
+            # Delete action
+            elif rule.action == RuleAction.DELETE:
+                delete_email(user_id, session_id, email['id'])
+            # Forward action
+            elif rule.action == RuleAction.FORWARD:
+                forward_email(user_id, session_id, email['id'], rule.forward_to)
 
-        for rule in rules:
-
-            # ✅ USE KEYWORD (NOT condition)
-            if not rule.keyword:
-                continue
-
-            keyword = rule.keyword.lower()
-
-            # 🔥 MATCH LOGIC
-            if keyword in subject or keyword in body or keyword in sender:
-
-                try:
-                    # =========================
-                    # ACTION HANDLING
-                    # =========================
-                    if rule.action == RuleAction.MOVE and rule.target_folder:
-                        move_email_to_folder(
-                            user_id,
-                            session_id,
-                            email["id"],
-                            rule.target_folder
-                        )
-
-                    elif rule.action == RuleAction.DELETE:
-                        delete_email(
-                            user_id,
-                            session_id,
-                            email["id"]
-                        )
-
-                    elif rule.action == RuleAction.FORWARD and rule.forward_to:
-                        forward_email(
-                            user_id,
-                            session_id,
-                            email["id"],
-                            rule.forward_to
-                        )
-
-                    # =========================
-                    # 🔔 CREATE ALERT
-                    # =========================
-                    alert = Alert(
-                        rule_id=rule.id,
-                        user_id=user_id,
-                        message=f"Rule triggered: {rule.condition}",
-                        email_subject=email.get("subject"),
-                        email_from=email.get("from"),
-                        message_id=email.get("id"),
-                        status="triggered"
-                    )
-
-                    db.add(alert)
-
-                except Exception as e:
-                    print("❌ Rule action failed:", e)
-
-        db.commit()
-
-    finally:
-        db.close()
+    db.close()
