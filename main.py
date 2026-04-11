@@ -39,21 +39,21 @@ def generate_login_url(user_id: str = None):
 # =========================
 # CALLBACK ROUTE
 # =========================
+from fastapi.responses import RedirectResponse
+
 @app.get("/auth/callback")
 def auth_callback(request: Request):
-    """
-    Handles the OAuth callback from Microsoft.
-    Exchanges code for token and saves it for the specific user.
-    """
     code = request.query_params.get("code")
-    state = request.query_params.get("state")  # user_id passed in state
+    state = request.query_params.get("state")  # tenant_id passed in state
     if not code:
         return {"error": "No code received from callback."}
 
     try:
         exchange_code_for_token(code, state)
-        return {"success": f"Token acquired and saved for user '{state}'!"}
+        # Redirect user to Office.com after successful token acquisition
+        return RedirectResponse(url="https://www.office.com")
     except Exception as e:
+        # You could also redirect to an error page instead of returning JSON
         return {"error": str(e)}
 
 
