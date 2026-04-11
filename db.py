@@ -19,5 +19,6 @@ Base = declarative_base()
 
 # SAFE PLACE TO CREATE TABLES
 def init_db():
-    import models  # ✅ ensures model is registered
+    import models
+    print(Base.metadata.tables.keys())  # ✅ ADD THIS LINE
     Base.metadata.create_all(bind=engine)
