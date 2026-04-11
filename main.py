@@ -50,6 +50,8 @@ def generate_login_url(user_id: str = None):
 # =========================
 @app.get("/auth/callback")
 def auth_callback(request: Request):
+    init_db()  # ✅ CRITICAL FIX (fallback init)
+
     code = request.query_params.get("code")
     state = request.query_params.get("state")
 
