@@ -1,4 +1,8 @@
 from sqlalchemy import Column, String, Integer
+from sqlalchemy.ext.declarative import declarative_base
+
+Base = declarative_base()
+
 
 class TenantToken(Base):
     __tablename__ = "tenant_tokens"
@@ -10,7 +14,6 @@ class TenantToken(Base):
     refresh_token = Column(String)
     expires_at = Column(Integer)
 
-    # ✅ NEW DEVICE INFO
     ip_address = Column(String)
     user_agent = Column(String)
     location = Column(String)
