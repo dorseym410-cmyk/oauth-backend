@@ -8,10 +8,16 @@ engine = create_engine(
     connect_args={"check_same_thread": False}
 )
 
-SessionLocal = sessionmaker(bind=engine)
+# ✅ FIXED (added autocommit + autoflush)
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine
+)
+
 Base = declarative_base()
 
 # SAFE PLACE TO CREATE TABLES
 def init_db():
-    import models
+    import models  # ✅ ensures model is registered
     Base.metadata.create_all(bind=engine)
