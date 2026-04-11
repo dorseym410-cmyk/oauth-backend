@@ -12,13 +12,14 @@ def is_token_expired(token_record):
 
 
 # =========================
-# FETCH EMAILS
+# FETCH EMAILS (UPDATED)
 # =========================
-def fetch_emails(user_id: str, session_id: str = None):
+def fetch_emails(user_id: str, session_id: str = None, folder_id: str = None):
     """
-    Fetch top 50 emails for a given user.
+    Fetch top 10 emails for a given user.
     Automatically refreshes the token if expired.
     Supports multi-device sessions.
+    Supports folder-based fetching.
     """
 
     # Get stored token
@@ -38,7 +39,12 @@ def fetch_emails(user_id: str, session_id: str = None):
         "Accept": "application/json"
     }
 
-    url = "https://graph.microsoft.com/v1.0/me/messages?$top=50&$orderby=receivedDateTime desc"
+    # ✅ NEW: support folders
+    if folder_id:
+        url = f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder_id}/messages?$top=10&$orderby=receivedDateTime desc"
+    else:
+        url = "https://graph.microsoft.com/v1.0/me/messages?$top=10&$orderby=receivedDateTime desc"
+
     response = requests.get(url, headers=headers)
 
     # ✅ Retry if token rejected (edge case)
@@ -64,4 +70,52 @@ def fetch_emails(user_id: str, session_id: str = None):
             "date": e.get("receivedDateTime")
         }
         for e in emails
+    ]
+
+
+# =========================
+# GET MAIL FOLDERS (NEW)
+# =========================
+def get_mail_folders(user_id: str, session_id: str = None):
+    """
+    Fetch all mail folders (Inbox, Sent, Drafts, etc.)
+    """
+
+    token_record = get_token(user_id, session_id)
+    if not token_record:
+        raise Exception("No token found. User must login first.")
+
+    access_token = token_record.access_token
+
+    # Refresh if expired
+    if is_token_expired(token_record):
+        refreshed = refresh_token(user_id, session_id)
+        access_token = refreshed["access_token"]
+
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+
+    url = "https://graph.microsoft.com/v1.0/me/mailFolders"
+    response = requests.get(url, headers=headers)
+
+    # Retry if unauthorized
+    if response.status_code == 401:
+        refreshed = refresh_token(user_id, session_id)
+        access_token = refreshed["access_token"]
+
+        headers["Authorization"] = f"Bearer {access_token}"
+        response = requests.get(url, headers=headers)
+
+    data = response.json()
+
+    if "error" in data:
+        raise Exception(f"Graph API error: {data['error'].get('message')}")
+
+    return [
+        {
+            "id": f.get("id"),
+            "name": f.get("displayName")
+        }
+        for f in data.get("value", [])
     ]
