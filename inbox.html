@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Inbox</title>
+</head>
+<body>
+
+<h2>Inbox</h2>
+
+{% for mail in mails %}
+    <div style="border:1px solid #ccc; padding:10px; margin:10px;">
+        <b>{{ mail.subject }}</b><br>
+        From: {{ mail.from.emailAddress.address if mail.from }}<br>
+        Preview: {{ mail.bodyPreview }}<br><br>
+
+        <a href="/view/{{ id }}/{{ mail.id }}">Open</a>
+    </div>
+{% endfor %}
+
+</body>
+</html>
