@@ -3,8 +3,17 @@ from fastapi.responses import RedirectResponse, JSONResponse
 from auth import generate_login_link, exchange_code_for_token
 from graph import fetch_emails
 from urllib.parse import urlparse, parse_qs
+from db import init_db  # ✅ NEW
 
 app = FastAPI()
+
+
+# =========================
+# STARTUP EVENT (AUTO INIT DB)
+# =========================
+@app.on_event("startup")
+def startup():
+    init_db()
 
 
 # =========================
