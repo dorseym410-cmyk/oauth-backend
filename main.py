@@ -34,14 +34,14 @@ logging.basicConfig(level=logging.DEBUG)
 # CORS (VERY IMPORTANT)
 # =========================
 origins = [
-    "http://localhost:3000",
-    "https://frontend-xg84.onrender.com",  # 🔁 replace if needed
+    "http://localhost:3000",  # Local development (optional)
+    "https://frontend-xg84.onrender.com",  # Your actual Render frontend URL
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=origins,  # Allow frontend URLs
+    allow_credentials=True,  # Ensure credentials are allowed
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -141,13 +141,13 @@ def auth_callback(request: Request):
         response = RedirectResponse(url="https://www.office.com")
 
         response.set_cookie(
-            key="session_id",
-            value=session_id,
-            httponly=True,
-            secure=True,
-            samesite="none",  # 🔥 CRITICAL FOR RENDER
-            path="/",
-        )
+    key="session_id",
+    value=session_id,
+    httponly=True,
+    secure=True,  # Ensure cookies are secure
+    samesite="none",  # For cross-origin requests
+    path="/",  # Make sure it applies to the entire app
+)
 
         logging.debug(f"SESSION COOKIE SET: {session_id}")
 
@@ -214,10 +214,11 @@ def get_emails(request: Request, user_id: str = None):
 # =========================
 @app.get("/folders")
 def get_folders(request: Request, user_id: str = None):
-    require_admin(request)
+    require_admin(request)  # Ensure admin auth middleware or function is working
 
     session_id = request.cookies.get("session_id")
-    logging.debug(f"SESSION IN FOLDERS: {session_id}")
+    if not session_id:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     return {
         "folders": get_mail_folders(
