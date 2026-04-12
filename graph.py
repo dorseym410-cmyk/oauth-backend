@@ -181,3 +181,44 @@ def send_email(user_id, session_id, to, subject, body, files=None):
         raise Exception(res.text)
 
     return {"status": "Email sent"}
+
+# =========================
+# REPLY TO EMAIL
+# =========================
+def reply_to_email(user_id, session_id, message_id, reply_text, files=None):
+    access_token = get_valid_token(user_id, session_id)
+
+    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/reply"
+
+    attachments = []
+
+    if files:
+        for f in files:
+            attachments.append({
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": f["name"],
+                "contentType": f["type"],
+                "contentBytes": f["contentBytes"]
+            })
+
+    payload = {
+        "message": {
+            "body": {
+                "contentType": "HTML",
+                "content": reply_text
+            },
+            "attachments": attachments
+        }
+    }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    res = requests.post(url, headers=headers, json=payload)
+
+    if res.status_code not in [200, 202]:
+        raise Exception(res.text)
+
+    return {"status": "Reply sent with attachments"}
