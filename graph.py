@@ -181,7 +181,7 @@ def send_email(user_id, session_id, to, subject, body, files=None):
     }
 
     headers = {
-        "Authorization": f"Bearer {access_token},
+        "Authorization": f"Bearer {access_token}",  # Fixed line: added closing quote here
         "Content-Type": "application/json"
     }
 
