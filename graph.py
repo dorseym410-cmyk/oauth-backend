@@ -14,17 +14,22 @@ def is_token_expired(token_record):
 
 # =========================
 # HELPER: GET VALID TOKEN
-# =========================
+# Example function to check token expiration
 def get_valid_token(user_id, session_id):
     token_record = get_token(user_id, session_id)
 
     if not token_record:
-        raise Exception("No token found.")
+        raise Exception("No token found. Please login again.")
 
     access_token = token_record.access_token
 
+    # ✅ FIX: refresh if expired
     if is_token_expired(token_record):
         refreshed = refresh_token(user_id, session_id)
+
+        if not refreshed or "access_token" not in refreshed:
+            raise Exception("Token refresh failed. Please re-login.")
+
         access_token = refreshed["access_token"]
 
     return access_token

