@@ -84,7 +84,6 @@ def fetch_emails(user_id, session_id=None, folder_id=None):
             "isRead": e.get("isRead")
         }
         for e in data.get("value", [])
-    ]
 
 
 # =========================
@@ -111,7 +110,6 @@ def get_mail_folders(user_id, session_id=None):
     return [
         {"id": f.get("id"), "name": f.get("displayName")}
         for f in data.get("value", [])
-    ]
 
 
 # =========================
@@ -175,13 +173,13 @@ def send_email(user_id, session_id, to, subject, body, files=None):
         "message": {
             "subject": subject,
             "body": {"contentType": "HTML", "content": body},
-            "toRecipients": [{"emailAddress": {"address": to}}],
+            "toRecipients": [{"emailAddress": {"address": to}}],  # Ensure this is correctly structured
             "attachments": attachments
         }
     }
 
     headers = {
-        "Authorization": f"Bearer {access_token}",  # Fixed line: added closing quote here
+        "Authorization": f"Bearer {access_token}",  # Corrected line
         "Content-Type": "application/json"
     }
 
