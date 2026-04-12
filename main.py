@@ -1,6 +1,7 @@
-from fastapi import FastAPI, Request, WebSocket
+from fastapi import FastAPI, Request, WebSocket, Header, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import logging
 import asyncio
 
@@ -15,16 +16,46 @@ from graph import (
     delete_email,
     mark_as_read,
     get_conversation,
-    move_email_to_folder  # ✅ ADDED
+    move_email_to_folder
 )
-from admin_auth import login_admin, require_admin
+from admin_auth import login_admin
 from urllib.parse import urlparse, parse_qs
 from db import init_db, SessionLocal
 from models import TenantToken, Rule
 from rule_engine import apply_rules
 from alerts import send_telegram_alert
 
+# ✅ JWT
+from jose import jwt, JWTError
+from datetime import datetime, timedelta
+
 app = FastAPI()
+
+# =========================
+# JWT CONFIG
+# =========================
+SECRET_KEY = "super-secret-key-change-this"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+security = HTTPBearer()
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token"
+        )
 
 # =========================
 # LOGGING
@@ -48,12 +79,13 @@ app.add_middleware(
 )
 
 # =========================
-# DEBUG MIDDLEWARE
+# DEBUG
 # =========================
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     logging.debug(f"\n--- REQUEST START ---")
     logging.debug(f"{request.method} {request.url}")
+    logging.debug(f"Headers: {request.headers}")
     logging.debug(f"Cookies: {request.cookies}")
 
     response = await call_next(request)
@@ -71,11 +103,12 @@ def startup():
     init_db()
 
 # =========================
-# ADMIN LOGIN
+# ADMIN LOGIN (JWT)
 # =========================
 @app.post("/admin/login")
 async def admin_login_route(request: Request):
     body = await request.json()
+
     username = body.get("username")
     password = body.get("password")
 
@@ -84,29 +117,12 @@ async def admin_login_route(request: Request):
     if "error" in result:
         return JSONResponse(result, status_code=401)
 
-    response = JSONResponse({"message": "Login successful"})
+    token = create_access_token({"sub": username})
 
-    response.set_cookie(
-        key="admin_session",
-        value="authenticated",
-        httponly=True,
-        secure=True,
-        samesite="None",
-        path="/"
-    )
-
-    logging.debug("ADMIN LOGIN SUCCESS → COOKIE SET")
-
-    return response
-
-# =========================
-# ✅ ADMIN LOGOUT (NEW)
-# =========================
-@app.get("/admin/logout")
-def admin_logout():
-    res = JSONResponse({"message": "Logged out"})
-    res.delete_cookie("admin_session", path="/")
-    return res
+    return {
+        "access_token": token,
+        "token_type": "bearer"
+    }
 
 # =========================
 # MICROSOFT LOGIN
@@ -131,8 +147,6 @@ def auth_callback(request: Request):
 
     code = request.query_params.get("code")
     state = request.query_params.get("state")
-
-    logging.debug(f"AUTH CALLBACK: code={code}, state={state}")
 
     if not code:
         return {"error": "No code received"}
@@ -159,98 +173,64 @@ def auth_callback(request: Request):
             path="/"
         )
 
-        logging.debug(f"SESSION COOKIE SET: {session_id}")
-
         return response
 
     except Exception as e:
-        logging.error(f"AUTH ERROR: {e}")
         return {"error": str(e)}
-
-# =========================
-# SESSION DEBUG
-# =========================
-@app.get("/session")
-def check_session(request: Request):
-    return {
-        "session_id": request.cookies.get("session_id"),
-        "admin": request.cookies.get("admin_session")
-    }
 
 # =========================
 # EMAILS
 # =========================
 @app.get("/emails")
-def get_emails(request: Request, user_id: str = None):
-    require_admin(request)
-
+def get_emails(request: Request, user_id: str = None, user=Depends(verify_token)):
     session_id = request.cookies.get("session_id")
-
-    if not session_id or session_id == "default":
-        return JSONResponse({"error": "No Microsoft session"}, status_code=401)
 
     return {
         "emails": fetch_emails(user_id or "default-user", session_id)
     }
 
-# =========================
-# FOLDERS
-# =========================
 @app.get("/folders")
-def get_folders(request: Request, user_id: str = None):
-    require_admin(request)
-
+def get_folders(request: Request, user_id: str = None, user=Depends(verify_token)):
     session_id = request.cookies.get("session_id")
-
-    if not session_id or session_id == "default":
-        return JSONResponse({"error": "No Microsoft session"}, status_code=401)
 
     return {
         "folders": get_mail_folders(user_id or "default-user", session_id)
     }
 
-# =========================
-# EMAIL DETAIL
-# =========================
 @app.get("/email/{message_id}")
-def email_detail(message_id: str, request: Request, user_id: str = None):
-    require_admin(request)
-
+def email_detail(message_id: str, request: Request, user_id: str = None, user=Depends(verify_token)):
     session_id = request.cookies.get("session_id")
 
     return get_email_detail(user_id or "default-user", session_id, message_id)
 
 # =========================
-# ✅ EMAIL ACTION ROUTES (NEW)
+# EMAIL ACTIONS
 # =========================
 @app.post("/email/reply")
-async def reply_email_route(request: Request):
-    require_admin(request)
+async def reply_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
 
     return reply_to_email(
-        user_id="default-user",
-        session_id=request.cookies.get("session_id"),
-        message_id=body.get("message_id"),
-        reply_text=body.get("reply_text")
+        "default-user",
+        request.cookies.get("session_id"),
+        body.get("message_id"),
+        body.get("reply_text")
     )
 
 @app.post("/email/send")
-async def send_email_route(request: Request):
-    require_admin(request)
+async def send_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
 
     return send_email(
-        user_id="default-user",
-        session_id=request.cookies.get("session_id"),
-        to=body.get("to"),
-        subject=body.get("subject"),
-        body=body.get("body")
+        "default-user",
+        request.cookies.get("session_id"),
+        body.get("to"),
+        body.get("subject"),
+        body.get("body")
     )
 
 @app.post("/email/forward")
-async def forward_email_route(request: Request):
-    require_admin(request)
+async def forward_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
 
     return forward_email(
@@ -261,8 +241,7 @@ async def forward_email_route(request: Request):
     )
 
 @app.post("/email/delete")
-async def delete_email_route(request: Request):
-    require_admin(request)
+async def delete_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
 
     return delete_email(
@@ -272,8 +251,7 @@ async def delete_email_route(request: Request):
     )
 
 @app.post("/email/mark-read")
-async def mark_read_route(request: Request):
-    require_admin(request)
+async def mark_read_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
 
     return mark_as_read(
@@ -284,8 +262,7 @@ async def mark_read_route(request: Request):
     )
 
 @app.post("/email/move")
-async def move_email_route(request: Request):
-    require_admin(request)
+async def move_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
 
     return move_email_to_folder(
@@ -299,9 +276,7 @@ async def move_email_route(request: Request):
 # RULES
 # =========================
 @app.post("/rules")
-async def add_rule(request: Request):
-    require_admin(request)
-
+async def add_rule(request: Request, user=Depends(verify_token)):
     body = await request.json()
     db = SessionLocal()
 
@@ -319,9 +294,7 @@ async def add_rule(request: Request):
     return {"message": "Rule created"}
 
 @app.get("/rules")
-def get_rules(request: Request):
-    require_admin(request)
-
+def get_rules(request: Request, user=Depends(verify_token)):
     db = SessionLocal()
     rules = db.query(Rule).all()
 
