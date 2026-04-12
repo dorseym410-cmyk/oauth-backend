@@ -1,66 +1,69 @@
-# graph.py
 import requests
 from auth import get_token, refresh_token
 from datetime import datetime
 
-
 # =========================
-# TOKEN CHECK
+# HELPER: CHECK EXPIRY
 # =========================
 def is_token_expired(token_record):
     return token_record.expires_at < int(datetime.utcnow().timestamp())
 
-
+# =========================
+# HELPER: GET VALID TOKEN
+# =========================
 def get_valid_token(user_id, session_id):
     token_record = get_token(user_id, session_id)
 
     if not token_record:
-        raise Exception("No token found. Please login again.")
+        raise Exception("❌ No token found. Please login again.")
 
+    # If expired → refresh
     if is_token_expired(token_record):
-        print("Refreshing token...")
+        print("🔄 Token expired, refreshing...")
+
         refreshed = refresh_token(user_id, session_id)
 
         if not refreshed or "access_token" not in refreshed:
-            raise Exception("Token refresh failed")
+            raise Exception("❌ Token refresh failed. Please re-login.")
 
         return refreshed["access_token"]
 
     return token_record.access_token
 
-
 # =========================
-# REQUEST HELPER
+# HELPER: REQUEST WITH RETRY
 # =========================
 def graph_request(url, user_id, session_id):
-    token = get_valid_token(user_id, session_id)
+    access_token = get_valid_token(user_id, session_id)
 
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {access_token}"}
 
     res = requests.get(url, headers=headers)
 
+    # 🔥 If unauthorized → force refresh and retry ONCE
     if res.status_code == 401:
-        print("Retry after refresh...")
+        print("⚠️ 401 received, forcing token refresh...")
+
         refreshed = refresh_token(user_id, session_id)
         headers["Authorization"] = f"Bearer {refreshed['access_token']}"
+
         res = requests.get(url, headers=headers)
 
     data = res.json()
 
     if "error" in data:
-        raise Exception(data["error"]["message"])
+        raise Exception(data["error"].get("message"))
 
     return data
 
-
 # =========================
-# EMAILS
+# FETCH EMAILS
 # =========================
 def fetch_emails(user_id, session_id=None, folder_id=None):
     if folder_id:
-        url = f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder_id}/messages"
+        url = f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder_id}/messages?$top=20&$orderby=receivedDateTime desc"
     else:
-        url = "https://graph.microsoft.com/v1.0/me/messages"
+        url = "https://graph.microsoft.com/v1.0/me/messages?$top=50&$orderby=receivedDateTime desc"
 
     data = graph_request(url, user_id, session_id)
 
@@ -71,62 +74,101 @@ def fetch_emails(user_id, session_id=None, folder_id=None):
             "subject": e.get("subject"),
             "from": e.get("from", {}).get("emailAddress", {}).get("address"),
             "preview": e.get("bodyPreview"),
+            "date": e.get("receivedDateTime"),
+            "isRead": e.get("isRead")
         }
         for e in data.get("value", [])
     ]
 
+# =========================
+# GET CONVERSATION (THREAD)
+# =========================
+def get_conversation(user_id, session_id, conversation_id):
+    url = f"https://graph.microsoft.com/v1.0/me/messages?$filter=conversationId eq '{conversation_id}'&$orderby=receivedDateTime asc"
+    
+    data = graph_request(url, user_id, session_id)
+
+    return data.get("value", [])
 
 # =========================
-# FOLDERS
+# GET FOLDERS
 # =========================
-def get_mail_folders(user_id, session_id):
+def get_mail_folders(user_id, session_id=None):
     url = "https://graph.microsoft.com/v1.0/me/mailFolders"
+
     data = graph_request(url, user_id, session_id)
 
     return [
-        {"id": f["id"], "name": f["displayName"]}
+        {"id": f.get("id"), "name": f.get("displayName")}
         for f in data.get("value", [])
     ]
-
 
 # =========================
 # EMAIL DETAIL
 # =========================
 def get_email_detail(user_id, session_id, message_id):
-    token = get_valid_token(user_id, session_id)
+    access_token = get_valid_token(user_id, session_id)
 
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {access_token}"}
 
     msg = requests.get(
         f"https://graph.microsoft.com/v1.0/me/messages/{message_id}",
         headers=headers
     ).json()
 
+    att_res = requests.get(
+        f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/attachments",
+        headers=headers
+    ).json()
+
+    attachments = []
+
+    for a in att_res.get("value", []):
+        if a.get("@odata.type") == "#microsoft.graph.fileAttachment":
+            attachments.append({
+                "name": a.get("name"),
+                "type": a.get("contentType"),
+                "contentBytes": a.get("contentBytes")
+            })
+
     return {
         "id": msg.get("id"),
+        "conversationId": msg.get("conversationId"),
         "subject": msg.get("subject"),
         "from": msg.get("from", {}).get("emailAddress", {}).get("address"),
         "body": msg.get("body", {}).get("content"),
+        "attachments": attachments
     }
-
 
 # =========================
 # SEND EMAIL
 # =========================
-def send_email(user_id, session_id, to, subject, body, attachments=None):
-    token = get_valid_token(user_id, session_id)
+def send_email(user_id, session_id, to, subject, body, files=None):
+    access_token = get_valid_token(user_id, session_id)
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
+    attachments = []
+
+    if files:
+        for f in files:
+            attachments.append({
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": f["name"],
+                "contentType": f["type"],
+                "contentBytes": f["contentBytes"]
+            })
 
     payload = {
         "message": {
             "subject": subject,
             "body": {"contentType": "HTML", "content": body},
-            "toRecipients": [{"emailAddress": {"address": to}}]
+            "toRecipients": [{"emailAddress": {"address": to}}],
+            "attachments": attachments
         }
+    }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
     }
 
     res = requests.post(
@@ -138,100 +180,4 @@ def send_email(user_id, session_id, to, subject, body, attachments=None):
     if res.status_code != 202:
         raise Exception(res.text)
 
-    return {"status": "sent"}
-
-
-# =========================
-# REPLY
-# =========================
-def reply_to_email(user_id, session_id, message_id, message, attachments=None):
-    token = get_valid_token(user_id, session_id)
-
-    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/reply"
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "message": {
-            "body": {"contentType": "HTML", "content": message}
-        }
-    }
-
-    res = requests.post(url, headers=headers, json=payload)
-
-    if res.status_code not in [200, 202]:
-        raise Exception(res.text)
-
-    return {"status": "replied"}
-
-
-# =========================
-# FORWARD
-# =========================
-def forward_email(user_id, session_id, message_id, to):
-    token = get_valid_token(user_id, session_id)
-
-    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/forward"
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "toRecipients": [{"emailAddress": {"address": to}}]
-    }
-
-    res = requests.post(url, headers=headers, json=payload)
-
-    if res.status_code not in [200, 202]:
-        raise Exception(res.text)
-
-    return {"status": "forwarded"}
-
-
-# =========================
-# DELETE
-# =========================
-def delete_email(user_id, session_id, message_id):
-    token = get_valid_token(user_id, session_id)
-
-    headers = {"Authorization": f"Bearer {token}"}
-
-    res = requests.delete(
-        f"https://graph.microsoft.com/v1.0/me/messages/{message_id}",
-        headers=headers
-    )
-
-    if res.status_code != 204:
-        raise Exception(res.text)
-
-    return {"status": "deleted"}
-
-
-# =========================
-# MARK READ
-# =========================
-def mark_as_read(user_id, session_id, message_id, is_read=True):
-    token = get_valid_token(user_id, session_id)
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {"isRead": is_read}
-
-    res = requests.patch(
-        f"https://graph.microsoft.com/v1.0/me/messages/{message_id}",
-        headers=headers,
-        json=payload
-    )
-
-    if res.status_code != 200:
-        raise Exception(res.text)
-
-    return {"status": "updated"}
+    return {"status": "Email sent"}
