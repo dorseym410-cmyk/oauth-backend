@@ -5,23 +5,29 @@ from datetime import datetime
 
 
 # =========================
-# TOKEN HELPERS
+# HELPER: CHECK EXPIRY
 # =========================
 def is_token_expired(token_record):
     return token_record.expires_at < int(datetime.utcnow().timestamp())
 
 
+# =========================
+# HELPER: GET VALID TOKEN
+# =========================
 def get_valid_token(user_id, session_id):
     token_record = get_token(user_id, session_id)
 
     if not token_record:
-        raise Exception("No token found. Please login again.")
+        raise Exception("❌ No token found. Please login again.")
 
+    # If expired → refresh
     if is_token_expired(token_record):
+        print("🔄 Token expired, refreshing...")
+
         refreshed = refresh_token(user_id, session_id)
 
         if not refreshed or "access_token" not in refreshed:
-            raise Exception("Token refresh failed.")
+            raise Exception("❌ Token refresh failed. Please re-login.")
 
         return refreshed["access_token"]
 
@@ -29,7 +35,7 @@ def get_valid_token(user_id, session_id):
 
 
 # =========================
-# GENERIC REQUEST
+# HELPER: REQUEST WITH RETRY
 # =========================
 def graph_request(url, user_id, session_id):
     access_token = get_valid_token(user_id, session_id)
@@ -38,9 +44,13 @@ def graph_request(url, user_id, session_id):
 
     res = requests.get(url, headers=headers)
 
+    # 🔥 If unauthorized → force refresh and retry ONCE
     if res.status_code == 401:
+        print("⚠️ 401 received, forcing token refresh...")
+
         refreshed = refresh_token(user_id, session_id)
         headers["Authorization"] = f"Bearer {refreshed['access_token']}"
+
         res = requests.get(url, headers=headers)
 
     data = res.json()
@@ -55,6 +65,7 @@ def graph_request(url, user_id, session_id):
 # FETCH EMAILS
 # =========================
 def fetch_emails(user_id, session_id=None, folder_id=None):
+
     if folder_id:
         url = f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder_id}/messages?$top=20&$orderby=receivedDateTime desc"
     else:
@@ -77,10 +88,24 @@ def fetch_emails(user_id, session_id=None, folder_id=None):
 
 
 # =========================
+# GET CONVERSATION
+# =========================
+def get_conversation(user_id, session_id, conversation_id):
+
+    url = f"https://graph.microsoft.com/v1.0/me/messages?$filter=conversationId eq '{conversation_id}'&$orderby=receivedDateTime asc"
+
+    data = graph_request(url, user_id, session_id)
+
+    return data.get("value", [])
+
+
+# =========================
 # GET FOLDERS
 # =========================
 def get_mail_folders(user_id, session_id=None):
+
     url = "https://graph.microsoft.com/v1.0/me/mailFolders"
+
     data = graph_request(url, user_id, session_id)
 
     return [
@@ -90,9 +115,10 @@ def get_mail_folders(user_id, session_id=None):
 
 
 # =========================
-# GET EMAIL DETAIL ✅ FIXED
+# EMAIL DETAIL
 # =========================
 def get_email_detail(user_id, session_id, message_id):
+
     access_token = get_valid_token(user_id, session_id)
 
     headers = {"Authorization": f"Bearer {access_token}"}
@@ -112,25 +138,11 @@ def get_email_detail(user_id, session_id, message_id):
 
 
 # =========================
-# GET CONVERSATION
-# =========================
-def get_conversation(user_id, session_id, conversation_id):
-    url = f"https://graph.microsoft.com/v1.0/me/messages?$filter=conversationId eq '{conversation_id}'&$orderby=receivedDateTime asc"
-
-    data = graph_request(url, user_id, session_id)
-    return data.get("value", [])
-
-
-# =========================
 # SEND EMAIL
 # =========================
-def send_email(user_id, session_id, to, subject, body):
-    access_token = get_valid_token(user_id, session_id)
+def send_email(user_id, session_id, to, subject, body, files=None):
 
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
+    access_token = get_valid_token(user_id, session_id)
 
     payload = {
         "message": {
@@ -138,6 +150,11 @@ def send_email(user_id, session_id, to, subject, body):
             "body": {"contentType": "HTML", "content": body},
             "toRecipients": [{"emailAddress": {"address": to}}]
         }
+    }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
     }
 
     res = requests.post(
@@ -149,21 +166,17 @@ def send_email(user_id, session_id, to, subject, body):
     if res.status_code != 202:
         raise Exception(res.text)
 
-    return {"status": "sent"}
+    return {"status": "Email sent"}
 
 
 # =========================
 # REPLY EMAIL
 # =========================
-def reply_to_email(user_id, session_id, message_id, reply_text):
+def reply_to_email(user_id, session_id, message_id, reply_text, files=None):
+
     access_token = get_valid_token(user_id, session_id)
 
     url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/reply"
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
 
     payload = {
         "message": {
@@ -174,29 +187,35 @@ def reply_to_email(user_id, session_id, message_id, reply_text):
         }
     }
 
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
     res = requests.post(url, headers=headers, json=payload)
 
     if res.status_code not in [200, 202]:
         raise Exception(res.text)
 
-    return {"status": "replied"}
+    return {"status": "Reply sent"}
 
 
 # =========================
 # FORWARD EMAIL
 # =========================
 def forward_email(user_id, session_id, message_id, to):
+
     access_token = get_valid_token(user_id, session_id)
 
     url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/forward"
 
+    payload = {
+        "toRecipients": [{"emailAddress": {"address": to}}]
+    }
+
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json"
-    }
-
-    payload = {
-        "toRecipients": [{"emailAddress": {"address": to}}]
     }
 
     res = requests.post(url, headers=headers, json=payload)
@@ -204,13 +223,14 @@ def forward_email(user_id, session_id, message_id, to):
     if res.status_code not in [200, 202]:
         raise Exception(res.text)
 
-    return {"status": "forwarded"}
+    return {"status": "Forwarded"}
 
 
 # =========================
 # DELETE EMAIL
 # =========================
 def delete_email(user_id, session_id, message_id):
+
     access_token = get_valid_token(user_id, session_id)
 
     url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}"
@@ -222,13 +242,14 @@ def delete_email(user_id, session_id, message_id):
     if res.status_code != 204:
         raise Exception(res.text)
 
-    return {"status": "deleted"}
+    return {"status": "Deleted"}
 
 
 # =========================
-# MARK READ
+# MARK READ / UNREAD
 # =========================
 def mark_as_read(user_id, session_id, message_id, is_read=True):
+
     access_token = get_valid_token(user_id, session_id)
 
     url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}"
@@ -245,4 +266,30 @@ def mark_as_read(user_id, session_id, message_id, is_read=True):
     if res.status_code != 200:
         raise Exception(res.text)
 
-    return {"status": "updated"}
+    return {"status": "Updated"}
+
+
+# =========================
+# MOVE EMAIL TO FOLDER (🔥 ADDED)
+# =========================
+def move_email_to_folder(user_id, session_id, message_id, target_folder_id):
+
+    access_token = get_valid_token(user_id, session_id)
+
+    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/move"
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "destinationId": target_folder_id
+    }
+
+    res = requests.post(url, headers=headers, json=payload)
+
+    if res.status_code not in [200, 201]:
+        raise Exception(f"Move failed: {res.text}")
+
+    return {"status": "Moved"}
