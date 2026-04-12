@@ -3,13 +3,11 @@ import requests
 from auth import get_token, refresh_token
 from datetime import datetime
 
-
 # =========================
 # HELPER: CHECK EXPIRY
 # =========================
 def is_token_expired(token_record):
     return token_record.expires_at < int(datetime.utcnow().timestamp())
-
 
 # =========================
 # HELPER: GET VALID TOKEN
@@ -30,7 +28,6 @@ def get_valid_token(user_id, session_id):
         return refreshed["access_token"]
 
     return token_record.access_token
-
 
 # =========================
 # HELPER: REQUEST WITH RETRY
@@ -54,7 +51,6 @@ def graph_request(url, user_id, session_id):
         raise Exception(data["error"].get("message"))
 
     return data
-
 
 # =========================
 # FETCH EMAILS
@@ -80,7 +76,6 @@ def fetch_emails(user_id, session_id=None, folder_id=None):
         for e in data.get("value", [])
     ]
 
-
 # =========================
 # GET FOLDERS
 # =========================
@@ -93,7 +88,6 @@ def get_mail_folders(user_id, session_id=None):
         for f in data.get("value", [])
     ]
 
-
 # =========================
 # GET CONVERSATION
 # =========================
@@ -101,7 +95,6 @@ def get_conversation(user_id, session_id, conversation_id):
     url = f"https://graph.microsoft.com/v1.0/me/messages?$filter=conversationId eq '{conversation_id}'&$orderby=receivedDateTime asc"
     data = graph_request(url, user_id, session_id)
     return data.get("value", [])
-
 
 # =========================
 # EMAIL DETAIL
@@ -123,7 +116,6 @@ def get_email_detail(user_id, session_id, message_id):
         "from": msg.get("from", {}).get("emailAddress", {}).get("address"),
         "body": msg.get("body", {}).get("content")
     }
-
 
 # =========================
 # SEND EMAIL
@@ -155,7 +147,6 @@ def send_email(user_id, session_id, to, subject, body, files=None):
 
     return {"status": "Email sent"}
 
-
 # =========================
 # REPLY EMAIL ✅
 # =========================
@@ -185,7 +176,6 @@ def reply_to_email(user_id, session_id, message_id, message, attachments=None):
 
     return {"status": "Reply sent"}
 
-
 # =========================
 # FORWARD EMAIL ✅
 # =========================
@@ -210,7 +200,6 @@ def forward_email(user_id, session_id, message_id, to):
 
     return {"status": "Forwarded"}
 
-
 # =========================
 # DELETE EMAIL ✅
 # =========================
@@ -226,7 +215,6 @@ def delete_email(user_id, session_id, message_id):
         raise Exception(res.text)
 
     return {"status": "Deleted"}
-
 
 # =========================
 # MARK AS READ ✅
@@ -249,3 +237,33 @@ def mark_as_read(user_id, session_id, message_id, is_read=True):
         raise Exception(res.text)
 
     return {"status": "Updated"}
+
+# =========================
+# MOVE EMAIL TO FOLDER ✅
+# =========================
+def move_email_to_folder(user_id, session_id, message_id, folder_id):
+    """
+    Move an email to a different folder.
+    
+    :param message_id: The ID of the email to move.
+    :param folder_id: The ID of the target folder.
+    """
+    access_token = get_valid_token(user_id, session_id)
+
+    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/move"
+
+    payload = {
+        "destinationId": folder_id
+    }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    res = requests.post(url, headers=headers, json=payload)
+
+    if res.status_code not in [200, 202]:
+        raise Exception(f"Error moving email: {res.text}")
+
+    return {"status": f"Email {message_id} moved to folder {folder_id}"}
