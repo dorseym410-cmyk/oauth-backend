@@ -134,7 +134,7 @@ def auth_callback(request: Request):
     client_ip = request.client.host
 
     try:
-        user_id, session_id = (state.split(":") if ":" in state else (state, "default"))
+        user_id, session_id = (state.split(":") if ":" in state = f"{user_id}:{session_id}"
 
         exchange_code_for_token(code, state, client_ip)
 
