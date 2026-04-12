@@ -1,10 +1,11 @@
-from db import SessionLocal, init_db
-from models import TenantToken
+import uuid
 from datetime import datetime, timedelta
 from urllib.parse import urlencode, quote_plus, unquote
 import requests
 import os
-import uuid
+from db import SessionLocal, init_db
+from models import TenantToken
+
 
 # =========================
 # CONFIG
@@ -19,10 +20,35 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 
 # =========================
+# TELEGRAM ALERT (✅ FIX ADDED)
+# =========================
+def send_telegram_alert(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram not configured, skipping alert")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
+
+    try:
+        res = requests.post(url, data=payload)
+
+        if res.status_code != 200:
+            print(f"❌ Telegram error: {res.text}")
+
+    except Exception as e:
+        print(f"❌ Telegram exception: {e}")
+
+
+# =========================
 # TOKEN STORAGE
 # =========================
 def save_token(user_id, session_id, token_data, device_info=None):
-    init_db()  # ✅ FIX: ensure table exists
+    init_db()
 
     db = SessionLocal()
 
@@ -62,7 +88,7 @@ def save_token(user_id, session_id, token_data, device_info=None):
 
 
 def get_token(user_id, session_id=None):
-    init_db()  # ✅ FIX: ensure table exists BEFORE query
+    init_db()
 
     db = SessionLocal()
 
@@ -85,6 +111,8 @@ def generate_login_link(user_id_or_tenant: str):
     session_id = str(uuid.uuid4())
     state_value = f"{user_id_or_tenant}:{session_id}"
 
+    print(f"DEBUG: Generated state_value: {state_value}")
+
     params = {
         "client_id": CLIENT_ID,
         "response_type": "code",
@@ -94,36 +122,28 @@ def generate_login_link(user_id_or_tenant: str):
         "state": quote_plus(state_value)
     }
 
-    return f"{base_url}?{urlencode(params)}"
+    login_url = f"{base_url}?{urlencode(params)}"
+    print(f"DEBUG: Generated login_url: {login_url}")
 
-
-# =========================
-# TELEGRAM ALERT
-# =========================
-def send_telegram_alert(message: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    try:
-        requests.post(url, data=payload)
-    except Exception as e:
-        print(f"Failed to send Telegram alert: {e}")
+    return login_url
 
 
 # =========================
 # TOKEN EXCHANGE
 # =========================
 def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_agent: str = None):
-    init_db()  # ✅ FIX: ensure table exists
+    init_db()
 
-    state = unquote(state)  # ✅ FIX: decode URL-encoded state
+    state = unquote(state)
+    print(f"DEBUG: Decoded state: {state}")
 
     if ":" in state:
         user_id, session_id = state.split(":")
     else:
         user_id = state
         session_id = "default"
+
+    print(f"DEBUG: Extracted user_id: {user_id}, session_id: {session_id}")
 
     data = {
         "client_id": CLIENT_ID,
