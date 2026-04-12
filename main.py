@@ -139,8 +139,8 @@ def auth_callback(request: Request):
             key="session_id",
             value=session_id,
             httponly=True,
-            secure=True,  # Secure cookies (for production with HTTPS)
-            samesite="none",  # This is required for cross-origin requests
+            secure=True,  # Ensure cookies are secure
+            samesite="none",  # Needed for cross-origin requests
             path="/",
         )
 
