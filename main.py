@@ -3,7 +3,6 @@ from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import logging
-import asyncio
 
 from auth import generate_login_link, exchange_code_for_token
 from graph import (
@@ -19,11 +18,8 @@ from graph import (
     move_email_to_folder
 )
 from admin_auth import login_admin
-from urllib.parse import urlparse, parse_qs
 from db import init_db, SessionLocal
-from models import TenantToken, Rule
-from rule_engine import apply_rules
-from alerts import send_telegram_alert
+from models import Rule
 
 # ✅ JWT
 from jose import jwt, JWTError
@@ -86,7 +82,6 @@ async def log_requests(request: Request, call_next):
     logging.debug(f"\n--- REQUEST START ---")
     logging.debug(f"{request.method} {request.url}")
     logging.debug(f"Headers: {request.headers}")
-    logging.debug(f"Cookies: {request.cookies}")
 
     response = await call_next(request)
 
@@ -125,21 +120,18 @@ async def admin_login_route(request: Request):
     }
 
 # =========================
-# MICROSOFT LOGIN
+# MICROSOFT LOGIN (JWT-BASED)
 # =========================
 @app.get("/login")
-def login(user_id: str = None):
-    return RedirectResponse(generate_login_link(user_id or "default-user"))
+def login(user=Depends(verify_token)):
+    user_id = user["sub"]
+    return RedirectResponse(generate_login_link(user_id))
 
 @app.get("/generate-login-url")
-def generate_login_url(user_id: str = None):
-    login_url = generate_login_link(user_id or "default-user")
-
-    parsed = urlparse(login_url)
-    state = parse_qs(parsed.query).get("state", [""])[0]
-    session_id = state.split(":")[1] if ":" in state else "default"
-
-    return {"login_url": login_url, "session_id": session_id}
+def generate_login_url(user=Depends(verify_token)):
+    user_id = user["sub"]
+    login_url = generate_login_link(user_id)
+    return {"login_url": login_url}
 
 @app.get("/auth/callback")
 def auth_callback(request: Request):
@@ -154,26 +146,10 @@ def auth_callback(request: Request):
     client_ip = request.client.host
 
     try:
-        if ":" in state:
-            user_id, session_id = state.split(":")
-        else:
-            user_id = state
-            session_id = "default"
-
+        # state IS user_id now
         exchange_code_for_token(code, state, client_ip)
 
-        response = RedirectResponse(url="https://www.office.com")
-
-        response.set_cookie(
-            key="session_id",
-            value=session_id,
-            httponly=True,
-            secure=True,
-            samesite="None",
-            path="/"
-        )
-
-        return response
+        return RedirectResponse(url="https://www.office.com")
 
     except Exception as e:
         return {"error": str(e)}
@@ -182,48 +158,48 @@ def auth_callback(request: Request):
 # EMAILS
 # =========================
 @app.get("/emails")
-def get_emails(request: Request, user_id: str = None, user=Depends(verify_token)):
-    session_id = request.cookies.get("session_id")
+def get_emails(user=Depends(verify_token)):
+    user_id = user["sub"]
 
     return {
-        "emails": fetch_emails(user_id or "default-user", session_id)
+        "emails": fetch_emails(user_id)
     }
 
 @app.get("/folders")
-def get_folders(request: Request, user_id: str = None, user=Depends(verify_token)):
-    session_id = request.cookies.get("session_id")
+def get_folders(user=Depends(verify_token)):
+    user_id = user["sub"]
 
     return {
-        "folders": get_mail_folders(user_id or "default-user", session_id)
+        "folders": get_mail_folders(user_id)
     }
 
 @app.get("/email/{message_id}")
-def email_detail(message_id: str, request: Request, user_id: str = None, user=Depends(verify_token)):
-    session_id = request.cookies.get("session_id")
+def email_detail(message_id: str, user=Depends(verify_token)):
+    user_id = user["sub"]
 
-    return get_email_detail(user_id or "default-user", session_id, message_id)
+    return get_email_detail(user_id, message_id)
 
 # =========================
 # EMAIL ACTIONS
 # =========================
 @app.post("/email/reply")
 async def reply_email_route(request: Request, user=Depends(verify_token)):
+    user_id = user["sub"]
     body = await request.json()
 
     return reply_to_email(
-        "default-user",
-        request.cookies.get("session_id"),
+        user_id,
         body.get("message_id"),
         body.get("reply_text")
     )
 
 @app.post("/email/send")
 async def send_email_route(request: Request, user=Depends(verify_token)):
+    user_id = user["sub"]
     body = await request.json()
 
     return send_email(
-        "default-user",
-        request.cookies.get("session_id"),
+        user_id,
         body.get("to"),
         body.get("subject"),
         body.get("body")
@@ -231,43 +207,43 @@ async def send_email_route(request: Request, user=Depends(verify_token)):
 
 @app.post("/email/forward")
 async def forward_email_route(request: Request, user=Depends(verify_token)):
+    user_id = user["sub"]
     body = await request.json()
 
     return forward_email(
-        "default-user",
-        request.cookies.get("session_id"),
+        user_id,
         body.get("message_id"),
         body.get("to")
     )
 
 @app.post("/email/delete")
 async def delete_email_route(request: Request, user=Depends(verify_token)):
+    user_id = user["sub"]
     body = await request.json()
 
     return delete_email(
-        "default-user",
-        request.cookies.get("session_id"),
+        user_id,
         body.get("message_id")
     )
 
 @app.post("/email/mark-read")
 async def mark_read_route(request: Request, user=Depends(verify_token)):
+    user_id = user["sub"]
     body = await request.json()
 
     return mark_as_read(
-        "default-user",
-        request.cookies.get("session_id"),
+        user_id,
         body.get("message_id"),
         body.get("is_read", True)
     )
 
 @app.post("/email/move")
 async def move_email_route(request: Request, user=Depends(verify_token)):
+    user_id = user["sub"]
     body = await request.json()
 
     return move_email_to_folder(
-        "default-user",
-        request.cookies.get("session_id"),
+        user_id,
         body.get("message_id"),
         body.get("folder_id")
     )
@@ -294,7 +270,7 @@ async def add_rule(request: Request, user=Depends(verify_token)):
     return {"message": "Rule created"}
 
 @app.get("/rules")
-def get_rules(request: Request, user=Depends(verify_token)):
+def get_rules(user=Depends(verify_token)):
     db = SessionLocal()
     rules = db.query(Rule).all()
 
