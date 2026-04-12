@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware  # Import CORSMiddleware
 from auth import generate_login_link, exchange_code_for_token
 from graph import (
     fetch_emails,
@@ -21,6 +22,22 @@ from alerts import send_telegram_alert
 import asyncio
 
 app = FastAPI()
+
+# =========================
+# CORS CONFIGURATION (ENABLE FRONTEND ON RENDER)
+# =========================
+origins = [
+    "http://localhost:3000",  # Local development (optional)
+    "https://frontend-xg84.onrender.com",  # Replace with your actual Render frontend URL
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  # Allow frontend URLs
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # =========================
 # WEBSOCKET (REAL-TIME ALERTS)
@@ -122,8 +139,8 @@ def auth_callback(request: Request):
             key="session_id",
             value=session_id,
             httponly=True,
-            secure=True,
-            samesite="lax",
+            secure=True,  # Secure cookies (for production with HTTPS)
+            samesite="none",  # This is required for cross-origin requests
             path="/",
         )
 
@@ -322,84 +339,3 @@ async def mark_read(message_id: str, request: Request, user_id: str = None):
         body.get("isRead", True)
     )
 
-
-# =========================
-# RULES (DB)
-# =========================
-@app.post("/rules")
-async def add_rule(request: Request):
-    require_admin(request)
-
-    body = await request.json()
-    db = SessionLocal()
-
-    rule = Rule(
-        condition=body.get("condition"),
-        action=body.get("action"),
-        target_folder=body.get("target_folder"),
-        forward_to=body.get("forward_to")
-    )
-
-    db.add(rule)
-    db.commit()
-    db.close()
-
-    return {"message": "Rule created"}
-
-
-@app.get("/rules")
-def get_rules(request: Request):
-    require_admin(request)
-
-    db = SessionLocal()
-    rules = db.query(Rule).all()
-
-    result = [{
-        "id": r.id,
-        "condition": r.condition,
-        "action": r.action.value,
-        "target_folder": r.target_folder,
-        "forward_to": r.forward_to
-    } for r in rules]
-
-    db.close()
-    return {"rules": result}
-
-
-# =========================
-# DEVICES
-# =========================
-@app.get("/devices")
-def get_devices(request: Request, user_id: str):
-    require_admin(request)
-
-    db = SessionLocal()
-    sessions = db.query(TenantToken).filter_by(tenant_id=user_id).all()
-
-    result = [{
-        "session_id": s.session_id,
-        "ip": s.ip_address,
-        "device": s.user_agent,
-        "location": s.location,
-        "expires_at": s.expires_at
-    } for s in sessions]
-
-    db.close()
-    return {"devices": result}
-
-
-@app.delete("/devices/{session_id}")
-def delete_device(session_id: str, request: Request, user_id: str):
-    require_admin(request)
-
-    db = SessionLocal()
-
-    db.query(TenantToken).filter_by(
-        tenant_id=user_id,
-        session_id=session_id
-    ).delete()
-
-    db.commit()
-    db.close()
-
-    return {"message": "Device removed"}
