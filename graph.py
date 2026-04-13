@@ -2,6 +2,7 @@
 import requests
 from auth import get_token, refresh_token
 from datetime import datetime
+from urllib.parse import quote
 
 
 # =========================
@@ -64,7 +65,6 @@ def graph_request(method, url, user_id, json=None):
 
     res = requests.request(method, url, headers=headers, json=json)
 
-    # Retry once on 401 after refresh
     if res.status_code == 401:
         print("⚠️ 401 received, forcing token refresh...")
         refreshed = refresh_token(user_id)
@@ -83,9 +83,10 @@ def graph_request(method, url, user_id, json=None):
 # =========================
 def fetch_emails(user_id, folder_id=None):
     if folder_id:
+        safe_folder_id = quote(folder_id, safe="")
         url = (
             f"https://graph.microsoft.com/v1.0/me/mailFolders/"
-            f"{folder_id}/messages?$top=20&$orderby=receivedDateTime desc"
+            f"{safe_folder_id}/messages?$top=20&$orderby=receivedDateTime desc"
         )
     else:
         url = "https://graph.microsoft.com/v1.0/me/messages?$top=50&$orderby=receivedDateTime desc"
@@ -136,7 +137,8 @@ def get_mail_folders(user_id):
 # EMAIL DETAIL
 # =========================
 def get_email_detail(user_id, message_id):
-    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}"
+    safe_message_id = quote(message_id, safe="")
+    url = f"https://graph.microsoft.com/v1.0/me/messages/{safe_message_id}"
     msg = graph_request("GET", url, user_id)
 
     return {
@@ -190,7 +192,8 @@ def send_email(user_id, to, subject, body, files=None):
 # REPLY EMAIL
 # =========================
 def reply_to_email(user_id, message_id, reply_text, files=None):
-    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/reply"
+    safe_message_id = quote(message_id, safe="")
+    url = f"https://graph.microsoft.com/v1.0/me/messages/{safe_message_id}/reply"
 
     payload = {
         "message": {
@@ -229,7 +232,8 @@ def reply_to_email(user_id, message_id, reply_text, files=None):
 # FORWARD EMAIL
 # =========================
 def forward_email(user_id, message_id, to):
-    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/forward"
+    safe_message_id = quote(message_id, safe="")
+    url = f"https://graph.microsoft.com/v1.0/me/messages/{safe_message_id}/forward"
 
     payload = {
         "toRecipients": [{"emailAddress": {"address": to}}]
@@ -263,7 +267,8 @@ def forward_email(user_id, message_id, to):
 # DELETE EMAIL
 # =========================
 def delete_email(user_id, message_id):
-    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}"
+    safe_message_id = quote(message_id, safe="")
+    url = f"https://graph.microsoft.com/v1.0/me/messages/{safe_message_id}"
 
     access_token = get_valid_token(user_id)
     headers = {"Authorization": f"Bearer {access_token}"}
@@ -290,7 +295,8 @@ def delete_email(user_id, message_id):
 # MARK READ / UNREAD
 # =========================
 def mark_as_read(user_id, message_id, is_read=True):
-    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}"
+    safe_message_id = quote(message_id, safe="")
+    url = f"https://graph.microsoft.com/v1.0/me/messages/{safe_message_id}"
 
     payload = {"isRead": is_read}
 
@@ -322,7 +328,8 @@ def mark_as_read(user_id, message_id, is_read=True):
 # MOVE EMAIL TO FOLDER
 # =========================
 def move_email_to_folder(user_id, message_id, target_folder_id):
-    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/move"
+    safe_message_id = quote(message_id, safe="")
+    url = f"https://graph.microsoft.com/v1.0/me/messages/{safe_message_id}/move"
 
     payload = {
         "destinationId": target_folder_id
