@@ -18,6 +18,9 @@ TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+# keep legacy DB column satisfied
+DEFAULT_SESSION_ID = "jwt-only"
+
 
 # =========================
 # TELEGRAM ALERT
@@ -45,58 +48,70 @@ def send_telegram_alert(message: str):
 
 
 # =========================
-# TOKEN STORAGE (JWT-ONLY)
+# TOKEN STORAGE (JWT-ONLY, LEGACY DB SAFE)
 # =========================
 def save_token(user_id, token_data, device_info=None):
     init_db()
 
     db = SessionLocal()
 
-    expires_at = int(
-        (datetime.utcnow() + timedelta(seconds=token_data["expires_in"])).timestamp()
-    )
+    try:
+        expires_at = int(
+            (datetime.utcnow() + timedelta(seconds=token_data["expires_in"])).timestamp()
+        )
 
-    # 🔥 Only ONE token per user now
-    existing = db.query(TenantToken).filter_by(
-        tenant_id=user_id
-    ).first()
+        existing = db.query(TenantToken).filter_by(
+            tenant_id=user_id
+        ).first()
 
-    if existing:
-        existing.access_token = token_data["access_token"]
-        existing.refresh_token = token_data.get("refresh_token") or existing.refresh_token
-        existing.expires_at = expires_at
+        if existing:
+            existing.access_token = token_data["access_token"]
+            existing.refresh_token = token_data.get("refresh_token") or existing.refresh_token
+            existing.expires_at = expires_at
 
-        if device_info:
-            existing.ip_address = device_info.get("ip")
-            existing.user_agent = device_info.get("agent")
-            existing.location = device_info.get("location")
+            # legacy schema support
+            if hasattr(existing, "session_id") and not existing.session_id:
+                existing.session_id = DEFAULT_SESSION_ID
 
-    else:
-        db.add(TenantToken(
-            tenant_id=user_id,
-            access_token=token_data["access_token"],
-            refresh_token=token_data.get("refresh_token"),
-            expires_at=expires_at,
-            ip_address=device_info.get("ip") if device_info else None,
-            user_agent=device_info.get("agent") if device_info else None,
-            location=device_info.get("location") if device_info else None
-        ))
+            if device_info:
+                existing.ip_address = device_info.get("ip")
+                existing.user_agent = device_info.get("agent")
+                existing.location = device_info.get("location")
 
-    db.commit()
-    db.close()
+        else:
+            new_row = TenantToken(
+                tenant_id=user_id,
+                access_token=token_data["access_token"],
+                refresh_token=token_data.get("refresh_token"),
+                expires_at=expires_at,
+                ip_address=device_info.get("ip") if device_info else None,
+                user_agent=device_info.get("agent") if device_info else None,
+                location=device_info.get("location") if device_info else None
+            )
+
+            # legacy schema support
+            if hasattr(new_row, "session_id"):
+                new_row.session_id = DEFAULT_SESSION_ID
+
+            db.add(new_row)
+
+        db.commit()
+
+    finally:
+        db.close()
 
 
 def get_token(user_id):
     init_db()
 
     db = SessionLocal()
-
-    token = db.query(TenantToken).filter_by(
-        tenant_id=user_id
-    ).first()
-
-    db.close()
-    return token
+    try:
+        token = db.query(TenantToken).filter_by(
+            tenant_id=user_id
+        ).first()
+        return token
+    finally:
+        db.close()
 
 
 # =========================
@@ -105,7 +120,7 @@ def get_token(user_id):
 def generate_login_link(user_id: str):
     base_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
 
-    state_value = user_id  # 🔥 no session_id anymore
+    state_value = user_id
 
     print(f"DEBUG: Generated state_value: {state_value}")
 
@@ -116,8 +131,6 @@ def generate_login_link(user_id: str):
         "response_mode": "query",
         "scope": "User.Read Mail.Read Mail.ReadWrite offline_access",
         "state": quote_plus(state_value),
-
-        # 🔥 FORCE Microsoft login every time (optional but useful)
         "prompt": "select_account"
     }
 
@@ -134,7 +147,7 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
     init_db()
 
     state = unquote(state)
-    user_id = state  # 🔥 state is now just user_id
+    user_id = state
 
     print(f"DEBUG: Extracted user_id: {user_id}")
 
@@ -160,7 +173,7 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
             if loc_resp.ok:
                 loc = loc_resp.json()
                 location_str = f"{loc.get('city')}, {loc.get('region')}, {loc.get('country')}"
-        except:
+        except Exception:
             pass
 
     device_info = {
@@ -175,7 +188,7 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
     try:
         graph_resp = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers)
         email = graph_resp.json().get("userPrincipalName", "unknown")
-    except:
+    except Exception:
         email = "unknown"
 
     message = (
