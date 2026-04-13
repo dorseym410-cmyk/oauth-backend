@@ -18,19 +18,16 @@ from graph import (
 )
 from admin_auth import login_admin
 from db import init_db, SessionLocal
-from models import Rule, TenantToken, RuleAction
+from models import Rule, TenantToken, RuleAction, SavedUser
 
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
 
 app = FastAPI()
 
-# =========================
-# JWT CONFIG
-# =========================
 SECRET_KEY = "super-secret-key-change-this"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 10080  # 7 days
+ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 
 security = HTTPBearer()
 
@@ -58,14 +55,8 @@ def resolve_user_id(requested_user_id: str | None, user_payload: dict) -> str:
     return requested_user_id or user_payload["sub"]
 
 
-# =========================
-# LOGGING
-# =========================
 logging.basicConfig(level=logging.DEBUG)
 
-# =========================
-# CORS
-# =========================
 origins = [
     "http://localhost:3000",
     "https://frontend-xg84.onrender.com",
@@ -79,9 +70,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
-# DEBUG MIDDLEWARE
-# =========================
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     logging.debug("\n--- REQUEST START ---")
@@ -96,17 +84,11 @@ async def log_requests(request: Request, call_next):
     return response
 
 
-# =========================
-# STARTUP
-# =========================
 @app.on_event("startup")
 def startup():
     init_db()
 
 
-# =========================
-# ADMIN LOGIN (JWT)
-# =========================
 @app.post("/admin/login")
 async def admin_login_route(request: Request):
     try:
@@ -130,9 +112,6 @@ async def admin_login_route(request: Request):
     }
 
 
-# =========================
-# MICROSOFT LOGIN
-# =========================
 @app.get("/login")
 def login(user_id: str, user=Depends(verify_token)):
     return RedirectResponse(generate_login_link(user_id))
@@ -161,9 +140,109 @@ def microsoft_status(user_id: str, user=Depends(verify_token)):
 def list_users(user=Depends(verify_token)):
     db = SessionLocal()
     try:
-        rows = db.query(TenantToken.tenant_id).distinct().all()
-        user_ids = sorted([row[0] for row in rows if row[0]])
+        admin_user_id = user["sub"]
+
+        connected_rows = db.query(TenantToken.tenant_id).distinct().all()
+        connected_users = [row[0] for row in connected_rows if row[0]]
+
+        saved_rows = (
+            db.query(SavedUser.user_id)
+            .filter(SavedUser.admin_user_id == admin_user_id)
+            .distinct()
+            .all()
+        )
+        saved_users = [row[0] for row in saved_rows if row[0]]
+
+        user_ids = sorted(set(connected_users + saved_users))
         return {"users": user_ids}
+    finally:
+        db.close()
+
+
+@app.get("/saved-users")
+def get_saved_users(user=Depends(verify_token)):
+    db = SessionLocal()
+    try:
+        admin_user_id = user["sub"]
+        rows = (
+            db.query(SavedUser)
+            .filter(SavedUser.admin_user_id == admin_user_id)
+            .order_by(SavedUser.user_id.asc())
+            .all()
+        )
+
+        return {
+            "users": [
+                {
+                    "id": row.id,
+                    "admin_user_id": row.admin_user_id,
+                    "user_id": row.user_id,
+                    "created_at": row.created_at
+                }
+                for row in rows
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.post("/saved-users")
+async def add_saved_user(request: Request, user=Depends(verify_token)):
+    db = SessionLocal()
+    try:
+        body = await request.json()
+        admin_user_id = user["sub"]
+        target_user_id = (body.get("user_id") or "").strip()
+
+        if not target_user_id:
+            return JSONResponse({"error": "user_id is required"}, status_code=400)
+
+        existing = (
+            db.query(SavedUser)
+            .filter(
+                SavedUser.admin_user_id == admin_user_id,
+                SavedUser.user_id == target_user_id
+            )
+            .first()
+        )
+
+        if existing:
+            return {"message": "User already saved", "user_id": target_user_id}
+
+        row = SavedUser(
+            admin_user_id=admin_user_id,
+            user_id=target_user_id
+        )
+        db.add(row)
+        db.commit()
+
+        return {"message": "User saved", "user_id": target_user_id}
+    finally:
+        db.close()
+
+
+@app.delete("/saved-users")
+def delete_saved_user(user_id: str, user=Depends(verify_token)):
+    db = SessionLocal()
+    try:
+        admin_user_id = user["sub"]
+
+        row = (
+            db.query(SavedUser)
+            .filter(
+                SavedUser.admin_user_id == admin_user_id,
+                SavedUser.user_id == user_id
+            )
+            .first()
+        )
+
+        if not row:
+            return JSONResponse({"error": "Saved user not found"}, status_code=404)
+
+        db.delete(row)
+        db.commit()
+
+        return {"message": "Saved user removed", "user_id": user_id}
     finally:
         db.close()
 
@@ -189,9 +268,6 @@ def auth_callback(request: Request):
         return {"error": str(e)}
 
 
-# =========================
-# EMAILS
-# =========================
 @app.get("/emails")
 def get_emails(
     user_id: str | None = None,
@@ -230,9 +306,6 @@ def email_detail(message_id: str, user_id: str | None = None, user=Depends(verif
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# =========================
-# EMAIL ACTIONS
-# =========================
 @app.post("/email/reply")
 async def reply_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
@@ -305,9 +378,6 @@ async def move_email_route(request: Request, user=Depends(verify_token)):
     )
 
 
-# =========================
-# RULES
-# =========================
 @app.post("/rules")
 async def add_rule(request: Request, user=Depends(verify_token)):
     body = await request.json()

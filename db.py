@@ -8,7 +8,7 @@ engine = create_engine(
     connect_args={"check_same_thread": False}
 )
 
-# ✅ FIXED (added autocommit + autoflush)
+# ✅ Session config
 SessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
@@ -17,8 +17,17 @@ SessionLocal = sessionmaker(
 
 Base = declarative_base()
 
-# SAFE PLACE TO CREATE TABLES
+
+# =========================
+# INIT DB (🔥 FIXED PROPERLY)
+# =========================
 def init_db():
+    # 🔥 IMPORTANT: import ALL models so SQLAlchemy registers them
     import models
-    print(Base.metadata.tables.keys())  # ✅ ADD THIS LINE
+
+    print("📦 Tables registered:", Base.metadata.tables.keys())
+
+    # 🔥 Create tables if they don't exist
     Base.metadata.create_all(bind=engine)
+
+    print("✅ Database initialized successfully")
