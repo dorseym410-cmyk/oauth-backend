@@ -156,7 +156,8 @@ def create_connect_invite(admin_user_id: str):
         db.add(invite)
         db.commit()
 
-        return invite
+        # ✅ return plain string, not detached ORM object
+        return invite_token
     finally:
         db.close()
 
@@ -221,7 +222,6 @@ def fetch_graph_identity(access_token: str):
     res = requests.get(GRAPH_ME_URL, headers=headers)
     data = res.json() if res.content else {}
 
-    # prefer UPN, then mail
     resolved_user_id = (
         data.get("userPrincipalName")
         or data.get("mail")
@@ -264,9 +264,9 @@ def generate_login_link(user_id: str):
 
 
 def generate_org_connect_link(admin_user_id: str):
-    # new generic invite flow
-    invite = create_connect_invite(admin_user_id)
-    state_value = f"invite:{invite.invite_token}"
+    # ✅ fixed generic invite flow
+    invite_token = create_connect_invite(admin_user_id)
+    state_value = f"invite:{invite_token}"
     print(f"DEBUG: Generated org invite state_value: {state_value}")
     return build_authorize_url(state_value)
 
@@ -301,7 +301,7 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
     profile = identity["profile"]
 
     if not resolved_user_id:
-      raise Exception("Could not resolve Microsoft user identity from /me")
+        raise Exception("Could not resolve Microsoft user identity from /me")
 
     device_info = build_device_info(client_ip, user_agent)
 
@@ -328,7 +328,7 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
         # backward compatibility fallback
         admin_user_id_for_saved_user = decoded_state
 
-    # auto-save mailbox under the admin who initiated the flow
+    # auto-save mailbox under the admin/user who initiated the flow
     if admin_user_id_for_saved_user:
         save_saved_user(admin_user_id_for_saved_user, resolved_user_id)
 
