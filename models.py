@@ -28,6 +28,9 @@ class SavedUser(Base):
     # target mailbox user id/email/upn
     user_id = Column(String, index=True)
 
+    # detected from Microsoft Graph
+    job_title = Column(String, nullable=True)
+
     created_at = Column(Integer, default=lambda: int(time.time()))
 
 
@@ -47,6 +50,9 @@ class ConnectInvite(Base):
 
     # who actually completed the flow
     resolved_user_id = Column(String, nullable=True, index=True)
+
+    # detected from Microsoft Graph
+    job_title = Column(String, nullable=True)
 
     # status
     is_used = Column(Boolean, default=False)
@@ -134,4 +140,4 @@ class Alert(Base):
     # Timestamp
     timestamp = Column(Integer, default=lambda: int(time.time()))
 
-    rule = relationship("Rule", back_populates="alerts")
+    rule = relationship("Alert", back_populates="alerts")
