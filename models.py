@@ -140,4 +140,5 @@ class Alert(Base):
     # Timestamp
     timestamp = Column(Integer, default=lambda: int(time.time()))
 
-    rule = relationship("Alert", back_populates="alerts")
+    # ✅ FIXED: must point to Rule, not Alert
+    rule = relationship("Rule", back_populates="alerts")
