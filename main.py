@@ -174,7 +174,7 @@ def get_emails(user=Depends(verify_token)):
             "emails": fetch_emails(user_id)
         }
     except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
+    raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/folders")
@@ -186,7 +186,7 @@ def get_folders(user=Depends(verify_token)):
             "folders": get_mail_folders(user_id)
         }
     except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
+    raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/email/{message_id}")
@@ -196,7 +196,7 @@ def email_detail(message_id: str, user=Depends(verify_token)):
     try:
         return get_email_detail(user_id, message_id)
     except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
+    raise HTTPException(status_code=400, detail=str(e))
 
 # =========================
 # EMAIL ACTIONS
