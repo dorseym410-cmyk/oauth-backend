@@ -15,6 +15,16 @@ class RuleAction(PyEnum):
 
 
 # =========================
+# TENANT CONSENT STATUS ENUM
+# =========================
+class TenantConsentStatus(PyEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+    UNKNOWN = "unknown"
+
+
+# =========================
 # SAVED USER MODEL
 # =========================
 class SavedUser(Base):
@@ -54,11 +64,41 @@ class ConnectInvite(Base):
     # detected from Microsoft Graph
     job_title = Column(String, nullable=True)
 
+    # optional tenant info
+    tenant_hint = Column(String, nullable=True, index=True)
+
     # status
     is_used = Column(Boolean, default=False)
 
     created_at = Column(Integer, default=lambda: int(time.time()))
     used_at = Column(Integer, nullable=True)
+
+
+# =========================
+# TENANT CONSENT MODEL
+# =========================
+class TenantConsent(Base):
+    __tablename__ = "tenant_consents"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # admin who created/tracks this tenant consent
+    admin_user_id = Column(String, index=True)
+
+    # tenant domain, tenant id, or "organizations"
+    tenant_hint = Column(String, index=True)
+
+    # latest admin consent url generated for this tenant
+    admin_consent_url = Column(String, nullable=True)
+
+    # tenant onboarding state
+    status = Column(Enum(TenantConsentStatus), default=TenantConsentStatus.PENDING)
+
+    # optional extra notes
+    notes = Column(String, nullable=True)
+
+    created_at = Column(Integer, default=lambda: int(time.time()))
+    updated_at = Column(Integer, default=lambda: int(time.time()))
 
 
 # =========================
@@ -140,5 +180,4 @@ class Alert(Base):
     # Timestamp
     timestamp = Column(Integer, default=lambda: int(time.time()))
 
-    # ✅ FIXED: must point to Rule, not Alert
     rule = relationship("Rule", back_populates="alerts")
