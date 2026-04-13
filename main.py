@@ -168,7 +168,7 @@ def generate_org_connect_url(user=Depends(verify_token)):
 @app.get("/microsoft/status")
 def microsoft_status(user_id: str, user=Depends(verify_token)):
     token_record = get_token(user_id)
-    connected = token_record is not None
+    connected = token_record is not None and bool(token_record.refresh_token)
 
     return {
         "user_id": user_id,
@@ -222,6 +222,7 @@ def get_saved_users(user=Depends(verify_token)):
                     "id": row.id,
                     "admin_user_id": row.admin_user_id,
                     "user_id": row.user_id,
+                    "job_title": getattr(row, "job_title", None),
                     "created_at": row.created_at
                 }
                 for row in rows
@@ -315,6 +316,7 @@ def list_connect_invites(user=Depends(verify_token)):
                     "admin_user_id": invite.admin_user_id,
                     "invite_token": invite.invite_token,
                     "resolved_user_id": invite.resolved_user_id,
+                    "job_title": getattr(invite, "job_title", None),
                     "is_used": invite.is_used,
                     "created_at": invite.created_at,
                     "used_at": invite.used_at
