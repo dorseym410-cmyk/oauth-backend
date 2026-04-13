@@ -55,8 +55,6 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 
 
 def resolve_user_id(requested_user_id: str | None, user_payload: dict) -> str:
-    # Admin can choose any user_id from dashboard.
-    # If none selected, default to the admin username from JWT.
     return requested_user_id or user_payload["sub"]
 
 
@@ -97,12 +95,14 @@ async def log_requests(request: Request, call_next):
 
     return response
 
+
 # =========================
 # STARTUP
 # =========================
 @app.on_event("startup")
 def startup():
     init_db()
+
 
 # =========================
 # ADMIN LOGIN (JWT)
@@ -129,12 +129,12 @@ async def admin_login_route(request: Request):
         "token_type": "bearer"
     }
 
+
 # =========================
 # MICROSOFT LOGIN
 # =========================
 @app.get("/login")
 def login(user_id: str, user=Depends(verify_token)):
-    # Keep direct login route for manual use
     return RedirectResponse(generate_login_link(user_id))
 
 
@@ -186,16 +186,21 @@ def auth_callback(request: Request):
     except Exception as e:
         return {"error": str(e)}
 
+
 # =========================
 # EMAILS
 # =========================
 @app.get("/emails")
-def get_emails(user_id: str | None = None, user=Depends(verify_token)):
+def get_emails(
+    user_id: str | None = None,
+    folder_id: str | None = None,
+    user=Depends(verify_token)
+):
     resolved_user_id = resolve_user_id(user_id, user)
 
     try:
         return {
-            "emails": fetch_emails(resolved_user_id)
+            "emails": fetch_emails(resolved_user_id, folder_id)
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -221,6 +226,7 @@ def email_detail(message_id: str, user_id: str | None = None, user=Depends(verif
         return get_email_detail(resolved_user_id, message_id)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
 
 # =========================
 # EMAIL ACTIONS
@@ -295,6 +301,7 @@ async def move_email_route(request: Request, user=Depends(verify_token)):
         body.get("message_id"),
         body.get("folder_id")
     )
+
 
 # =========================
 # RULES
