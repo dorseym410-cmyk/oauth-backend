@@ -14,7 +14,6 @@ from models import (
     TenantConsentStatus,
 )
 
-
 # =========================
 # CONFIG
 # =========================
@@ -32,7 +31,8 @@ GRAPH_ME_URL = (
     "?$select=id,displayName,mail,userPrincipalName,jobTitle"
 )
 
-GRAPH_SCOPES = "User.Read Mail.Read Mail.ReadWrite offline_access"
+# ✅ READ-ONLY MODE
+GRAPH_SCOPES = "User.Read Mail.Read offline_access"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
