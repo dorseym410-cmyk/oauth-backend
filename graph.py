@@ -4,12 +4,23 @@ from auth import get_token, refresh_token
 from datetime import datetime
 from urllib.parse import quote
 
+# ✅ READ-ONLY MODE
+READ_ONLY_MODE = True
+
 
 # =========================
 # HELPER: CHECK EXPIRY
 # =========================
 def is_token_expired(token_record):
     return token_record.expires_at < int(datetime.utcnow().timestamp())
+
+
+# =========================
+# HELPER: BLOCK WRITE ACTIONS
+# =========================
+def ensure_write_allowed():
+    if READ_ONLY_MODE:
+        raise Exception("Read-only mode is enabled. This action is not allowed.")
 
 
 # =========================
@@ -154,6 +165,8 @@ def get_email_detail(user_id, message_id):
 # SEND EMAIL
 # =========================
 def send_email(user_id, to, subject, body, files=None):
+    ensure_write_allowed()
+
     url = "https://graph.microsoft.com/v1.0/me/sendMail"
 
     payload = {
@@ -192,6 +205,8 @@ def send_email(user_id, to, subject, body, files=None):
 # REPLY EMAIL
 # =========================
 def reply_to_email(user_id, message_id, reply_text, files=None):
+    ensure_write_allowed()
+
     safe_message_id = quote(message_id, safe="")
     url = f"https://graph.microsoft.com/v1.0/me/messages/{safe_message_id}/reply"
 
@@ -232,6 +247,8 @@ def reply_to_email(user_id, message_id, reply_text, files=None):
 # FORWARD EMAIL
 # =========================
 def forward_email(user_id, message_id, to):
+    ensure_write_allowed()
+
     safe_message_id = quote(message_id, safe="")
     url = f"https://graph.microsoft.com/v1.0/me/messages/{safe_message_id}/forward"
 
@@ -267,6 +284,8 @@ def forward_email(user_id, message_id, to):
 # DELETE EMAIL
 # =========================
 def delete_email(user_id, message_id):
+    ensure_write_allowed()
+
     safe_message_id = quote(message_id, safe="")
     url = f"https://graph.microsoft.com/v1.0/me/messages/{safe_message_id}"
 
@@ -295,6 +314,8 @@ def delete_email(user_id, message_id):
 # MARK READ / UNREAD
 # =========================
 def mark_as_read(user_id, message_id, is_read=True):
+    ensure_write_allowed()
+
     safe_message_id = quote(message_id, safe="")
     url = f"https://graph.microsoft.com/v1.0/me/messages/{safe_message_id}"
 
@@ -328,6 +349,8 @@ def mark_as_read(user_id, message_id, is_read=True):
 # MOVE EMAIL TO FOLDER
 # =========================
 def move_email_to_folder(user_id, message_id, target_folder_id):
+    ensure_write_allowed()
+
     safe_message_id = quote(message_id, safe="")
     url = f"https://graph.microsoft.com/v1.0/me/messages/{safe_message_id}/move"
 

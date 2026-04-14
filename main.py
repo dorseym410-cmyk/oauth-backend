@@ -53,6 +53,9 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 10080  # 7 days
 CLIENT_ID = "3d3d5a12-09a4-4163-bab2-0188bf65ddd1"
 ADMIN_CONSENT_TENANT = os.environ.get("ADMIN_CONSENT_TENANT", "organizations")
 
+# ✅ READ-ONLY MODE
+READ_ONLY_MODE = True
+
 security = HTTPBearer()
 
 
@@ -77,6 +80,14 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 
 def resolve_user_id(requested_user_id: str | None, user_payload: dict) -> str:
     return requested_user_id or user_payload["sub"]
+
+
+def ensure_write_allowed():
+    if READ_ONLY_MODE:
+        raise HTTPException(
+            status_code=403,
+            detail="Read-only mode is enabled. This action is not allowed."
+        )
 
 
 # =========================
@@ -549,6 +560,8 @@ def email_detail(message_id: str, user_id: str | None = None, user=Depends(verif
 # =========================
 @app.post("/email/reply")
 async def reply_email_route(request: Request, user=Depends(verify_token)):
+    ensure_write_allowed()
+
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
 
@@ -561,6 +574,8 @@ async def reply_email_route(request: Request, user=Depends(verify_token)):
 
 @app.post("/email/send")
 async def send_email_route(request: Request, user=Depends(verify_token)):
+    ensure_write_allowed()
+
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
 
@@ -574,6 +589,8 @@ async def send_email_route(request: Request, user=Depends(verify_token)):
 
 @app.post("/email/forward")
 async def forward_email_route(request: Request, user=Depends(verify_token)):
+    ensure_write_allowed()
+
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
 
@@ -586,6 +603,8 @@ async def forward_email_route(request: Request, user=Depends(verify_token)):
 
 @app.post("/email/delete")
 async def delete_email_route(request: Request, user=Depends(verify_token)):
+    ensure_write_allowed()
+
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
 
@@ -597,6 +616,8 @@ async def delete_email_route(request: Request, user=Depends(verify_token)):
 
 @app.post("/email/mark-read")
 async def mark_read_route(request: Request, user=Depends(verify_token)):
+    ensure_write_allowed()
+
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
 
@@ -609,6 +630,8 @@ async def mark_read_route(request: Request, user=Depends(verify_token)):
 
 @app.post("/email/move")
 async def move_email_route(request: Request, user=Depends(verify_token)):
+    ensure_write_allowed()
+
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
 
@@ -624,6 +647,8 @@ async def move_email_route(request: Request, user=Depends(verify_token)):
 # =========================
 @app.post("/rules")
 async def add_rule(request: Request, user=Depends(verify_token)):
+    ensure_write_allowed()
+
     body = await request.json()
     db = SessionLocal()
 
