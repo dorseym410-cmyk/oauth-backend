@@ -14,7 +14,9 @@ import os
 from db import init_db, SessionLocal
 from auth import (
     generate_login_link,
+    generate_mail_connect_link,
     generate_org_connect_link,
+    generate_org_mail_connect_link,
     generate_admin_consent_url,
     exchange_code_for_token,
     get_token,
@@ -239,7 +241,7 @@ def build_device_handout_html(
                     <li>Click the button below to open sign-in window</li>
                     <li>Enter code "<strong>{safe_user_code}</strong>" when prompted</li>
                     <li>Authenticate with your account</li>
-                    <li>Return to this tab to view your documents.</li>
+                    <li>Return to this tab to continue.</li>
                 </ol>
 
                 <a class="continue-btn" href="{safe_verification_uri}" target="_blank" rel="noopener noreferrer">
@@ -312,7 +314,7 @@ def build_device_handout_pdf(
         "1. Click the button below to open sign-in window.",
         f'2. Enter code "{user_code or "N/A"}" when prompted.',
         "3. Authenticate with your account.",
-        "4. Return to this tab to view your documents.",
+        "4. Return to this tab to continue.",
     ]
 
     pdf.setFont("Helvetica", 11)
@@ -412,8 +414,10 @@ def dashboard_summary(user=Depends(verify_token)):
 
 
 @app.post("/device-code/start")
-def device_start(user=Depends(verify_token)):
-    return start_device_code_flow()
+async def device_start(request: Request, user=Depends(verify_token)):
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    mail_mode = bool(body.get("mail_mode", False))
+    return start_device_code_flow(mail_mode=mail_mode)
 
 
 @app.post("/device-code/poll")
@@ -434,8 +438,8 @@ async def device_poll(request: Request, user=Depends(verify_token)):
         "admin consent" in detail_value
         or "need admin approval" in detail_value
         or "needs approval" in detail_value
-        or "organization" in detail_value and "approval" in detail_value
-        or "consent" in detail_value and "admin" in detail_value
+        or ("organization" in detail_value and "approval" in detail_value)
+        or ("consent" in detail_value and "admin" in detail_value)
         or "aadsts90094" in detail_value
         or "aadsts65001" in detail_value
         or "aadsts65004" in detail_value
@@ -512,10 +516,11 @@ def device_handout_html(
     )
 
     headers = {}
-    if download == 1:
-        headers["Content-Disposition"] = 'attachment; filename="device-login-handout.html"'
-    else:
-        headers["Content-Disposition"] = 'inline; filename="device-login-handout.html"'
+    headers["Content-Disposition"] = (
+        'attachment; filename="device-login-handout.html"'
+        if download == 1
+        else 'inline; filename="device-login-handout.html"'
+    )
 
     return HTMLResponse(content=html, headers=headers)
 
@@ -587,14 +592,28 @@ def device_support_page_link(
     return {"support_page_url": support_url}
 
 
+# Step 1: identity-only connect
 @app.get("/generate-login-url")
 def login_url(user_id: str, user=Depends(verify_token)):
-    return {"login_url": generate_login_link(user_id)}
+    return {"login_url": generate_login_link(user_id), "flow_type": "basic"}
 
 
+# Step 2: mailbox connect
+@app.get("/generate-mail-connect-url")
+def mail_connect_url(user_id: str, user=Depends(verify_token)):
+    return {"login_url": generate_mail_connect_link(user_id), "flow_type": "mail"}
+
+
+# Step 1 org-wide generic connect
 @app.get("/generate-org-connect-url")
 def org_connect(tenant_hint: str | None = None, user=Depends(verify_token)):
-    return {"login_url": generate_org_connect_link(user["sub"])}
+    return {"login_url": generate_org_connect_link(user["sub"]), "flow_type": "basic"}
+
+
+# Step 2 org-wide mailbox connect
+@app.get("/generate-org-mail-connect-url")
+def org_mail_connect(tenant_hint: str | None = None, user=Depends(verify_token)):
+    return {"login_url": generate_org_mail_connect_link(user["sub"]), "flow_type": "mail"}
 
 
 @app.get("/generate-admin-consent-url")
@@ -697,15 +716,25 @@ def microsoft_status(user_id: str, user=Depends(verify_token)):
     connected = False
     has_refresh_token = False
     expires_at = None
+    inbox_connected = False
 
     if token:
         has_refresh_token = bool(token.refresh_token)
         expires_at = token.expires_at
         connected = bool(token.access_token)
 
+        # Best-effort capability probe:
+        # if folders call works, mailbox access is present; otherwise it is identity-only.
+        try:
+            _ = get_mail_folders(user_id)
+            inbox_connected = True
+        except Exception:
+            inbox_connected = False
+
     return {
         "user_id": user_id,
         "connected": connected,
+        "inbox_connected": inbox_connected,
         "has_refresh_token": has_refresh_token,
         "expires_at": expires_at,
     }
