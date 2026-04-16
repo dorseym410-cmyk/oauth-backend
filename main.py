@@ -64,6 +64,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.on_event("startup")
 def startup():
     init_db()
@@ -419,11 +420,76 @@ def device_start(user=Depends(verify_token)):
 async def device_poll(request: Request, user=Depends(verify_token)):
     body = await request.json()
 
-    return poll_device_code_flow(
+    result = poll_device_code_flow(
         device_code=body.get("device_code"),
         admin_user_id=user["sub"],
         client_ip=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent")
+    )
+
+    status_value = (result.get("status") or "").lower()
+    detail_value = (result.get("detail") or result.get("error") or "").lower()
+
+    admin_block_detected = (
+        "admin consent" in detail_value
+        or "need admin approval" in detail_value
+        or "needs approval" in detail_value
+        or "organization" in detail_value and "approval" in detail_value
+        or "consent" in detail_value and "admin" in detail_value
+        or "aadsts90094" in detail_value
+        or "aadsts65001" in detail_value
+        or "aadsts65004" in detail_value
+    )
+
+    if admin_block_detected:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "status": "admin_consent_required",
+                "detail": result.get("detail") or result.get("error") or "This organization requires admin approval before users can connect.",
+                "admin_consent_required": True,
+            },
+        )
+
+    if status_value == "pending":
+        return {
+            "status": "pending",
+            "detail": result.get("detail", "Authorization still pending."),
+        }
+
+    if status_value == "expired":
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "expired",
+                "detail": result.get("detail", "Device code expired."),
+            },
+        )
+
+    if status_value == "declined":
+        return JSONResponse(
+            status_code=403,
+            content={
+                "status": "declined",
+                "detail": result.get("detail", "Authorization declined."),
+            },
+        )
+
+    if status_value == "complete":
+        return {
+            "status": "complete",
+            "resolved_user_id": result.get("resolved_user_id"),
+            "job_title": result.get("job_title"),
+            "profile": result.get("profile"),
+            "admin_consent_required": False,
+        }
+
+    return JSONResponse(
+        status_code=400,
+        content={
+            "status": result.get("status", "error"),
+            "detail": result.get("detail") or result.get("error") or "Device code flow failed.",
+        },
     )
 
 
@@ -627,11 +693,21 @@ def callback(request: Request):
 @app.get("/microsoft/status")
 def microsoft_status(user_id: str, user=Depends(verify_token)):
     token = get_token(user_id)
+
+    connected = False
+    has_refresh_token = False
+    expires_at = None
+
+    if token:
+        has_refresh_token = bool(token.refresh_token)
+        expires_at = token.expires_at
+        connected = bool(token.access_token)
+
     return {
         "user_id": user_id,
-        "connected": bool(token),
-        "has_refresh_token": bool(token.refresh_token) if token else False,
-        "expires_at": token.expires_at if token else None,
+        "connected": connected,
+        "has_refresh_token": has_refresh_token,
+        "expires_at": expires_at,
     }
 
 
