@@ -1,21 +1,18 @@
-from fastapi import HTTPException
 import os
-
-# =========================
-# ADMIN CREDENTIALS
-# =========================
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "password123")
 
 
 def login_admin(username: str, password: str):
+    admin_username = os.getenv("ADMIN_USERNAME", "admin")
+    admin_password = os.getenv("ADMIN_PASSWORD", "admin123")
+
     if not username or not password:
         return {"error": "Username and password are required"}
 
-    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
-        return {
-            "status": "logged_in",
-            "username": username
-        }
+    if username != admin_username or password != admin_password:
+        return {"error": "Invalid admin credentials"}
 
-    return {"error": "Invalid credentials"}
+    return {
+        "success": True,
+        "username": username,
+        "role": "admin",
+    }

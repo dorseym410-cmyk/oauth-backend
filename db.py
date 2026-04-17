@@ -1,33 +1,65 @@
+import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-DATABASE_URL = "sqlite:///./tokens.db"
+# =========================
+# DATABASE CONFIG
+# =========================
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False}
-)
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./tokens.db")
 
-# ✅ Session config
+# Render may provide postgres urls in old format.
+# Normalize only if needed.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# SQLite needs check_same_thread=False
+engine_kwargs = {
+    "pool_pre_ping": True,
+}
+
+if DATABASE_URL.startswith("sqlite"):
+    engine_kwargs["connect_args"] = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, **engine_kwargs)
+
 SessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
-    bind=engine
+    bind=engine,
 )
 
 Base = declarative_base()
 
 
 # =========================
-# INIT DB (🔥 FIXED PROPERLY)
+# DB SESSION DEPENDENCY
 # =========================
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# =========================
+# DB INIT
+# =========================
+
 def init_db():
-    # 🔥 IMPORTANT: import ALL models so SQLAlchemy registers them
-    import models
+    # Import models here so all tables register on Base.metadata
+    import models  # noqa: F401
 
-    print("📦 Tables registered:", Base.metadata.tables.keys())
+    try:
+        print("📦 Tables registered:", Base.metadata.tables.keys())
+    except Exception:
+        pass
 
-    # 🔥 Create tables if they don't exist
     Base.metadata.create_all(bind=engine)
 
-    print("✅ Database initialized successfully")
+    try:
+        print("✅ Database initialized successfully")
+    except Exception:
+        pass

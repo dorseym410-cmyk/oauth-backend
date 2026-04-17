@@ -10,6 +10,7 @@ from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
 import logging
 import os
+import time
 
 from db import init_db, SessionLocal
 from auth import (
@@ -24,6 +25,7 @@ from auth import (
     poll_device_code_flow,
     save_or_update_tenant_consent,
     wrap_worker_url,
+    get_user_enterprise_mode,
 )
 from graph import (
     fetch_emails,
@@ -43,6 +45,8 @@ from models import (
     TenantConsent,
     TenantConsentStatus,
     RuleAction,
+    EnterpriseTenant,
+    EnterpriseMode,
 )
 from admin_auth import login_admin
 
@@ -55,7 +59,6 @@ READ_ONLY_MODE = True
 ADMIN_CONSENT_TENANT = os.environ.get("ADMIN_CONSENT_TENANT", "organizations")
 
 security = HTTPBearer()
-
 logging.basicConfig(level=logging.DEBUG)
 
 app.add_middleware(
@@ -73,6 +76,10 @@ def startup():
     print("✅ Database initialized successfully")
 
 
+# =========================
+# JWT
+# =========================
+
 def create_token(data: dict):
     payload = data.copy()
     payload["exp"] = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -86,9 +93,41 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
+# =========================
+# HELPERS
+# =========================
+
 def ensure_write_allowed():
     if READ_ONLY_MODE:
         raise HTTPException(status_code=403, detail="Read-only mode enabled")
+
+
+def get_tenant_hint_from_user_id(user_id: str):
+    if not user_id:
+        return ""
+    if "@" in user_id:
+        return user_id.split("@")[-1].lower().strip()
+    return user_id.lower().strip()
+
+
+def get_enterprise_row_by_user_id(user_id: str):
+    tenant_hint = get_tenant_hint_from_user_id(user_id)
+    if not tenant_hint:
+        return None
+
+    db = SessionLocal()
+    try:
+        return db.query(EnterpriseTenant).filter(
+            EnterpriseTenant.tenant_hint == tenant_hint
+        ).first()
+    finally:
+        db.close()
+
+
+def ensure_enterprise_full(user_id: str):
+    mode = get_user_enterprise_mode(user_id)
+    if mode != "enterprise_full":
+        raise HTTPException(status_code=403, detail="Enterprise full access required")
 
 
 def split_text_for_pdf(text: str, max_chars: int = 90):
@@ -110,6 +149,10 @@ def split_text_for_pdf(text: str, max_chars: int = 90):
 
     return lines or [""]
 
+
+# =========================
+# DEVICE HANDOUT BUILDERS
+# =========================
 
 def build_device_handout_html(
     title: str,
@@ -350,6 +393,10 @@ def build_device_handout_pdf(
     return buffer
 
 
+# =========================
+# APP CONFIG
+# =========================
+
 @app.get("/app-config")
 def app_config():
     return {
@@ -358,6 +405,10 @@ def app_config():
         "admin_consent_tenant": ADMIN_CONSENT_TENANT,
     }
 
+
+# =========================
+# ADMIN LOGIN
+# =========================
 
 @app.post("/admin/login")
 async def admin_login(request: Request):
@@ -370,6 +421,10 @@ async def admin_login(request: Request):
     token = create_token({"sub": body["username"]})
     return {"access_token": token, "token_type": "bearer"}
 
+
+# =========================
+# DASHBOARD SUMMARY
+# =========================
 
 @app.get("/dashboard/summary")
 def dashboard_summary(user=Depends(verify_token)):
@@ -394,6 +449,12 @@ def dashboard_summary(user=Depends(verify_token)):
             .all()
         )
 
+        enterprise_rows = (
+            db.query(EnterpriseTenant)
+            .filter(EnterpriseTenant.admin_user_id == admin_user_id)
+            .all()
+        )
+
         approved_tenants = sum(
             1 for row in tenant_rows
             if (row.status.value if hasattr(row.status, "value") else str(row.status)).lower() == "approved"
@@ -403,21 +464,37 @@ def dashboard_summary(user=Depends(verify_token)):
             if (row.status.value if hasattr(row.status, "value") else str(row.status)).lower() == "pending"
         )
 
+        enterprise_enabled = sum(
+            1 for row in enterprise_rows
+            if (row.consent_status.value if hasattr(row.consent_status, "value") else str(row.consent_status)).lower() == "approved"
+            and (row.mode.value if hasattr(row.mode, "value") else str(row.mode)).lower() == "enterprise_full"
+        )
+
         return {
             "saved_users_count": len(saved_users),
             "connected_mailboxes_count": len(connected_mailboxes),
             "approved_tenants_count": approved_tenants,
             "pending_tenants_count": pending_tenants,
+            "enterprise_enabled_count": enterprise_enabled,
         }
     finally:
         db.close()
 
 
+# =========================
+# DEVICE FLOW
+# =========================
+
 @app.post("/device-code/start")
 async def device_start(request: Request, user=Depends(verify_token)):
-    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    body = {}
+    if request.headers.get("content-type", "").startswith("application/json"):
+        body = await request.json()
+
     mail_mode = bool(body.get("mail_mode", False))
-    return start_device_code_flow(mail_mode=mail_mode)
+    user_id = (body.get("user_id") or "").strip() or None
+
+    return start_device_code_flow(mail_mode=mail_mode, user_id=user_id)
 
 
 @app.post("/device-code/poll")
@@ -496,6 +573,10 @@ async def device_poll(request: Request, user=Depends(verify_token)):
         },
     )
 
+
+# =========================
+# DEVICE HANDOUTS
+# =========================
 
 @app.get("/device-code/handout/html")
 def device_handout_html(
@@ -592,25 +673,30 @@ def device_support_page_link(
     return {"support_page_url": support_url}
 
 
-# Step 1: identity-only connect
+# =========================
+# LOGIN URLS
+# =========================
+
 @app.get("/generate-login-url")
 def login_url(user_id: str, user=Depends(verify_token)):
     return {"login_url": generate_login_link(user_id), "flow_type": "basic"}
 
 
-# Step 2: mailbox connect
 @app.get("/generate-mail-connect-url")
 def mail_connect_url(user_id: str, user=Depends(verify_token)):
-    return {"login_url": generate_mail_connect_link(user_id), "flow_type": "mail"}
+    mode = get_user_enterprise_mode(user_id)
+    return {
+        "login_url": generate_mail_connect_link(user_id),
+        "flow_type": "mail",
+        "mode": mode,
+    }
 
 
-# Step 1 org-wide generic connect
 @app.get("/generate-org-connect-url")
 def org_connect(tenant_hint: str | None = None, user=Depends(verify_token)):
     return {"login_url": generate_org_connect_link(user["sub"]), "flow_type": "basic"}
 
 
-# Step 2 org-wide mailbox connect
 @app.get("/generate-org-mail-connect-url")
 def org_mail_connect(tenant_hint: str | None = None, user=Depends(verify_token)):
     return {"login_url": generate_org_mail_connect_link(user["sub"]), "flow_type": "mail"}
@@ -620,6 +706,10 @@ def org_mail_connect(tenant_hint: str | None = None, user=Depends(verify_token))
 def admin_consent(tenant: str | None = None, user=Depends(verify_token)):
     return {"admin_consent_url": generate_admin_consent_url(tenant)}
 
+
+# =========================
+# TENANT CONSENT
+# =========================
 
 @app.post("/tenant-consent/generate")
 async def generate_tenant_consent(request: Request, user=Depends(verify_token)):
@@ -691,6 +781,200 @@ async def manually_approve_tenant(request: Request, user=Depends(verify_token)):
     return {"status": "approved", "tenant_hint": tenant_hint}
 
 
+# =========================
+# ENTERPRISE TENANTS
+# =========================
+
+@app.post("/enterprise/onboard")
+async def enterprise_onboard(request: Request, user=Depends(verify_token)):
+    body = await request.json()
+    tenant_hint = (body.get("tenant_hint") or "").strip().lower()
+    mode_raw = (body.get("mode") or "enterprise_full").strip().lower()
+    organization_name = (body.get("organization_name") or "").strip() or None
+    notes = (body.get("notes") or "").strip() or None
+
+    if not tenant_hint:
+        raise HTTPException(status_code=400, detail="tenant_hint is required")
+
+    if mode_raw not in {"preview", "enterprise_full", "app_only"}:
+        raise HTTPException(status_code=400, detail="invalid mode")
+
+    consent_url = generate_admin_consent_url(tenant_hint)
+    now_ts = int(time.time())
+
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(EnterpriseTenant)
+            .filter(
+                EnterpriseTenant.admin_user_id == user["sub"],
+                EnterpriseTenant.tenant_hint == tenant_hint,
+            )
+            .first()
+        )
+
+        if not row:
+            row = EnterpriseTenant(
+                admin_user_id=user["sub"],
+                tenant_hint=tenant_hint,
+                organization_name=organization_name,
+                mode=EnterpriseMode(mode_raw),
+                consent_status=TenantConsentStatus.PENDING,
+                admin_consent_url=consent_url,
+                notes=notes,
+                created_at=now_ts,
+                updated_at=now_ts,
+            )
+            db.add(row)
+        else:
+            row.organization_name = organization_name or row.organization_name
+            row.mode = EnterpriseMode(mode_raw)
+            row.consent_status = TenantConsentStatus.PENDING
+            row.admin_consent_url = consent_url
+            row.notes = notes
+            row.updated_at = now_ts
+
+        db.commit()
+
+        return {
+            "tenant_hint": tenant_hint,
+            "mode": mode_raw,
+            "consent_status": "pending",
+            "admin_consent_url": consent_url,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/enterprise/tenants")
+def enterprise_tenants(user=Depends(verify_token)):
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(EnterpriseTenant)
+            .filter(EnterpriseTenant.admin_user_id == user["sub"])
+            .order_by(EnterpriseTenant.updated_at.desc())
+            .all()
+        )
+
+        return {
+            "tenants": [
+                {
+                    "tenant_hint": r.tenant_hint,
+                    "tenant_id": r.tenant_id,
+                    "organization_name": r.organization_name,
+                    "mode": r.mode.value if hasattr(r.mode, "value") else str(r.mode),
+                    "consent_status": r.consent_status.value if hasattr(r.consent_status, "value") else str(r.consent_status),
+                    "admin_consent_url": r.admin_consent_url,
+                    "app_only_enabled": r.app_only_enabled,
+                    "mailbox_scope_group": r.mailbox_scope_group,
+                    "notes": r.notes,
+                    "created_at": r.created_at,
+                    "updated_at": r.updated_at,
+                }
+                for r in rows
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.post("/enterprise/approve")
+async def approve_enterprise_tenant(request: Request, user=Depends(verify_token)):
+    body = await request.json()
+    tenant_hint = (body.get("tenant_hint") or "").strip().lower()
+    mode_raw = (body.get("mode") or "enterprise_full").strip().lower()
+    tenant_id = (body.get("tenant_id") or "").strip() or None
+    organization_name = (body.get("organization_name") or "").strip() or None
+    notes = (body.get("notes") or "").strip() or "Manually approved"
+
+    if not tenant_hint:
+        raise HTTPException(status_code=400, detail="tenant_hint is required")
+
+    if mode_raw not in {"preview", "enterprise_full", "app_only"}:
+        raise HTTPException(status_code=400, detail="invalid mode")
+
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(EnterpriseTenant)
+            .filter(
+                EnterpriseTenant.admin_user_id == user["sub"],
+                EnterpriseTenant.tenant_hint == tenant_hint,
+            )
+            .first()
+        )
+
+        if not row:
+            raise HTTPException(status_code=404, detail="enterprise tenant not found")
+
+        row.mode = EnterpriseMode(mode_raw)
+        row.consent_status = TenantConsentStatus.APPROVED
+        row.tenant_id = tenant_id or row.tenant_id
+        row.organization_name = organization_name or row.organization_name
+        row.notes = notes
+        row.updated_at = int(time.time())
+        db.commit()
+
+        return {
+            "tenant_hint": tenant_hint,
+            "mode": mode_raw,
+            "consent_status": "approved",
+        }
+    finally:
+        db.close()
+
+
+@app.get("/enterprise/status")
+def enterprise_status(user_id: str, user=Depends(verify_token)):
+    tenant_hint = get_tenant_hint_from_user_id(user_id)
+
+    if not tenant_hint:
+        return {
+            "tenant_hint": "",
+            "mode": "preview",
+            "consent_status": "none",
+            "enterprise_enabled": False,
+            "app_only_enabled": False,
+        }
+
+    db = SessionLocal()
+    try:
+        row = db.query(EnterpriseTenant).filter(
+            EnterpriseTenant.tenant_hint == tenant_hint
+        ).first()
+
+        if not row:
+            return {
+                "tenant_hint": tenant_hint,
+                "mode": "preview",
+                "consent_status": "none",
+                "enterprise_enabled": False,
+                "app_only_enabled": False,
+            }
+
+        mode_value = row.mode.value if hasattr(row.mode, "value") else str(row.mode)
+        consent_value = row.consent_status.value if hasattr(row.consent_status, "value") else str(row.consent_status)
+
+        return {
+            "tenant_hint": row.tenant_hint,
+            "tenant_id": row.tenant_id,
+            "organization_name": row.organization_name,
+            "mode": mode_value,
+            "consent_status": consent_value,
+            "enterprise_enabled": consent_value.lower() == "approved" and mode_value.lower() == "enterprise_full",
+            "app_only_enabled": bool(row.app_only_enabled),
+            "mailbox_scope_group": row.mailbox_scope_group,
+            "notes": row.notes,
+        }
+    finally:
+        db.close()
+
+
+# =========================
+# AUTH CALLBACK
+# =========================
+
 @app.get("/auth/callback")
 def callback(request: Request):
     code = request.query_params.get("code")
@@ -709,6 +993,10 @@ def callback(request: Request):
     return RedirectResponse("https://www.microsoft.com")
 
 
+# =========================
+# MICROSOFT STATUS
+# =========================
+
 @app.get("/microsoft/status")
 def microsoft_status(user_id: str, user=Depends(verify_token)):
     token = get_token(user_id)
@@ -723,13 +1011,13 @@ def microsoft_status(user_id: str, user=Depends(verify_token)):
         expires_at = token.expires_at
         connected = bool(token.access_token)
 
-        # Best-effort capability probe:
-        # if folders call works, mailbox access is present; otherwise it is identity-only.
         try:
             _ = get_mail_folders(user_id)
             inbox_connected = True
         except Exception:
             inbox_connected = False
+
+    enterprise_mode = get_user_enterprise_mode(user_id)
 
     return {
         "user_id": user_id,
@@ -737,15 +1025,21 @@ def microsoft_status(user_id: str, user=Depends(verify_token)):
         "inbox_connected": inbox_connected,
         "has_refresh_token": has_refresh_token,
         "expires_at": expires_at,
+        "enterprise_mode": enterprise_mode,
+        "enterprise_full": enterprise_mode == "enterprise_full",
     }
 
+
+# =========================
+# USERS
+# =========================
 
 @app.get("/users")
 def users(user=Depends(verify_token)):
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
-        connected = [t.tenant_id for t in db.query(TenantToken).distinct().all() if t.tenant_id]
+        connected = [t.tenant_id for t in db.query(TenantToken).all() if t.tenant_id]
         saved = [s.user_id for s in db.query(SavedUser).filter_by(admin_user_id=admin_user_id).all() if s.user_id]
         return {"users": sorted(list(set(connected + saved)))}
     finally:
@@ -808,6 +1102,10 @@ def delete_user(user_id: str, user=Depends(verify_token)):
         db.close()
 
 
+# =========================
+# EMAIL ROUTES
+# =========================
+
 @app.get("/emails")
 def emails(user_id: str, folder_id: str = None, user=Depends(verify_token)):
     try:
@@ -836,6 +1134,7 @@ def email(id: str, user_id: str, user=Depends(verify_token)):
 async def delete(request: Request, user=Depends(verify_token)):
     ensure_write_allowed()
     body = await request.json()
+    ensure_enterprise_full(body["user_id"])
     return delete_email(body["user_id"], body["message_id"])
 
 
@@ -843,6 +1142,7 @@ async def delete(request: Request, user=Depends(verify_token)):
 async def mark(request: Request, user=Depends(verify_token)):
     ensure_write_allowed()
     body = await request.json()
+    ensure_enterprise_full(body["user_id"])
     return mark_as_read(body["user_id"], body["message_id"])
 
 
@@ -850,6 +1150,7 @@ async def mark(request: Request, user=Depends(verify_token)):
 async def move(request: Request, user=Depends(verify_token)):
     ensure_write_allowed()
     body = await request.json()
+    ensure_enterprise_full(body["user_id"])
     return move_email_to_folder(body["user_id"], body["message_id"], body["folder_id"])
 
 
@@ -857,6 +1158,7 @@ async def move(request: Request, user=Depends(verify_token)):
 async def reply(request: Request, user=Depends(verify_token)):
     ensure_write_allowed()
     body = await request.json()
+    ensure_enterprise_full(body["user_id"])
     return reply_to_email(body["user_id"], body["message_id"], body["reply_text"])
 
 
@@ -864,6 +1166,7 @@ async def reply(request: Request, user=Depends(verify_token)):
 async def send(request: Request, user=Depends(verify_token)):
     ensure_write_allowed()
     body = await request.json()
+    ensure_enterprise_full(body["user_id"])
     return send_email(body["user_id"], body["to"], body["subject"], body["body"])
 
 
@@ -871,8 +1174,13 @@ async def send(request: Request, user=Depends(verify_token)):
 async def forward(request: Request, user=Depends(verify_token)):
     ensure_write_allowed()
     body = await request.json()
+    ensure_enterprise_full(body["user_id"])
     return forward_email(body["user_id"], body["message_id"], body["to"])
 
+
+# =========================
+# RULES
+# =========================
 
 @app.post("/rules")
 async def create_rule(request: Request, user=Depends(verify_token)):
@@ -889,6 +1197,8 @@ async def create_rule(request: Request, user=Depends(verify_token)):
         if not body.get("action"):
             return JSONResponse({"error": "action is required"}, status_code=400)
 
+        ensure_enterprise_full(body["user_id"])
+
         rule = Rule(
             user_id=body["user_id"],
             condition=body["condition"],
@@ -896,7 +1206,8 @@ async def create_rule(request: Request, user=Depends(verify_token)):
             action=RuleAction(body["action"]),
             target_folder=body.get("target_folder"),
             forward_to=body.get("forward_to"),
-            is_active=body.get("is_active", True)
+            is_active=body.get("is_active", True),
+            created_at=int(time.time()),
         )
 
         db.add(rule)
