@@ -1,183 +1,144 @@
-from sqlalchemy import Column, String, Integer, Enum, ForeignKey, Boolean
-from sqlalchemy.orm import relationship
+from sqlalchemy import Column, Integer, String, Boolean, Text, Enum, UniqueConstraint
+import enum
+
 from db import Base
-from enum import Enum as PyEnum
-import time
 
 
-# =========================
-# RULE ACTION ENUM
-# =========================
-class RuleAction(PyEnum):
-    MOVE = "move"
-    DELETE = "delete"
-    FORWARD = "forward"
-
-
-# =========================
-# TENANT CONSENT STATUS ENUM
-# =========================
-class TenantConsentStatus(PyEnum):
+class TenantConsentStatus(str, enum.Enum):
     PENDING = "pending"
     APPROVED = "approved"
     DENIED = "denied"
-    UNKNOWN = "unknown"
 
 
-# =========================
-# SAVED USER MODEL
-# =========================
+class EnterpriseMode(str, enum.Enum):
+    PREVIEW = "preview"
+    ENTERPRISE_FULL = "enterprise_full"
+    APP_ONLY = "app_only"
+
+
+class RuleAction(str, enum.Enum):
+    move = "move"
+    delete = "delete"
+    forward = "forward"
+
+
+class TenantToken(Base):
+    __tablename__ = "tenant_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(String, index=True, nullable=False, unique=True)
+    session_id = Column(String, index=True, nullable=True)
+    access_token = Column(Text, nullable=False)
+    refresh_token = Column(Text, nullable=True)
+    expires_at = Column(Integer, nullable=True)
+
+    ip_address = Column(String, nullable=True)
+    user_agent = Column(Text, nullable=True)
+    location = Column(String, nullable=True)
+
+
 class SavedUser(Base):
     __tablename__ = "saved_users"
 
     id = Column(Integer, primary_key=True, index=True)
-
-    # admin who saved this user
-    admin_user_id = Column(String, index=True)
-
-    # target mailbox user id/email/upn
-    user_id = Column(String, index=True)
-
-    # detected from Microsoft Graph
+    admin_user_id = Column(String, index=True, nullable=False)
+    user_id = Column(String, index=True, nullable=False)
     job_title = Column(String, nullable=True)
 
-    created_at = Column(Integer, default=lambda: int(time.time()))
+    __table_args__ = (
+        UniqueConstraint("admin_user_id", "user_id", name="uq_saved_user_admin_user"),
+    )
 
 
-# =========================
-# CONNECT INVITE MODEL
-# =========================
 class ConnectInvite(Base):
     __tablename__ = "connect_invites"
 
     id = Column(Integer, primary_key=True, index=True)
+    admin_user_id = Column(String, index=True, nullable=False)
+    invite_token = Column(String, unique=True, index=True, nullable=False)
 
-    # admin who generated the org connect URL
-    admin_user_id = Column(String, index=True)
+    connect_mode = Column(String, default="basic")  # basic | mail
 
-    # random unique token placed in OAuth state
-    invite_token = Column(String, unique=True, index=True)
-
-    # who actually completed the flow
-    resolved_user_id = Column(String, nullable=True, index=True)
-
-    # detected from Microsoft Graph
-    job_title = Column(String, nullable=True)
-
-    # optional tenant info
-    tenant_hint = Column(String, nullable=True, index=True)
-
-    # status
     is_used = Column(Boolean, default=False)
-
-    created_at = Column(Integer, default=lambda: int(time.time()))
     used_at = Column(Integer, nullable=True)
 
+    resolved_user_id = Column(String, nullable=True)
+    job_title = Column(String, nullable=True)
 
-# =========================
-# TENANT CONSENT MODEL
-# =========================
+
 class TenantConsent(Base):
     __tablename__ = "tenant_consents"
 
     id = Column(Integer, primary_key=True, index=True)
+    admin_user_id = Column(String, index=True, nullable=False)
+    tenant_hint = Column(String, index=True, nullable=False)
 
-    # admin who created/tracks this tenant consent
-    admin_user_id = Column(String, index=True)
+    admin_consent_url = Column(Text, nullable=True)
+    status = Column(Enum(TenantConsentStatus), default=TenantConsentStatus.PENDING, nullable=False)
+    notes = Column(Text, nullable=True)
 
-    # tenant domain, tenant id, or "organizations"
-    tenant_hint = Column(String, index=True)
+    created_at = Column(Integer, nullable=True)
+    updated_at = Column(Integer, nullable=True)
 
-    # latest admin consent url generated for this tenant
-    admin_consent_url = Column(String, nullable=True)
-
-    # tenant onboarding state
-    status = Column(Enum(TenantConsentStatus), default=TenantConsentStatus.PENDING)
-
-    # optional extra notes
-    notes = Column(String, nullable=True)
-
-    created_at = Column(Integer, default=lambda: int(time.time()))
-    updated_at = Column(Integer, default=lambda: int(time.time()))
+    __table_args__ = (
+        UniqueConstraint("admin_user_id", "tenant_hint", name="uq_tenant_consent_admin_tenant"),
+    )
 
 
-# =========================
-# RULE MODEL
-# =========================
+class EnterpriseTenant(Base):
+    __tablename__ = "enterprise_tenants"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    admin_user_id = Column(String, index=True, nullable=False)
+    tenant_hint = Column(String, index=True, nullable=False)
+    tenant_id = Column(String, index=True, nullable=True)
+
+    organization_name = Column(String, nullable=True)
+
+    mode = Column(Enum(EnterpriseMode), default=EnterpriseMode.PREVIEW, nullable=False)
+    consent_status = Column(Enum(TenantConsentStatus), default=TenantConsentStatus.PENDING, nullable=False)
+
+    admin_consent_url = Column(Text, nullable=True)
+
+    app_only_enabled = Column(Boolean, default=False)
+    mailbox_scope_group = Column(String, nullable=True)
+
+    notes = Column(Text, nullable=True)
+
+    created_at = Column(Integer, nullable=True)
+    updated_at = Column(Integer, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("admin_user_id", "tenant_hint", name="uq_enterprise_tenant_admin_tenant"),
+    )
+
+
 class Rule(Base):
     __tablename__ = "rules"
 
     id = Column(Integer, primary_key=True, index=True)
 
-    # MULTI-TENANT SUPPORT
-    user_id = Column(String, index=True)
+    user_id = Column(String, index=True, nullable=False)
 
-    # Rule condition (human readable)
-    condition = Column(String)
+    condition = Column(String, nullable=False)
+    keyword = Column(String, nullable=False)
 
-    # actual match field used by backend logic
-    keyword = Column(String, index=True)
+    action = Column(Enum(RuleAction), nullable=False)
 
-    action = Column(Enum(RuleAction))
-
-    # Action targets
     target_folder = Column(String, nullable=True)
     forward_to = Column(String, nullable=True)
 
-    # Enable / disable rule
     is_active = Column(Boolean, default=True)
 
-    # Timestamp
-    created_at = Column(Integer, default=lambda: int(time.time()))
-
-    # Relationships
-    alerts = relationship("Alert", back_populates="rule")
+    created_at = Column(Integer, nullable=True)
 
 
-# =========================
-# TENANT TOKENS
-# =========================
-class TenantToken(Base):
-    __tablename__ = "tenant_tokens"
-
-    tenant_id = Column(String, primary_key=True)
-    session_id = Column(String, primary_key=True)
-
-    access_token = Column(String)
-    refresh_token = Column(String)
-    expires_at = Column(Integer)
-
-    ip_address = Column(String)
-    user_agent = Column(String)
-    location = Column(String)
-
-
-# =========================
-# ALERT MODEL
-# =========================
 class Alert(Base):
     __tablename__ = "alerts"
 
     id = Column(Integer, primary_key=True, index=True)
-
-    # Link to rule
-    rule_id = Column(Integer, ForeignKey("rules.id"))
-
-    # MULTI-TENANT
-    user_id = Column(String, index=True)
-
-    # Alert content
-    message = Column(String)
-
-    # Extra useful metadata
-    email_subject = Column(String)
-    email_from = Column(String)
-    message_id = Column(String)
-
-    # Status tracking
-    status = Column(String, default="triggered")  # triggered | sent | read
-
-    # Timestamp
-    timestamp = Column(Integer, default=lambda: int(time.time()))
-
-    rule = relationship("Rule", back_populates="alerts")
+    user_id = Column(String, index=True, nullable=True)
+    level = Column(String, nullable=True)
+    message = Column(Text, nullable=False)
+    created_at = Column(Integer, nullable=True)
