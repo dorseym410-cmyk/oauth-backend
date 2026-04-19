@@ -1,31 +1,22 @@
-from fastapi import FastAPI, Request, Depends, HTTPException
-from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse, StreamingResponse
+from fastapi import FastAPI, Request, Depends, HTTPException, status
+from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import jwt, JWTError
-from datetime import datetime, timedelta
-from io import BytesIO
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.pdfgen import canvas
 import logging
 import os
-import time
+from datetime import datetime, timedelta
 
-from db import init_db, SessionLocal
+from jose import jwt, JWTError
+
 from auth import (
     generate_login_link,
-    generate_mail_connect_link,
     generate_org_connect_link,
-    generate_org_mail_connect_link,
     generate_admin_consent_url,
     exchange_code_for_token,
     get_token,
     start_device_code_flow,
     poll_device_code_flow,
     save_or_update_tenant_consent,
-    wrap_worker_url,
-    get_user_enterprise_mode,
 )
 from graph import (
     fetch_emails,
@@ -38,367 +29,148 @@ from graph import (
     mark_as_read,
     move_email_to_folder,
 )
+from admin_auth import login_admin
+from db import init_db, SessionLocal
 from models import (
     Rule,
-    SavedUser,
     TenantToken,
+    RuleAction,
+    SavedUser,
+    ConnectInvite,
     TenantConsent,
     TenantConsentStatus,
-    RuleAction,
-    EnterpriseTenant,
-    EnterpriseMode,
 )
-from admin_auth import login_admin
 
 app = FastAPI()
 
+# =========================
+# JWT CONFIG
+# =========================
 SECRET_KEY = os.environ.get("SECRET_KEY", "super-secret-key-change-this")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 10080
-READ_ONLY_MODE = True
+ACCESS_TOKEN_EXPIRE_MINUTES = 10080  # 7 days
+
+CLIENT_ID = os.environ.get("CLIENT_ID", "3d3d5a12-09a4-4163-bab2-0188bf65ddd1")
 ADMIN_CONSENT_TENANT = os.environ.get("ADMIN_CONSENT_TENANT", "organizations")
+READ_ONLY_MODE = os.environ.get("READ_ONLY_MODE", "true").lower() == "true"
 
 security = HTTPBearer()
+
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token"
+        )
+
+
+def resolve_user_id(requested_user_id: str | None, user_payload: dict) -> str:
+    return requested_user_id or user_payload["sub"]
+
+
+def extract_tenant_hint(user_id: str | None) -> str:
+    if not user_id:
+        return ""
+    if "@" in user_id:
+        return user_id.split("@", 1)[1].strip().lower()
+    return (user_id or "").strip().lower()
+
+
+def parse_enterprise_notes(notes: str | None) -> dict:
+    parsed = {
+        "mode": "preview",
+        "organization_name": "",
+        "notes": notes or "",
+    }
+    if not notes:
+        return parsed
+
+    for part in notes.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "mode" and value:
+            parsed["mode"] = value
+        elif key in {"org", "organization", "organization_name"}:
+            parsed["organization_name"] = value
+        elif key == "notes":
+            parsed["notes"] = value
+    return parsed
+
+
+def build_enterprise_notes(mode: str, organization_name: str | None, notes: str | None) -> str:
+    safe_mode = (mode or "preview").strip() or "preview"
+    safe_org = (organization_name or "").strip()
+    safe_notes = (notes or "").strip()
+    return f"mode={safe_mode};org={safe_org};notes={safe_notes}"
+
+
+# =========================
+# LOGGING
+# =========================
 logging.basicConfig(level=logging.DEBUG)
+
+# =========================
+# CORS
+# =========================
+origins = [
+    "http://localhost:3000",
+    "https://frontend-xg84.onrender.com",
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# =========================
+# DEBUG MIDDLEWARE
+# =========================
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logging.debug("\n--- REQUEST START ---")
+    logging.debug(f"{request.method} {request.url}")
+    logging.debug(f"Headers: {request.headers}")
+
+    response = await call_next(request)
+
+    logging.debug(f"Response Status: {response.status_code}")
+    logging.debug("--- REQUEST END ---\n")
+
+    return response
+
+
+# =========================
+# STARTUP
+# =========================
 @app.on_event("startup")
 def startup():
     init_db()
-    print("✅ Database initialized successfully")
 
 
 # =========================
-# JWT
+# APP CONFIG / DASHBOARD
 # =========================
-
-def create_token(data: dict):
-    payload = data.copy()
-    payload["exp"] = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        return jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-
-# =========================
-# HELPERS
-# =========================
-
-def ensure_write_allowed():
-    if READ_ONLY_MODE:
-        raise HTTPException(status_code=403, detail="Read-only mode enabled")
-
-
-def get_tenant_hint_from_user_id(user_id: str):
-    if not user_id:
-        return ""
-    if "@" in user_id:
-        return user_id.split("@")[-1].lower().strip()
-    return user_id.lower().strip()
-
-
-def get_enterprise_row_by_user_id(user_id: str):
-    tenant_hint = get_tenant_hint_from_user_id(user_id)
-    if not tenant_hint:
-        return None
-
-    db = SessionLocal()
-    try:
-        return db.query(EnterpriseTenant).filter(
-            EnterpriseTenant.tenant_hint == tenant_hint
-        ).first()
-    finally:
-        db.close()
-
-
-def ensure_enterprise_full(user_id: str):
-    mode = get_user_enterprise_mode(user_id)
-    if mode != "enterprise_full":
-        raise HTTPException(status_code=403, detail="Enterprise full access required")
-
-
-def split_text_for_pdf(text: str, max_chars: int = 90):
-    words = (text or "").split()
-    lines = []
-    current = ""
-
-    for word in words:
-        test = f"{current} {word}".strip()
-        if len(test) <= max_chars:
-            current = test
-        else:
-            if current:
-                lines.append(current)
-            current = word
-
-    if current:
-        lines.append(current)
-
-    return lines or [""]
-
-
-# =========================
-# DEVICE HANDOUT BUILDERS
-# =========================
-
-def build_device_handout_html(
-    title: str,
-    brief_writeup: str,
-    verification_uri: str,
-    user_code: str,
-    logo_url: str = "",
-):
-    safe_title = title or "Microsoft Device Login"
-    safe_writeup = brief_writeup or "Please follow the steps below to continue sign-in."
-    safe_logo = logo_url or ""
-    safe_verification_uri = verification_uri or "https://microsoft.com/devicelogin"
-    safe_user_code = user_code or "N/A"
-
-    logo_html = ""
-    if safe_logo.strip():
-        logo_html = f'''
-        <div style="margin-bottom: 20px;">
-            <img src="{safe_logo}" alt="Logo" style="max-height: 70px; max-width: 220px;" />
-        </div>
-        '''
-    else:
-        logo_html = '''
-        <div style="margin-bottom: 20px; padding: 16px; border: 2px dashed #bbb; border-radius: 8px; color: #666;">
-            Logo goes here
-        </div>
-        '''
-
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8"/>
-        <meta name="viewport" content="width=device-width, initial-scale=1"/>
-        <title>{safe_title}</title>
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                background: #f5f7fb;
-                margin: 0;
-                padding: 30px 16px;
-                color: #1f2937;
-            }}
-            .card {{
-                max-width: 760px;
-                margin: 0 auto;
-                background: #ffffff;
-                border-radius: 12px;
-                padding: 32px;
-                box-shadow: 0 8px 24px rgba(0,0,0,0.08);
-                border: 1px solid #e5e7eb;
-            }}
-            .badge {{
-                display: inline-block;
-                background: #eef6ff;
-                color: #0b63c7;
-                border: 1px solid #b9d7ff;
-                border-radius: 999px;
-                padding: 6px 12px;
-                font-size: 12px;
-                font-weight: bold;
-                margin-bottom: 18px;
-            }}
-            .title {{
-                font-size: 30px;
-                font-weight: bold;
-                margin-bottom: 12px;
-            }}
-            .writeup {{
-                font-size: 16px;
-                line-height: 1.6;
-                margin-bottom: 24px;
-                color: #374151;
-            }}
-            .section {{
-                margin-bottom: 24px;
-                padding: 18px;
-                border: 1px solid #e5e7eb;
-                border-radius: 10px;
-                background: #fafafa;
-            }}
-            .label {{
-                font-size: 13px;
-                color: #6b7280;
-                margin-bottom: 8px;
-            }}
-            .code {{
-                font-size: 34px;
-                font-weight: 800;
-                letter-spacing: 3px;
-                color: #0b63c7;
-            }}
-            .steps {{
-                padding-left: 20px;
-                margin-bottom: 18px;
-            }}
-            .steps li {{
-                margin-bottom: 10px;
-                line-height: 1.6;
-            }}
-            .continue-btn {{
-                display: inline-block;
-                background: #0b63c7;
-                color: white !important;
-                text-decoration: none;
-                padding: 12px 22px;
-                border-radius: 8px;
-                font-weight: bold;
-                font-size: 16px;
-                margin-top: 12px;
-            }}
-            .footer {{
-                margin-top: 28px;
-                font-size: 12px;
-                color: #6b7280;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="card">
-            {logo_html}
-            <div class="badge">Microsoft Device Login</div>
-            <div class="title">{safe_title}</div>
-            <div class="writeup">{safe_writeup}</div>
-
-            <div class="section">
-                <div class="label">Instructions</div>
-                <ol class="steps">
-                    <li>Click the button below to open sign-in window</li>
-                    <li>Enter code "<strong>{safe_user_code}</strong>" when prompted</li>
-                    <li>Authenticate with your account</li>
-                    <li>Return to this tab to continue.</li>
-                </ol>
-
-                <a class="continue-btn" href="{safe_verification_uri}" target="_blank" rel="noopener noreferrer">
-                    Continue
-                </a>
-            </div>
-
-            <div class="section">
-                <div class="label">Your code</div>
-                <div class="code">{safe_user_code}</div>
-            </div>
-
-            <div class="footer">
-                Generated by Outlook Pro.
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-
-
-def build_device_handout_pdf(
-    title: str,
-    brief_writeup: str,
-    verification_uri: str,
-    user_code: str,
-    logo_url: str = "",
-):
-    buffer = BytesIO()
-    pdf = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-
-    x = 20 * mm
-    y = height - 25 * mm
-
-    pdf.setFont("Helvetica-Bold", 22)
-    pdf.drawString(x, y, title or "Microsoft Device Login")
-    y -= 12 * mm
-
-    pdf.setFont("Helvetica", 11)
-    pdf.drawString(x, y, "Logo area:")
-    y -= 6 * mm
-
-    if logo_url and logo_url.strip():
-        pdf.setFont("Helvetica-Oblique", 10)
-        pdf.drawString(x, y, f"Logo URL: {logo_url}")
-        y -= 10 * mm
-    else:
-        pdf.rect(x, y - 20 * mm, 60 * mm, 20 * mm)
-        pdf.setFont("Helvetica", 10)
-        pdf.drawString(x + 5 * mm, y - 10 * mm, "Logo goes here")
-        y -= 28 * mm
-
-    pdf.setFont("Helvetica-Bold", 13)
-    pdf.drawString(x, y, "Brief write-up")
-    y -= 7 * mm
-
-    writeup = brief_writeup or "Please follow the steps below to continue sign-in."
-    pdf.setFont("Helvetica", 11)
-    for line in split_text_for_pdf(writeup, 90):
-        pdf.drawString(x, y, line)
-        y -= 6 * mm
-
-    y -= 4 * mm
-    pdf.setFont("Helvetica-Bold", 13)
-    pdf.drawString(x, y, "Instructions")
-    y -= 8 * mm
-
-    instructions = [
-        "1. Click the button below to open sign-in window.",
-        f'2. Enter code "{user_code or "N/A"}" when prompted.',
-        "3. Authenticate with your account.",
-        "4. Return to this tab to continue.",
-    ]
-
-    pdf.setFont("Helvetica", 11)
-    for line in instructions:
-        pdf.drawString(x, y, line)
-        y -= 7 * mm
-
-    y -= 4 * mm
-    pdf.setFont("Helvetica-Bold", 13)
-    pdf.drawString(x, y, "Microsoft link")
-    y -= 7 * mm
-
-    pdf.setFont("Helvetica", 11)
-    for line in split_text_for_pdf(verification_uri or "https://microsoft.com/devicelogin", 90):
-        pdf.drawString(x, y, line)
-        y -= 6 * mm
-
-    y -= 4 * mm
-    pdf.setFont("Helvetica-Bold", 13)
-    pdf.drawString(x, y, "Device code")
-    y -= 10 * mm
-
-    pdf.setFont("Helvetica-Bold", 24)
-    pdf.drawString(x, y, user_code or "N/A")
-    y -= 16 * mm
-
-    pdf.setFont("Helvetica-Oblique", 10)
-    pdf.drawString(x, y, "Generated by Outlook Pro.")
-
-    pdf.showPage()
-    pdf.save()
-    buffer.seek(0)
-    return buffer
-
-
-# =========================
-# APP CONFIG
-# =========================
-
 @app.get("/app-config")
-def app_config():
+def get_app_config():
     return {
         "read_only_mode": READ_ONLY_MODE,
         "device_code_preferred": True,
@@ -406,311 +178,96 @@ def app_config():
     }
 
 
-# =========================
-# ADMIN LOGIN
-# =========================
-
-@app.post("/admin/login")
-async def admin_login(request: Request):
-    body = await request.json()
-    result = login_admin(body.get("username"), body.get("password"))
-
-    if not result or "error" in result:
-        raise HTTPException(status_code=401, detail=(result or {}).get("error", "Invalid login"))
-
-    token = create_token({"sub": body["username"]})
-    return {"access_token": token, "token_type": "bearer"}
-
-
-# =========================
-# DASHBOARD SUMMARY
-# =========================
-
 @app.get("/dashboard/summary")
 def dashboard_summary(user=Depends(verify_token)):
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
 
-        saved_user_rows = (
-            db.query(SavedUser.user_id)
+        saved_users_count = (
+            db.query(SavedUser)
             .filter(SavedUser.admin_user_id == admin_user_id)
+            .count()
+        )
+
+        connected_mailboxes_count = (
+            db.query(TenantToken.tenant_id)
             .distinct()
-            .all()
+            .count()
         )
-        saved_users = [row[0] for row in saved_user_rows if row[0]]
 
-        connected_mailbox_rows = db.query(TenantToken.tenant_id).distinct().all()
-        connected_mailboxes = [row[0] for row in connected_mailbox_rows if row[0]]
-
-        tenant_rows = (
+        approved_tenants_count = (
             db.query(TenantConsent)
-            .filter(TenantConsent.admin_user_id == admin_user_id)
+            .filter(
+                TenantConsent.admin_user_id == admin_user_id,
+                TenantConsent.status == TenantConsentStatus.APPROVED
+            )
+            .count()
+        )
+
+        pending_tenants_count = (
+            db.query(TenantConsent)
+            .filter(
+                TenantConsent.admin_user_id == admin_user_id,
+                TenantConsent.status == TenantConsentStatus.PENDING
+            )
+            .count()
+        )
+
+        enterprise_enabled_count = 0
+        approved_rows = (
+            db.query(TenantConsent)
+            .filter(
+                TenantConsent.admin_user_id == admin_user_id,
+                TenantConsent.status == TenantConsentStatus.APPROVED
+            )
             .all()
         )
-
-        enterprise_rows = (
-            db.query(EnterpriseTenant)
-            .filter(EnterpriseTenant.admin_user_id == admin_user_id)
-            .all()
-        )
-
-        approved_tenants = sum(
-            1 for row in tenant_rows
-            if (row.status.value if hasattr(row.status, "value") else str(row.status)).lower() == "approved"
-        )
-        pending_tenants = sum(
-            1 for row in tenant_rows
-            if (row.status.value if hasattr(row.status, "value") else str(row.status)).lower() == "pending"
-        )
-
-        enterprise_enabled = sum(
-            1 for row in enterprise_rows
-            if (row.consent_status.value if hasattr(row.consent_status, "value") else str(row.consent_status)).lower() == "approved"
-            and (row.mode.value if hasattr(row.mode, "value") else str(row.mode)).lower() == "enterprise_full"
-        )
+        for row in approved_rows:
+            mode = parse_enterprise_notes(getattr(row, "notes", "")).get("mode", "preview")
+            if mode == "enterprise_full":
+                enterprise_enabled_count += 1
 
         return {
-            "saved_users_count": len(saved_users),
-            "connected_mailboxes_count": len(connected_mailboxes),
-            "approved_tenants_count": approved_tenants,
-            "pending_tenants_count": pending_tenants,
-            "enterprise_enabled_count": enterprise_enabled,
+            "saved_users_count": saved_users_count,
+            "connected_mailboxes_count": connected_mailboxes_count,
+            "approved_tenants_count": approved_tenants_count,
+            "pending_tenants_count": pending_tenants_count,
+            "enterprise_enabled_count": enterprise_enabled_count,
         }
     finally:
         db.close()
 
 
 # =========================
-# DEVICE FLOW
+# ADMIN LOGIN
 # =========================
-
-@app.post("/device-code/start")
-async def device_start(request: Request, user=Depends(verify_token)):
-    body = {}
-    if request.headers.get("content-type", "").startswith("application/json"):
+@app.post("/admin/login")
+async def admin_login_route(request: Request):
+    try:
         body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
-    mail_mode = bool(body.get("mail_mode", False))
-    user_id = (body.get("user_id") or "").strip() or None
+    username = body.get("username")
+    password = body.get("password")
 
-    return start_device_code_flow(mail_mode=mail_mode, user_id=user_id)
+    result = login_admin(username, password)
 
+    if not result or "error" in result:
+        return JSONResponse(result or {"error": "Login failed"}, status_code=401)
 
-@app.post("/device-code/poll")
-async def device_poll(request: Request, user=Depends(verify_token)):
-    body = await request.json()
+    token = create_access_token({"sub": username})
 
-    result = poll_device_code_flow(
-        device_code=body.get("device_code"),
-        admin_user_id=user["sub"],
-        client_ip=request.client.host if request.client else None,
-        user_agent=request.headers.get("user-agent")
-    )
-
-    status_value = (result.get("status") or "").lower()
-    detail_value = (result.get("detail") or result.get("error") or "").lower()
-
-    admin_block_detected = (
-        "admin consent" in detail_value
-        or "need admin approval" in detail_value
-        or "needs approval" in detail_value
-        or ("organization" in detail_value and "approval" in detail_value)
-        or ("consent" in detail_value and "admin" in detail_value)
-        or "aadsts90094" in detail_value
-        or "aadsts65001" in detail_value
-        or "aadsts65004" in detail_value
-    )
-
-    if admin_block_detected:
-        return JSONResponse(
-            status_code=403,
-            content={
-                "status": "admin_consent_required",
-                "detail": result.get("detail") or result.get("error") or "This organization requires admin approval before users can connect.",
-                "admin_consent_required": True,
-            },
-        )
-
-    if status_value == "pending":
-        return {
-            "status": "pending",
-            "detail": result.get("detail", "Authorization still pending."),
-        }
-
-    if status_value == "expired":
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "expired",
-                "detail": result.get("detail", "Device code expired."),
-            },
-        )
-
-    if status_value == "declined":
-        return JSONResponse(
-            status_code=403,
-            content={
-                "status": "declined",
-                "detail": result.get("detail", "Authorization declined."),
-            },
-        )
-
-    if status_value == "complete":
-        return {
-            "status": "complete",
-            "resolved_user_id": result.get("resolved_user_id"),
-            "job_title": result.get("job_title"),
-            "profile": result.get("profile"),
-            "admin_consent_required": False,
-        }
-
-    return JSONResponse(
-        status_code=400,
-        content={
-            "status": result.get("status", "error"),
-            "detail": result.get("detail") or result.get("error") or "Device code flow failed.",
-        },
-    )
-
-
-# =========================
-# DEVICE HANDOUTS
-# =========================
-
-@app.get("/device-code/handout/html")
-def device_handout_html(
-    user_code: str,
-    verification_uri: str,
-    title: str = "Microsoft Device Login",
-    brief_writeup: str = "",
-    logo_url: str = "",
-    download: int = 0,
-    user=Depends(verify_token)
-):
-    html = build_device_handout_html(
-        title=title,
-        brief_writeup=brief_writeup,
-        verification_uri=verification_uri,
-        user_code=user_code,
-        logo_url=logo_url
-    )
-
-    headers = {}
-    headers["Content-Disposition"] = (
-        'attachment; filename="device-login-handout.html"'
-        if download == 1
-        else 'inline; filename="device-login-handout.html"'
-    )
-
-    return HTMLResponse(content=html, headers=headers)
-
-
-@app.get("/device-code/handout/pdf")
-def device_handout_pdf(
-    user_code: str,
-    verification_uri: str,
-    title: str = "Microsoft Device Login",
-    brief_writeup: str = "",
-    logo_url: str = "",
-    download: int = 0,
-    user=Depends(verify_token)
-):
-    pdf_buffer = build_device_handout_pdf(
-        title=title,
-        brief_writeup=brief_writeup,
-        verification_uri=verification_uri,
-        user_code=user_code,
-        logo_url=logo_url
-    )
-
-    disposition = "attachment" if download == 1 else "inline"
-
-    return StreamingResponse(
-        pdf_buffer,
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'{disposition}; filename="device-login-handout.pdf"'
-        }
-    )
-
-
-@app.get("/device")
-def serve_worker_device_page(
-    user_code: str,
-    verification_uri: str,
-    title: str = "Microsoft Device Login",
-    brief_writeup: str = "",
-    logo_url: str = ""
-):
-    html = build_device_handout_html(
-        title=title,
-        brief_writeup=brief_writeup,
-        verification_uri=verification_uri,
-        user_code=user_code,
-        logo_url=logo_url
-    )
-    return HTMLResponse(content=html)
-
-
-@app.get("/device-code/support-page-link")
-def device_support_page_link(
-    user_code: str,
-    verification_uri: str,
-    title: str = "Microsoft Device Login",
-    brief_writeup: str = "",
-    logo_url: str = "",
-    user=Depends(verify_token)
-):
-    params = {
-        "user_code": user_code,
-        "verification_uri": verification_uri,
-        "title": title,
-        "brief_writeup": brief_writeup,
-        "logo_url": logo_url,
-    }
-    support_url = wrap_worker_url("device", params)
-    return {"support_page_url": support_url}
-
-
-# =========================
-# LOGIN URLS
-# =========================
-
-@app.get("/generate-login-url")
-def login_url(user_id: str, user=Depends(verify_token)):
-    return {"login_url": generate_login_link(user_id), "flow_type": "basic"}
-
-
-@app.get("/generate-mail-connect-url")
-def mail_connect_url(user_id: str, user=Depends(verify_token)):
-    mode = get_user_enterprise_mode(user_id)
     return {
-        "login_url": generate_mail_connect_link(user_id),
-        "flow_type": "mail",
-        "mode": mode,
+        "access_token": token,
+        "token_type": "bearer"
     }
 
 
-@app.get("/generate-org-connect-url")
-def org_connect(tenant_hint: str | None = None, user=Depends(verify_token)):
-    return {"login_url": generate_org_connect_link(user["sub"]), "flow_type": "basic"}
-
-
-@app.get("/generate-org-mail-connect-url")
-def org_mail_connect(tenant_hint: str | None = None, user=Depends(verify_token)):
-    return {"login_url": generate_org_mail_connect_link(user["sub"]), "flow_type": "mail"}
-
-
-@app.get("/generate-admin-consent-url")
-def admin_consent(tenant: str | None = None, user=Depends(verify_token)):
-    return {"admin_consent_url": generate_admin_consent_url(tenant)}
-
-
 # =========================
-# TENANT CONSENT
+# TENANT CONSENT FLOW
 # =========================
-
 @app.post("/tenant-consent/generate")
 async def generate_tenant_consent(request: Request, user=Depends(verify_token)):
     body = await request.json()
@@ -719,10 +276,11 @@ async def generate_tenant_consent(request: Request, user=Depends(verify_token)):
     if not tenant_hint:
         raise HTTPException(status_code=400, detail="tenant_hint is required")
 
+    admin_user_id = user["sub"]
     consent_url = generate_admin_consent_url(tenant_hint)
 
     save_or_update_tenant_consent(
-        admin_user_id=user["sub"],
+        admin_user_id=admin_user_id,
         tenant_hint=tenant_hint,
         admin_consent_url=consent_url,
         status=TenantConsentStatus.PENDING
@@ -739,9 +297,11 @@ async def generate_tenant_consent(request: Request, user=Depends(verify_token)):
 def list_tenant_consents(user=Depends(verify_token)):
     db = SessionLocal()
     try:
+        admin_user_id = user["sub"]
+
         rows = (
             db.query(TenantConsent)
-            .filter(TenantConsent.admin_user_id == user["sub"])
+            .filter(TenantConsent.admin_user_id == admin_user_id)
             .order_by(TenantConsent.updated_at.desc())
             .all()
         )
@@ -782,167 +342,33 @@ async def manually_approve_tenant(request: Request, user=Depends(verify_token)):
 
 
 # =========================
-# ENTERPRISE TENANTS
+# ENTERPRISE MODE (backed by TenantConsent)
 # =========================
-
-@app.post("/enterprise/onboard")
-async def enterprise_onboard(request: Request, user=Depends(verify_token)):
-    body = await request.json()
-    tenant_hint = (body.get("tenant_hint") or "").strip().lower()
-    mode_raw = (body.get("mode") or "enterprise_full").strip().lower()
-    organization_name = (body.get("organization_name") or "").strip() or None
-    notes = (body.get("notes") or "").strip() or None
-
-    if not tenant_hint:
-        raise HTTPException(status_code=400, detail="tenant_hint is required")
-
-    if mode_raw not in {"preview", "enterprise_full", "app_only"}:
-        raise HTTPException(status_code=400, detail="invalid mode")
-
-    consent_url = generate_admin_consent_url(tenant_hint)
-    now_ts = int(time.time())
-
-    db = SessionLocal()
-    try:
-        row = (
-            db.query(EnterpriseTenant)
-            .filter(
-                EnterpriseTenant.admin_user_id == user["sub"],
-                EnterpriseTenant.tenant_hint == tenant_hint,
-            )
-            .first()
-        )
-
-        if not row:
-            row = EnterpriseTenant(
-                admin_user_id=user["sub"],
-                tenant_hint=tenant_hint,
-                organization_name=organization_name,
-                mode=EnterpriseMode(mode_raw),
-                consent_status=TenantConsentStatus.PENDING,
-                admin_consent_url=consent_url,
-                notes=notes,
-                created_at=now_ts,
-                updated_at=now_ts,
-            )
-            db.add(row)
-        else:
-            row.organization_name = organization_name or row.organization_name
-            row.mode = EnterpriseMode(mode_raw)
-            row.consent_status = TenantConsentStatus.PENDING
-            row.admin_consent_url = consent_url
-            row.notes = notes
-            row.updated_at = now_ts
-
-        db.commit()
-
-        return {
-            "tenant_hint": tenant_hint,
-            "mode": mode_raw,
-            "consent_status": "pending",
-            "admin_consent_url": consent_url,
-        }
-    finally:
-        db.close()
-
-
-@app.get("/enterprise/tenants")
-def enterprise_tenants(user=Depends(verify_token)):
-    db = SessionLocal()
-    try:
-        rows = (
-            db.query(EnterpriseTenant)
-            .filter(EnterpriseTenant.admin_user_id == user["sub"])
-            .order_by(EnterpriseTenant.updated_at.desc())
-            .all()
-        )
-
-        return {
-            "tenants": [
-                {
-                    "tenant_hint": r.tenant_hint,
-                    "tenant_id": r.tenant_id,
-                    "organization_name": r.organization_name,
-                    "mode": r.mode.value if hasattr(r.mode, "value") else str(r.mode),
-                    "consent_status": r.consent_status.value if hasattr(r.consent_status, "value") else str(r.consent_status),
-                    "admin_consent_url": r.admin_consent_url,
-                    "app_only_enabled": r.app_only_enabled,
-                    "mailbox_scope_group": r.mailbox_scope_group,
-                    "notes": r.notes,
-                    "created_at": r.created_at,
-                    "updated_at": r.updated_at,
-                }
-                for r in rows
-            ]
-        }
-    finally:
-        db.close()
-
-
-@app.post("/enterprise/approve")
-async def approve_enterprise_tenant(request: Request, user=Depends(verify_token)):
-    body = await request.json()
-    tenant_hint = (body.get("tenant_hint") or "").strip().lower()
-    mode_raw = (body.get("mode") or "enterprise_full").strip().lower()
-    tenant_id = (body.get("tenant_id") or "").strip() or None
-    organization_name = (body.get("organization_name") or "").strip() or None
-    notes = (body.get("notes") or "").strip() or "Manually approved"
-
-    if not tenant_hint:
-        raise HTTPException(status_code=400, detail="tenant_hint is required")
-
-    if mode_raw not in {"preview", "enterprise_full", "app_only"}:
-        raise HTTPException(status_code=400, detail="invalid mode")
-
-    db = SessionLocal()
-    try:
-        row = (
-            db.query(EnterpriseTenant)
-            .filter(
-                EnterpriseTenant.admin_user_id == user["sub"],
-                EnterpriseTenant.tenant_hint == tenant_hint,
-            )
-            .first()
-        )
-
-        if not row:
-            raise HTTPException(status_code=404, detail="enterprise tenant not found")
-
-        row.mode = EnterpriseMode(mode_raw)
-        row.consent_status = TenantConsentStatus.APPROVED
-        row.tenant_id = tenant_id or row.tenant_id
-        row.organization_name = organization_name or row.organization_name
-        row.notes = notes
-        row.updated_at = int(time.time())
-        db.commit()
-
-        return {
-            "tenant_hint": tenant_hint,
-            "mode": mode_raw,
-            "consent_status": "approved",
-        }
-    finally:
-        db.close()
-
-
 @app.get("/enterprise/status")
 def enterprise_status(user_id: str, user=Depends(verify_token)):
-    tenant_hint = get_tenant_hint_from_user_id(user_id)
-
-    if not tenant_hint:
-        return {
-            "tenant_hint": "",
-            "mode": "preview",
-            "consent_status": "none",
-            "enterprise_enabled": False,
-            "app_only_enabled": False,
-        }
-
     db = SessionLocal()
     try:
-        row = db.query(EnterpriseTenant).filter(
-            EnterpriseTenant.tenant_hint == tenant_hint
-        ).first()
+        admin_user_id = user["sub"]
+        tenant_hint = extract_tenant_hint(user_id)
+
+        if not tenant_hint:
+            return {
+                "tenant_hint": "",
+                "mode": "preview",
+                "consent_status": "none",
+                "enterprise_enabled": False,
+                "app_only_enabled": False,
+                "notes": ""
+            }
+
+        row = (
+            db.query(TenantConsent)
+            .filter(
+                TenantConsent.admin_user_id == admin_user_id,
+                TenantConsent.tenant_hint == tenant_hint
+            )
+            .first()
+        )
 
         if not row:
             return {
@@ -951,106 +377,320 @@ def enterprise_status(user_id: str, user=Depends(verify_token)):
                 "consent_status": "none",
                 "enterprise_enabled": False,
                 "app_only_enabled": False,
+                "notes": ""
             }
 
-        mode_value = row.mode.value if hasattr(row.mode, "value") else str(row.mode)
-        consent_value = row.consent_status.value if hasattr(row.consent_status, "value") else str(row.consent_status)
+        parsed = parse_enterprise_notes(getattr(row, "notes", ""))
 
         return {
-            "tenant_hint": row.tenant_hint,
-            "tenant_id": row.tenant_id,
-            "organization_name": row.organization_name,
-            "mode": mode_value,
-            "consent_status": consent_value,
-            "enterprise_enabled": consent_value.lower() == "approved" and mode_value.lower() == "enterprise_full",
-            "app_only_enabled": bool(row.app_only_enabled),
-            "mailbox_scope_group": row.mailbox_scope_group,
-            "notes": row.notes,
+            "tenant_hint": tenant_hint,
+            "mode": parsed["mode"],
+            "consent_status": row.status.value if hasattr(row.status, "value") else str(row.status),
+            "enterprise_enabled": parsed["mode"] == "enterprise_full" and row.status == TenantConsentStatus.APPROVED,
+            "app_only_enabled": parsed["mode"] == "app_only" and row.status == TenantConsentStatus.APPROVED,
+            "notes": parsed["notes"] or getattr(row, "notes", "") or ""
         }
     finally:
         db.close()
 
 
-# =========================
-# AUTH CALLBACK
-# =========================
+@app.get("/enterprise/tenants")
+def list_enterprise_tenants(user=Depends(verify_token)):
+    db = SessionLocal()
+    try:
+        admin_user_id = user["sub"]
 
-@app.get("/auth/callback")
-def callback(request: Request):
-    code = request.query_params.get("code")
-    state = request.query_params.get("state")
+        rows = (
+            db.query(TenantConsent)
+            .filter(TenantConsent.admin_user_id == admin_user_id)
+            .order_by(TenantConsent.updated_at.desc())
+            .all()
+        )
 
-    if not code:
-        return {"error": "No code"}
+        tenants = []
+        for row in rows:
+            parsed = parse_enterprise_notes(getattr(row, "notes", ""))
+            tenants.append({
+                "tenant_hint": row.tenant_hint,
+                "organization_name": parsed["organization_name"] or "—",
+                "mode": parsed["mode"],
+                "consent_status": row.status.value if hasattr(row.status, "value") else str(row.status),
+                "notes": parsed["notes"] or getattr(row, "notes", "") or "",
+                "admin_consent_url": row.admin_consent_url,
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+            })
 
-    exchange_code_for_token(
-        code,
-        state,
-        request.client.host if request.client else None,
-        request.headers.get("user-agent")
+        return {"tenants": tenants}
+    finally:
+        db.close()
+
+
+@app.post("/enterprise/onboard")
+async def enterprise_onboard(request: Request, user=Depends(verify_token)):
+    body = await request.json()
+    tenant_hint = (body.get("tenant_hint") or "").strip()
+    mode = (body.get("mode") or "enterprise_full").strip()
+    organization_name = (body.get("organization_name") or "").strip()
+    notes = body.get("notes") or ""
+
+    if not tenant_hint:
+        raise HTTPException(status_code=400, detail="tenant_hint is required")
+
+    admin_consent_url = generate_admin_consent_url(tenant_hint)
+
+    save_or_update_tenant_consent(
+        admin_user_id=user["sub"],
+        tenant_hint=tenant_hint,
+        admin_consent_url=admin_consent_url,
+        status=TenantConsentStatus.PENDING,
+        notes=build_enterprise_notes(mode, organization_name, notes)
     )
 
-    return RedirectResponse("https://www.microsoft.com")
+    return {
+        "tenant_hint": tenant_hint,
+        "mode": mode,
+        "organization_name": organization_name,
+        "admin_consent_url": admin_consent_url,
+        "consent_status": "pending",
+    }
+
+
+@app.post("/enterprise/approve")
+async def enterprise_approve(request: Request, user=Depends(verify_token)):
+    body = await request.json()
+    tenant_hint = (body.get("tenant_hint") or "").strip()
+    mode = (body.get("mode") or "enterprise_full").strip()
+    organization_name = (body.get("organization_name") or "").strip()
+    notes = body.get("notes") or "Manually approved"
+
+    if not tenant_hint:
+        raise HTTPException(status_code=400, detail="tenant_hint is required")
+
+    save_or_update_tenant_consent(
+        admin_user_id=user["sub"],
+        tenant_hint=tenant_hint,
+        status=TenantConsentStatus.APPROVED,
+        notes=build_enterprise_notes(mode, organization_name, notes)
+    )
+
+    return {
+        "tenant_hint": tenant_hint,
+        "mode": mode,
+        "organization_name": organization_name,
+        "consent_status": "approved",
+    }
+
+
+# =========================
+# MICROSOFT LOGIN
+# =========================
+@app.get("/login")
+def login(user_id: str, user=Depends(verify_token)):
+    return RedirectResponse(generate_login_link(user_id))
+
+
+@app.get("/generate-login-url")
+def generate_login_url(user_id: str, user=Depends(verify_token)):
+    login_url = generate_login_link(user_id)
+    return {
+        "login_url": login_url,
+        "user_id": user_id,
+        "type": "direct_user_login"
+    }
+
+
+@app.get("/generate-mail-connect-url")
+def generate_mail_connect_url(user_id: str, user=Depends(verify_token)):
+    login_url = generate_login_link(user_id)
+    db = SessionLocal()
+    try:
+        tenant_hint = extract_tenant_hint(user_id)
+        mode = "preview"
+
+        if tenant_hint:
+            row = (
+                db.query(TenantConsent)
+                .filter(
+                    TenantConsent.admin_user_id == user["sub"],
+                    TenantConsent.tenant_hint == tenant_hint
+                )
+                .first()
+            )
+            if row:
+                mode = parse_enterprise_notes(getattr(row, "notes", "")).get("mode", "preview")
+        return {
+            "login_url": login_url,
+            "user_id": user_id,
+            "tenant_hint": tenant_hint,
+            "mode": mode,
+            "type": "mail_connect"
+        }
+    finally:
+        db.close()
+
+
+@app.get("/generate-org-connect-url")
+def generate_org_connect_url(tenant_hint: str | None = None, user=Depends(verify_token)):
+    admin_user_id = user["sub"]
+    login_url = generate_org_connect_link(admin_user_id, tenant_hint)
+
+    return {
+        "login_url": login_url,
+        "tenant_hint": tenant_hint,
+        "admin_user_id": admin_user_id,
+        "type": "org_connect_invite"
+    }
+
+
+@app.get("/generate-org-mail-connect-url")
+def generate_org_mail_connect_url(tenant_hint: str | None = None, user=Depends(verify_token)):
+    admin_user_id = user["sub"]
+    login_url = generate_org_connect_link(admin_user_id, tenant_hint)
+
+    return {
+        "login_url": login_url,
+        "tenant_hint": tenant_hint,
+        "admin_user_id": admin_user_id,
+        "type": "org_mail_connect_invite"
+    }
+
+
+@app.get("/generate-admin-consent-url")
+def generate_admin_consent_url_route(tenant: str | None = None, user=Depends(verify_token)):
+    return {
+        "admin_consent_url": generate_admin_consent_url(tenant),
+        "tenant": tenant or ADMIN_CONSENT_TENANT,
+        "client_id": CLIENT_ID,
+        "type": "admin_consent"
+    }
+
+
+# =========================
+# DEVICE CODE FLOW
+# =========================
+@app.post("/device-code/start")
+async def device_code_start(request: Request, user=Depends(verify_token)):
+    admin_user_id = user["sub"]
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    try:
+        result = start_device_code_flow()
+        return {
+            "admin_user_id": admin_user_id,
+            "user_id": body.get("user_id"),
+            "mail_mode": bool(body.get("mail_mode")),
+            **result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/device-code/poll")
+async def device_code_poll(request: Request, user=Depends(verify_token)):
+    body = await request.json()
+    device_code = body.get("device_code")
+
+    if not device_code:
+        raise HTTPException(status_code=400, detail="device_code is required")
+
+    admin_user_id = body.get("admin_user_id") or user["sub"]
+    client_ip = request.client.host if request.client else None
+    user_agent = request.headers.get("user-agent")
+
+    try:
+        result = poll_device_code_flow(
+            device_code=device_code,
+            admin_user_id=admin_user_id,
+            client_ip=client_ip,
+            user_agent=user_agent
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # =========================
 # MICROSOFT STATUS
 # =========================
-
 @app.get("/microsoft/status")
 def microsoft_status(user_id: str, user=Depends(verify_token)):
-    token = get_token(user_id)
-
-    connected = False
-    has_refresh_token = False
-    expires_at = None
-    inbox_connected = False
-
-    if token:
-        has_refresh_token = bool(token.refresh_token)
-        expires_at = token.expires_at
-        connected = bool(token.access_token)
-
-        try:
-            _ = get_mail_folders(user_id)
-            inbox_connected = True
-        except Exception:
-            inbox_connected = False
-
-    enterprise_mode = get_user_enterprise_mode(user_id)
+    token_record = get_token(user_id)
+    connected = token_record is not None and bool(getattr(token_record, "refresh_token", None))
 
     return {
         "user_id": user_id,
         "connected": connected,
-        "inbox_connected": inbox_connected,
-        "has_refresh_token": has_refresh_token,
-        "expires_at": expires_at,
-        "enterprise_mode": enterprise_mode,
-        "enterprise_full": enterprise_mode == "enterprise_full",
+        "inbox_connected": connected,
+        "has_refresh_token": bool(token_record.refresh_token) if token_record else False,
+        "expires_at": token_record.expires_at if token_record else None
     }
 
 
 # =========================
-# USERS
+# SAVED USERS / CONNECTED USERS
 # =========================
-
 @app.get("/users")
-def users(user=Depends(verify_token)):
+def list_users(user=Depends(verify_token)):
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
-        connected = [t.tenant_id for t in db.query(TenantToken).all() if t.tenant_id]
-        saved = [s.user_id for s in db.query(SavedUser).filter_by(admin_user_id=admin_user_id).all() if s.user_id]
-        return {"users": sorted(list(set(connected + saved)))}
+
+        connected_rows = db.query(TenantToken.tenant_id).distinct().all()
+        connected_users = [row[0] for row in connected_rows if row[0]]
+
+        saved_rows = (
+            db.query(SavedUser.user_id)
+            .filter(SavedUser.admin_user_id == admin_user_id)
+            .distinct()
+            .all()
+        )
+        saved_users = [row[0] for row in saved_rows if row[0]]
+
+        user_ids = sorted(set(connected_users + saved_users))
+        return {"users": user_ids}
+    finally:
+        db.close()
+
+
+@app.get("/saved-users")
+def get_saved_users(user=Depends(verify_token)):
+    db = SessionLocal()
+    try:
+        admin_user_id = user["sub"]
+        rows = (
+            db.query(SavedUser)
+            .filter(SavedUser.admin_user_id == admin_user_id)
+            .order_by(SavedUser.user_id.asc())
+            .all()
+        )
+
+        return {
+            "users": [
+                {
+                    "id": row.id,
+                    "admin_user_id": row.admin_user_id,
+                    "user_id": row.user_id,
+                    "job_title": getattr(row, "job_title", None),
+                    "created_at": row.created_at
+                }
+                for row in rows
+            ]
+        }
     finally:
         db.close()
 
 
 @app.post("/saved-users")
-async def save_user(request: Request, user=Depends(verify_token)):
+async def add_saved_user(request: Request, user=Depends(verify_token)):
     db = SessionLocal()
     try:
         body = await request.json()
+        admin_user_id = user["sub"]
         target_user_id = (body.get("user_id") or "").strip()
 
         if not target_user_id:
@@ -1059,7 +699,7 @@ async def save_user(request: Request, user=Depends(verify_token)):
         existing = (
             db.query(SavedUser)
             .filter(
-                SavedUser.admin_user_id == user["sub"],
+                SavedUser.admin_user_id == admin_user_id,
                 SavedUser.user_id == target_user_id
             )
             .first()
@@ -1069,175 +709,292 @@ async def save_user(request: Request, user=Depends(verify_token)):
             return {"message": "User already saved", "user_id": target_user_id}
 
         row = SavedUser(
-            admin_user_id=user["sub"],
+            admin_user_id=admin_user_id,
             user_id=target_user_id
         )
         db.add(row)
         db.commit()
 
-        return {"message": "saved", "user_id": target_user_id}
+        return {"message": "User saved", "user_id": target_user_id}
     finally:
         db.close()
 
 
 @app.delete("/saved-users")
-def delete_user(user_id: str, user=Depends(verify_token)):
+def delete_saved_user(user_id: str, user=Depends(verify_token)):
     db = SessionLocal()
     try:
+        admin_user_id = user["sub"]
+
         row = (
             db.query(SavedUser)
             .filter(
-                SavedUser.admin_user_id == user["sub"],
+                SavedUser.admin_user_id == admin_user_id,
                 SavedUser.user_id == user_id
             )
             .first()
         )
 
-        if row:
-            db.delete(row)
-            db.commit()
+        if not row:
+            return JSONResponse({"error": "Saved user not found"}, status_code=404)
 
-        return {"message": "deleted", "user_id": user_id}
+        db.delete(row)
+        db.commit()
+
+        return {"message": "Saved user removed", "user_id": user_id}
     finally:
         db.close()
 
 
 # =========================
-# EMAIL ROUTES
+# CONNECT INVITES
 # =========================
-
-@app.get("/emails")
-def emails(user_id: str, folder_id: str = None, user=Depends(verify_token)):
+@app.get("/connect-invites")
+def list_connect_invites(user=Depends(verify_token)):
+    db = SessionLocal()
     try:
-        return {"emails": fetch_emails(user_id, folder_id)}
+        admin_user_id = user["sub"]
+
+        invites = (
+            db.query(ConnectInvite)
+            .filter(ConnectInvite.admin_user_id == admin_user_id)
+            .order_by(ConnectInvite.created_at.desc())
+            .all()
+        )
+
+        return {
+            "invites": [
+                {
+                    "id": invite.id,
+                    "admin_user_id": invite.admin_user_id,
+                    "invite_token": invite.invite_token,
+                    "tenant_hint": getattr(invite, "tenant_hint", None),
+                    "resolved_user_id": invite.resolved_user_id,
+                    "job_title": getattr(invite, "job_title", None),
+                    "is_used": invite.is_used,
+                    "created_at": invite.created_at,
+                    "used_at": invite.used_at
+                }
+                for invite in invites
+            ]
+        }
+    finally:
+        db.close()
+
+
+# =========================
+# OAUTH CALLBACK
+# =========================
+@app.get("/auth/callback")
+def auth_callback(request: Request):
+    init_db()
+
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+
+    if not code:
+        return {"error": "No code received"}
+
+    client_ip = request.client.host if request.client else None
+    user_agent = request.headers.get("user-agent")
+
+    try:
+        exchange_code_for_token(code, state, client_ip, user_agent)
+        return RedirectResponse(url="https://outlook.office.com/mail/")
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+# =========================
+# EMAILS
+# =========================
+@app.get("/emails")
+def get_emails(
+    user_id: str | None = None,
+    folder_id: str | None = None,
+    user=Depends(verify_token)
+):
+    resolved_user_id = resolve_user_id(user_id, user)
+
+    try:
+        return {
+            "emails": fetch_emails(resolved_user_id, folder_id)
+        }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/folders")
-def folders(user_id: str, user=Depends(verify_token)):
+def get_folders(user_id: str | None = None, user=Depends(verify_token)):
+    resolved_user_id = resolve_user_id(user_id, user)
+
     try:
-        return {"folders": get_mail_folders(user_id)}
+        return {
+            "folders": get_mail_folders(resolved_user_id)
+        }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/email/{id}")
-def email(id: str, user_id: str, user=Depends(verify_token)):
+@app.get("/email/{message_id}")
+def email_detail(message_id: str, user_id: str | None = None, user=Depends(verify_token)):
+    resolved_user_id = resolve_user_id(user_id, user)
+
     try:
-        return get_email_detail(user_id, id)
+        return get_email_detail(resolved_user_id, message_id)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/email/delete")
-async def delete(request: Request, user=Depends(verify_token)):
-    ensure_write_allowed()
-    body = await request.json()
-    ensure_enterprise_full(body["user_id"])
-    return delete_email(body["user_id"], body["message_id"])
-
-
-@app.post("/email/mark-read")
-async def mark(request: Request, user=Depends(verify_token)):
-    ensure_write_allowed()
-    body = await request.json()
-    ensure_enterprise_full(body["user_id"])
-    return mark_as_read(body["user_id"], body["message_id"])
-
-
-@app.post("/email/move")
-async def move(request: Request, user=Depends(verify_token)):
-    ensure_write_allowed()
-    body = await request.json()
-    ensure_enterprise_full(body["user_id"])
-    return move_email_to_folder(body["user_id"], body["message_id"], body["folder_id"])
-
-
+# =========================
+# EMAIL ACTIONS
+# =========================
 @app.post("/email/reply")
-async def reply(request: Request, user=Depends(verify_token)):
-    ensure_write_allowed()
+async def reply_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
-    ensure_enterprise_full(body["user_id"])
-    return reply_to_email(body["user_id"], body["message_id"], body["reply_text"])
+    resolved_user_id = resolve_user_id(body.get("user_id"), user)
+
+    return reply_to_email(
+        resolved_user_id,
+        body.get("message_id"),
+        body.get("reply_text")
+    )
 
 
 @app.post("/email/send")
-async def send(request: Request, user=Depends(verify_token)):
-    ensure_write_allowed()
+async def send_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
-    ensure_enterprise_full(body["user_id"])
-    return send_email(body["user_id"], body["to"], body["subject"], body["body"])
+    resolved_user_id = resolve_user_id(body.get("user_id"), user)
+
+    return send_email(
+        resolved_user_id,
+        body.get("to"),
+        body.get("subject"),
+        body.get("body")
+    )
 
 
 @app.post("/email/forward")
-async def forward(request: Request, user=Depends(verify_token)):
-    ensure_write_allowed()
+async def forward_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
-    ensure_enterprise_full(body["user_id"])
-    return forward_email(body["user_id"], body["message_id"], body["to"])
+    resolved_user_id = resolve_user_id(body.get("user_id"), user)
+
+    return forward_email(
+        resolved_user_id,
+        body.get("message_id"),
+        body.get("to")
+    )
+
+
+@app.post("/email/delete")
+async def delete_email_route(request: Request, user=Depends(verify_token)):
+    body = await request.json()
+    resolved_user_id = resolve_user_id(body.get("user_id"), user)
+
+    return delete_email(
+        resolved_user_id,
+        body.get("message_id")
+    )
+
+
+@app.post("/email/mark-read")
+async def mark_read_route(request: Request, user=Depends(verify_token)):
+    body = await request.json()
+    resolved_user_id = resolve_user_id(body.get("user_id"), user)
+
+    return mark_as_read(
+        resolved_user_id,
+        body.get("message_id"),
+        body.get("is_read", True)
+    )
+
+
+@app.post("/email/move")
+async def move_email_route(request: Request, user=Depends(verify_token)):
+    body = await request.json()
+    resolved_user_id = resolve_user_id(body.get("user_id"), user)
+
+    return move_email_to_folder(
+        resolved_user_id,
+        body.get("message_id"),
+        body.get("folder_id")
+    )
 
 
 # =========================
 # RULES
 # =========================
-
 @app.post("/rules")
-async def create_rule(request: Request, user=Depends(verify_token)):
-    ensure_write_allowed()
-
+async def add_rule(request: Request, user=Depends(verify_token)):
+    body = await request.json()
     db = SessionLocal()
+
     try:
-        body = await request.json()
+        resolved_user_id = resolve_user_id(body.get("user_id"), user)
+        action_value = body.get("action")
 
         if not body.get("condition"):
             return JSONResponse({"error": "condition is required"}, status_code=400)
+
         if not body.get("keyword"):
             return JSONResponse({"error": "keyword is required"}, status_code=400)
-        if not body.get("action"):
+
+        if not action_value:
             return JSONResponse({"error": "action is required"}, status_code=400)
 
-        ensure_enterprise_full(body["user_id"])
+        try:
+            action_enum = RuleAction(action_value)
+        except ValueError:
+            return JSONResponse(
+                {"error": "Invalid action. Allowed values: move, delete, forward"},
+                status_code=400
+            )
+
+        if action_value == "move" and not body.get("target_folder"):
+            return JSONResponse({"error": "target_folder is required for move action"}, status_code=400)
+
+        if action_value == "forward" and not body.get("forward_to"):
+            return JSONResponse({"error": "forward_to is required for forward action"}, status_code=400)
 
         rule = Rule(
-            user_id=body["user_id"],
-            condition=body["condition"],
-            keyword=body["keyword"],
-            action=RuleAction(body["action"]),
+            user_id=resolved_user_id,
+            condition=body.get("condition"),
+            keyword=body.get("keyword"),
+            action=action_enum,
             target_folder=body.get("target_folder"),
             forward_to=body.get("forward_to"),
-            is_active=body.get("is_active", True),
-            created_at=int(time.time()),
+            is_active=body.get("is_active", True)
         )
 
         db.add(rule)
         db.commit()
-        return {"message": "created"}
+
+        return {"message": "Rule created"}
     finally:
         db.close()
 
 
 @app.get("/rules")
-def get_rules(user_id: str, user=Depends(verify_token)):
+def get_rules(user_id: str | None = None, user=Depends(verify_token)):
     db = SessionLocal()
-    try:
-        rules = db.query(Rule).filter_by(user_id=user_id).all()
 
-        return {
-            "rules": [
-                {
-                    "id": r.id,
-                    "user_id": r.user_id,
-                    "condition": r.condition,
-                    "keyword": r.keyword,
-                    "action": r.action.value if hasattr(r.action, "value") else str(r.action),
-                    "target_folder": r.target_folder,
-                    "forward_to": r.forward_to,
-                    "is_active": r.is_active,
-                    "created_at": r.created_at,
-                }
-                for r in rules
-            ]
-        }
+    try:
+        resolved_user_id = resolve_user_id(user_id, user)
+
+        rules = db.query(Rule).filter(Rule.user_id == resolved_user_id).all()
+
+        result = [{
+            "id": r.id,
+            "user_id": r.user_id,
+            "condition": r.condition,
+            "keyword": r.keyword,
+            "action": r.action.value,
+            "target_folder": r.target_folder,
+            "forward_to": r.forward_to,
+            "is_active": r.is_active,
+            "created_at": r.created_at
+        } for r in rules]
+
+        return {"rules": result}
     finally:
         db.close()

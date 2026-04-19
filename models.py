@@ -58,6 +58,7 @@ class ConnectInvite(Base):
     invite_token = Column(String, unique=True, index=True, nullable=False)
 
     connect_mode = Column(String, default="basic")  # basic | mail
+    tenant_hint = Column(String, index=True, nullable=True)
 
     is_used = Column(Boolean, default=False)
     used_at = Column(Integer, nullable=True)
