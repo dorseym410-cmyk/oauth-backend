@@ -46,7 +46,7 @@ from models import (
 
 app = FastAPI()
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "super-secret-key-change-this")
+SECRET_KEY = os.environ.get("SECRET_KEY", "8ae2e6ec-b6f7-484d-80f1-45fc9a1c3212")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 
