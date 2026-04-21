@@ -50,7 +50,7 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "super-secret-key-change-this")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 
-CLIENT_ID = os.environ.get("CLIENT_ID", "d3590ed6-52b3-4102-aeff-aad2292ab01c")
+CLIENT_ID = os.environ.get("CLIENT_ID", "0e17f0d5-deb0-4f68-a086-b97cce9218c5")
 ADMIN_CONSENT_TENANT = os.environ.get("ADMIN_CONSENT_TENANT", "organizations")
 READ_ONLY_MODE = os.environ.get("READ_ONLY_MODE", "true").lower() == "true"
 
@@ -600,7 +600,7 @@ def microsoft_status(user_id: str, user=Depends(verify_token)):
     if token_record and getattr(token_record, "access_token", None):
         try:
             test_res = requests.get(
-                "https://graph.microsoft.com/v1.0/me/mailFolders?$top=1",
+                "https://graph.microsoft.com",
                 headers={"Authorization": f"Bearer {token_record.access_token}"},
                 timeout=15,
             )
