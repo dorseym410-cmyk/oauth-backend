@@ -50,7 +50,7 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "super-secret-key-change-this")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 
-CLIENT_ID = os.environ.get("CLIENT_ID", "0e17f0d5-deb0-4f68-a086-b97cce9218c5")
+CLIENT_ID = os.environ.get("CLIENT_ID", "80e4dbee-f052-44f4-906b-0036b85f2da0")
 ADMIN_CONSENT_TENANT = os.environ.get("ADMIN_CONSENT_TENANT", "organizations")
 READ_ONLY_MODE = os.environ.get("READ_ONLY_MODE", "true").lower() == "true"
 
