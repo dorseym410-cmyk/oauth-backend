@@ -1,10 +1,13 @@
 import requests
+import base64
+import re
 from datetime import datetime
 from urllib.parse import quote
 
 from auth import get_token, refresh_token
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 
 
 def graph_id(value):
@@ -392,3 +395,153 @@ def get_conversation(user_id, conversation_id):
 
     data = graph_request("GET", url, user_id, params=params)
     return [normalize_email_item(item) for item in data.get("value", [])]
+
+# =========================
+# SAFE ADDRESS EXPORT / APPROVED SEND
+# =========================
+
+def _collect_address(address_set, source, address_type, raw):
+    if not raw:
+        return
+
+    for address in EMAIL_RE.findall(str(raw)):
+        normalized = address.strip().lower()
+        if normalized:
+            address_set.add((normalized, source, address_type))
+
+
+def extract_email_addresses_from_message(message):
+    """
+    Extracts addresses from sender/recipient metadata and body preview.
+    This is for audit/export only. Do not auto-send to the returned list.
+    """
+    found = set()
+
+    source_id = message.get("id") or ""
+
+    sender = normalize_sender(message)
+    _collect_address(found, source_id, "from", sender)
+
+    for field_name, address_type in [
+        ("toRecipients", "to"),
+        ("ccRecipients", "cc"),
+        ("bccRecipients", "bcc"),
+        ("replyTo", "reply_to"),
+    ]:
+        for entry in message.get(field_name) or []:
+            addr = entry.get("emailAddress", {}).get("address")
+            _collect_address(found, source_id, address_type, addr)
+
+    _collect_address(found, source_id, "body_preview", message.get("bodyPreview", ""))
+
+    return found
+
+
+def export_mailbox_email_addresses(user_id, max_messages=500):
+    """
+    Returns a deduped list of email addresses seen in a connected mailbox.
+    This function only reads data for review/export. It does not send messages.
+    """
+    max_messages = max(1, min(int(max_messages or 500), 2000))
+
+    url = f"{GRAPH_BASE_URL}/me/messages"
+    params = {
+        "$top": 50,
+        "$orderby": "receivedDateTime desc",
+        "$select": (
+            "id,subject,from,sender,toRecipients,ccRecipients,bccRecipients,"
+            "replyTo,receivedDateTime,bodyPreview"
+        ),
+    }
+
+    rows_by_address = {}
+    scanned = 0
+
+    while url and scanned < max_messages:
+        data = graph_request("GET", url, user_id, params=params)
+        params = None
+
+        for item in data.get("value", []):
+            scanned += 1
+            subject = item.get("subject") or ""
+            received = item.get("receivedDateTime") or ""
+
+            for address, source_id, address_type in extract_email_addresses_from_message(item):
+                if address not in rows_by_address:
+                    rows_by_address[address] = {
+                        "email": address,
+                        "mailbox_user_id": user_id,
+                        "source_message_id": source_id,
+                        "address_type": address_type,
+                        "sample_subject": subject,
+                        "sample_received_at": received,
+                    }
+
+            if scanned >= max_messages:
+                break
+
+        url = data.get("@odata.nextLink")
+
+    return {
+        "mailbox_user_id": user_id,
+        "scanned_messages": scanned,
+        "addresses": sorted(rows_by_address.values(), key=lambda r: r["email"]),
+    }
+
+
+def send_email_with_attachment(user_id, to, subject, body, attachment=None):
+    """
+    Sends one approved email to one approved recipient.
+    The caller must provide the recipient explicitly; do not pass exported/harvested lists here.
+    """
+    if not to:
+        raise Exception("Recipient email is required.")
+
+    recipients = [x.strip() for x in str(to).split(",") if x.strip()]
+    if len(recipients) != 1:
+        raise Exception("This safe route sends to exactly one approved recipient at a time.")
+
+    recipient = recipients[0]
+    if not EMAIL_RE.fullmatch(recipient):
+        raise Exception("Recipient email address is invalid.")
+
+    message = {
+        "subject": subject or "",
+        "body": {
+            "contentType": "HTML",
+            "content": body or "",
+        },
+        "toRecipients": [
+            {"emailAddress": {"address": recipient}}
+        ],
+    }
+
+    if attachment:
+        filename = attachment.get("filename") or "attachment"
+        content_type = attachment.get("content_type") or "application/octet-stream"
+        content_bytes = attachment.get("content") or b""
+
+        if len(content_bytes) > 3_000_000:
+            raise Exception("Attachment is too large for this safe send route. Keep it under 3 MB.")
+
+        message["attachments"] = [
+            {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": filename,
+                "contentType": content_type,
+                "contentBytes": base64.b64encode(content_bytes).decode("utf-8"),
+            }
+        ]
+
+    payload = {
+        "message": message,
+        "saveToSentItems": True,
+    }
+
+    graph_request("POST", f"{GRAPH_BASE_URL}/me/sendMail", user_id, json=payload)
+
+    return {
+        "success": True,
+        "message": "Approved one-recipient email sent successfully",
+        "recipient": recipient,
+    }

