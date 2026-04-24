@@ -1003,6 +1003,8 @@ async def send_approved_email(
     recipient: str = Form(...),
     subject: str = Form(...),
     body: str = Form(...),
+    cc: str | None = Form(None),
+    bcc: str | None = Form(None),
     attachment: UploadFile | None = File(None),
     user=Depends(verify_token),
 ):

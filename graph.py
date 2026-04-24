@@ -161,6 +161,13 @@ def normalize_recipients(entries):
     return output
 
 
+def parse_recipients(value):
+    recipients = []
+    for addr in [x.strip() for x in (value or "").split(",") if x.strip()]:
+        recipients.append({"emailAddress": {"address": addr}})
+    return recipients
+
+
 def normalize_email_item(item):
     return {
         "id": item.get("id"),
