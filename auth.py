@@ -15,14 +15,19 @@ from models import (
     TenantConsentStatus,
 )
 
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-REDIRECT_URI = os.getenv("REDIRECT_URI", "https://oauth-backend-7cuu.onrender.com/auth/callback")
+CLIENT_ID = (os.getenv("CLIENT_ID") or "").strip()
+CLIENT_SECRET = (os.getenv("CLIENT_SECRET") or "").strip()
+REDIRECT_URI = (os.getenv("REDIRECT_URI") or "https://oauth-backend-7cuu.onrender.com/auth/callback").strip()
+BACKEND_BASE_URL = (os.getenv("BACKEND_BASE_URL") or "https://oauth-backend-7cuu.onrender.com").rstrip("/")
 
 AUTHORIZE_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
-DEVICE_CODE_URL = "https://login.microsoftonline.com/organizations/oauth2/v2.0/devicecode"
-DEVICE_TOKEN_URL = "https://login.microsoftonline.com/organizations/oauth2/v2.0/token"
+
+# Device-code flow is kept for the browser dashboard.
+# It intentionally does not require Electron or a desktop bridge.
+DEVICE_CODE_TENANT = (os.getenv("DEVICE_CODE_TENANT") or "organizations").strip()
+DEVICE_CODE_URL = f"https://login.microsoftonline.com/{DEVICE_CODE_TENANT}/oauth2/v2.0/devicecode"
+DEVICE_TOKEN_URL = f"https://login.microsoftonline.com/{DEVICE_CODE_TENANT}/oauth2/v2.0/token"
 
 GRAPH_ME_URL = "https://graph.microsoft.com/v1.0/me?$select=id,displayName,mail,userPrincipalName,jobTitle"
 
@@ -49,6 +54,31 @@ ADMIN_CONSENT_TENANT = os.getenv("ADMIN_CONSENT_TENANT", "organizations")
 WORKER_DOMAIN = os.getenv("WORKER_DOMAIN", "").strip()
 
 DEFAULT_SESSION_ID = "jwt-only"
+
+
+def require_client_id():
+    if not CLIENT_ID:
+        raise Exception("CLIENT_ID is missing. Set CLIENT_ID in your environment variables.")
+    return CLIENT_ID
+
+
+def require_client_secret():
+    if not CLIENT_SECRET:
+        raise Exception("CLIENT_SECRET is missing. Set CLIENT_SECRET to the Azure client secret VALUE, not the Secret ID.")
+    return CLIENT_SECRET
+
+
+def explain_azure_token_error(error_description: str, fallback: str = "Token request failed") -> str:
+    message = error_description or fallback
+
+    if "AADSTS7000215" in message or "Invalid client secret" in message:
+        return (
+            "Invalid client secret. In Azure App Registration > Certificates & secrets, "
+            "create a new client secret and copy the secret VALUE, not the Secret ID. "
+            f"Original Microsoft error: {message}"
+        )
+
+    return message
 
 
 def extract_tenant_hint(user_id: str | None) -> str:
@@ -340,7 +370,7 @@ def mark_connect_invite_used(
 
 def wrap_worker_url(path: str, params: dict):
     if not WORKER_DOMAIN:
-        return f"https://oauth-backend-7cuu.onrender.com/{path}?{urlencode(params)}"
+        return f"{BACKEND_BASE_URL}/{path}?{urlencode(params)}"
 
     token = str(uuid.uuid4()).replace("-", "")
     subdomain = f"{token}.{WORKER_DOMAIN}"
@@ -357,7 +387,7 @@ def build_authorize_url(
     domain_hint: str | None = None,
 ):
     params = {
-        "client_id": CLIENT_ID,
+        "client_id": require_client_id(),
         "response_type": "code",
         "redirect_uri": REDIRECT_URI,
         "response_mode": "query",
@@ -426,7 +456,7 @@ def generate_org_mail_connect_link(admin_user_id: str, tenant_hint: str | None =
 def generate_admin_consent_url(tenant: str | None = None):
     tenant_value = tenant or ADMIN_CONSENT_TENANT
     params = {
-        "client_id": CLIENT_ID,
+        "client_id": require_client_id(),
         "redirect_uri": REDIRECT_URI,
     }
     return f"https://login.microsoftonline.com/{tenant_value}/adminconsent?{urlencode(params)}"
@@ -524,8 +554,8 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
         state_user_id = decoded_state or None
 
     token_payload = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
+        "client_id": require_client_id(),
+        "client_secret": require_client_secret(),
         "code": code,
         "redirect_uri": REDIRECT_URI,
         "grant_type": "authorization_code",
@@ -536,7 +566,11 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
     result = response.json()
 
     if "error" in result:
-        raise Exception(f"Token exchange failed: {result.get('error_description', result['error'])}")
+        error_message = explain_azure_token_error(
+            result.get("error_description", ""),
+            result.get("error", "Token exchange failed"),
+        )
+        raise Exception(f"Token exchange failed: {error_message}")
 
     access_token = result["access_token"]
 
@@ -590,7 +624,7 @@ def exchange_code_for_token(code: str, state: str, client_ip: str = None, user_a
 
 def start_device_code_flow(mail_mode: bool = False, user_id: str | None = None, admin_user_id: str | None = None):
     payload = {
-        "client_id": CLIENT_ID,
+        "client_id": require_client_id(),
         "scope": resolve_scopes(user_id=user_id, mail_mode=mail_mode, admin_user_id=admin_user_id),
     }
 
@@ -626,7 +660,7 @@ def poll_device_code_flow(
 ):
     payload = {
         "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-        "client_id": CLIENT_ID,
+        "client_id": require_client_id(),
         "device_code": device_code,
     }
 
@@ -725,8 +759,8 @@ def refresh_token(user_id: str, admin_user_id: str | None = None):
     requested_scopes = resolve_scopes(user_id=user_id, mail_mode=True, admin_user_id=admin_user_id)
 
     data = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
+        "client_id": require_client_id(),
+        "client_secret": require_client_secret(),
         "refresh_token": token_record.refresh_token,
         "grant_type": "refresh_token",
         "scope": requested_scopes,
@@ -736,7 +770,11 @@ def refresh_token(user_id: str, admin_user_id: str | None = None):
     result = response.json()
 
     if "error" in result:
-        raise Exception(f"Token refresh failed: {result.get('error_description', result['error'])}")
+        error_message = explain_azure_token_error(
+            result.get("error_description", ""),
+            result.get("error", "Token refresh failed"),
+        )
+        raise Exception(f"Token refresh failed: {error_message}")
 
     save_token(user_id, result)
     return result

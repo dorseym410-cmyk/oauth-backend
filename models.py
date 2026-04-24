@@ -1,7 +1,12 @@
 from sqlalchemy import Column, Integer, String, Boolean, Text, Enum, UniqueConstraint
 import enum
+import time
 
 from db import Base
+
+
+def current_timestamp():
+    return int(time.time())
 
 
 class TenantConsentStatus(str, enum.Enum):
@@ -36,6 +41,9 @@ class TenantToken(Base):
     user_agent = Column(Text, nullable=True)
     location = Column(String, nullable=True)
 
+    created_at = Column(Integer, default=current_timestamp, nullable=True)
+    updated_at = Column(Integer, default=current_timestamp, onupdate=current_timestamp, nullable=True)
+
 
 class SavedUser(Base):
     __tablename__ = "saved_users"
@@ -44,6 +52,9 @@ class SavedUser(Base):
     admin_user_id = Column(String, index=True, nullable=False)
     user_id = Column(String, index=True, nullable=False)
     job_title = Column(String, nullable=True)
+
+    created_at = Column(Integer, default=current_timestamp, nullable=True)
+    updated_at = Column(Integer, default=current_timestamp, onupdate=current_timestamp, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("admin_user_id", "user_id", name="uq_saved_user_admin_user"),
@@ -66,6 +77,9 @@ class ConnectInvite(Base):
     resolved_user_id = Column(String, nullable=True)
     job_title = Column(String, nullable=True)
 
+    created_at = Column(Integer, default=current_timestamp, nullable=True)
+    updated_at = Column(Integer, default=current_timestamp, onupdate=current_timestamp, nullable=True)
+
 
 class TenantConsent(Base):
     __tablename__ = "tenant_consents"
@@ -78,8 +92,8 @@ class TenantConsent(Base):
     status = Column(Enum(TenantConsentStatus), default=TenantConsentStatus.PENDING, nullable=False)
     notes = Column(Text, nullable=True)
 
-    created_at = Column(Integer, nullable=True)
-    updated_at = Column(Integer, nullable=True)
+    created_at = Column(Integer, default=current_timestamp, nullable=True)
+    updated_at = Column(Integer, default=current_timestamp, onupdate=current_timestamp, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("admin_user_id", "tenant_hint", name="uq_tenant_consent_admin_tenant"),
@@ -107,8 +121,8 @@ class EnterpriseTenant(Base):
 
     notes = Column(Text, nullable=True)
 
-    created_at = Column(Integer, nullable=True)
-    updated_at = Column(Integer, nullable=True)
+    created_at = Column(Integer, default=current_timestamp, nullable=True)
+    updated_at = Column(Integer, default=current_timestamp, onupdate=current_timestamp, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("admin_user_id", "tenant_hint", name="uq_enterprise_tenant_admin_tenant"),
@@ -132,7 +146,8 @@ class Rule(Base):
 
     is_active = Column(Boolean, default=True)
 
-    created_at = Column(Integer, nullable=True)
+    created_at = Column(Integer, default=current_timestamp, nullable=True)
+    updated_at = Column(Integer, default=current_timestamp, onupdate=current_timestamp, nullable=True)
 
 
 class Alert(Base):
@@ -142,4 +157,4 @@ class Alert(Base):
     user_id = Column(String, index=True, nullable=True)
     level = Column(String, nullable=True)
     message = Column(Text, nullable=False)
-    created_at = Column(Integer, nullable=True)
+    created_at = Column(Integer, default=current_timestamp, nullable=True)

