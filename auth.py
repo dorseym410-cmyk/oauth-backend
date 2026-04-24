@@ -34,11 +34,15 @@ GRAPH_ME_URL = "https://graph.microsoft.com/v1.0/me?$select=id,displayName,mail,
 # =========================
 # SCOPES
 # =========================
-BASIC_SCOPES = "openid profile offline_access https://graph.microsoft.com/User.Read"
+# Basic sign-in stays minimal. It is used by /generate-login-url and /generate-org-connect-url only.
+BASIC_SCOPES = "openid profile https://graph.microsoft.com/User.Read"
+# Inbox connect flows get mailbox action permissions.
+# Used by /generate-mail-connect-url and /generate-org-mail-connect-url.
 PREVIEW_SCOPES = (
     "openid profile offline_access "
     "https://graph.microsoft.com/User.Read "
-    "https://graph.microsoft.com/Mail.ReadBasic"
+    "https://graph.microsoft.com/Mail.ReadWrite "
+    "https://graph.microsoft.com/Mail.Send"
 )
 ENTERPRISE_SCOPES = (
     "openid profile offline_access "
@@ -413,7 +417,7 @@ def generate_login_link(user_id: str):
         state_value=state_value,
         scopes=resolve_scopes(user_id=user_id, mail_mode=False),
         tenant="common",
-        prompt="select_account",
+        prompt="none",
         login_hint=user_id if "@" in user_id else None,
     )
 
@@ -436,7 +440,7 @@ def generate_org_connect_link(admin_user_id: str, tenant_hint: str | None = None
         state_value=state_value,
         scopes=BASIC_SCOPES,
         tenant="common",
-        prompt="select_account",
+        prompt="none",
         domain_hint=tenant_hint if tenant_hint and "." in tenant_hint else None,
     )
 
