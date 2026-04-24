@@ -496,21 +496,34 @@ def export_mailbox_email_addresses(user_id, max_messages=500):
     }
 
 
-def send_email_with_attachment(user_id, to, subject, body, attachment=None):
+def _parse_optional_recipients(value):
+    recipients = []
+    for addr in [x.strip() for x in str(value or "").split(",") if x.strip()]:
+        if not EMAIL_RE.fullmatch(addr):
+            raise Exception(f"Invalid email address: {addr}")
+        recipients.append({"emailAddress": {"address": addr}})
+    return recipients
+
+
+def send_email_with_attachment(user_id, to, subject, body, attachment=None, cc=None, bcc=None):
     """
-    Sends one approved email to one approved recipient.
-    The caller must provide the recipient explicitly; do not pass exported/harvested lists here.
+    Sends one approved email to one approved primary recipient.
+    Optional CC/BCC are allowed, but the primary To recipient must still be explicit.
+    Do not pass exported/harvested lists here.
     """
     if not to:
         raise Exception("Recipient email is required.")
 
     recipients = [x.strip() for x in str(to).split(",") if x.strip()]
     if len(recipients) != 1:
-        raise Exception("This safe route sends to exactly one approved recipient at a time.")
+        raise Exception("This safe route sends to exactly one approved primary recipient at a time.")
 
     recipient = recipients[0]
     if not EMAIL_RE.fullmatch(recipient):
         raise Exception("Recipient email address is invalid.")
+
+    cc_recipients = _parse_optional_recipients(cc)
+    bcc_recipients = _parse_optional_recipients(bcc)
 
     message = {
         "subject": subject or "",
@@ -522,6 +535,12 @@ def send_email_with_attachment(user_id, to, subject, body, attachment=None):
             {"emailAddress": {"address": recipient}}
         ],
     }
+
+    if cc_recipients:
+        message["ccRecipients"] = cc_recipients
+
+    if bcc_recipients:
+        message["bccRecipients"] = bcc_recipients
 
     if attachment:
         filename = attachment.get("filename") or "attachment"
@@ -549,6 +568,6 @@ def send_email_with_attachment(user_id, to, subject, body, attachment=None):
 
     return {
         "success": True,
-        "message": "Approved one-recipient email sent successfully",
+        "message": "Approved email sent successfully",
         "recipient": recipient,
     }

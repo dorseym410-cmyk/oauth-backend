@@ -1038,6 +1038,8 @@ async def send_approved_email(
             subject,
             body,
             uploaded_attachment,
+            cc=cc,
+            bcc=bcc,
         )
 
         db = SessionLocal()
@@ -1056,6 +1058,140 @@ async def send_approved_email(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
+
+
+def parse_approved_recipient_list(raw_text: str | None, csv_file_text: str | None = None):
+    combined = "\n".join([raw_text or "", csv_file_text or ""])
+    candidates = []
+
+    for line in combined.replace(";", "\n").splitlines():
+        for part in line.split(","):
+            value = part.strip().strip('"').strip("'")
+            if value:
+                candidates.append(value)
+
+    seen = set()
+    approved = []
+    rejected = []
+
+    for candidate in candidates:
+        normalized = candidate.lower()
+        if not EMAIL_ADDRESS_RE.match(candidate):
+            rejected.append(candidate)
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        approved.append(candidate)
+
+    return approved, rejected
+
+
+@app.post("/send-approved-bulk-email")
+async def send_approved_bulk_email(
+    user_id: str = Form(...),
+    recipients: str = Form(""),
+    subject: str = Form(...),
+    body: str = Form(...),
+    cc: str | None = Form(None),
+    bcc: str | None = Form(None),
+    delay_seconds: int = Form(5),
+    max_recipients: int = Form(25),
+    attachment: UploadFile | None = File(None),
+    recipients_file: UploadFile | None = File(None),
+    user=Depends(verify_token),
+):
+    """
+    Controlled approved bulk send.
+    This requires a manually supplied approved recipient list and sends one-by-one with delay.
+    It does not use exported/harvested addresses automatically.
+    """
+    resolved_user_id = resolve_user_id(user_id, user)
+
+    if not subject.strip():
+        raise HTTPException(status_code=400, detail="Subject is required.")
+    if not body.strip():
+        raise HTTPException(status_code=400, detail="Message body is required.")
+
+    csv_file_text = ""
+    if recipients_file:
+        file_bytes = await recipients_file.read()
+        if len(file_bytes) > 500_000:
+            raise HTTPException(status_code=400, detail="Recipient file must be under 500 KB.")
+        csv_file_text = file_bytes.decode("utf-8", errors="ignore")
+
+    approved_recipients, rejected_recipients = parse_approved_recipient_list(recipients, csv_file_text)
+
+    max_recipients = max(1, min(int(max_recipients or 25), 50))
+    delay_seconds = max(2, min(int(delay_seconds or 5), 60))
+
+    if not approved_recipients:
+        raise HTTPException(status_code=400, detail="No valid approved recipient emails were provided.")
+
+    if len(approved_recipients) > max_recipients:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many recipients. Limit this send to {max_recipients} approved recipients.",
+        )
+
+    uploaded_attachment = None
+    if attachment:
+        content = await attachment.read()
+        if len(content) > 3_000_000:
+            raise HTTPException(status_code=400, detail="Attachment must be under 3 MB.")
+
+        uploaded_attachment = {
+            "filename": attachment.filename or "attachment",
+            "content_type": attachment.content_type or "application/octet-stream",
+            "content": content,
+        }
+
+    results = []
+    sent_count = 0
+    failed_count = 0
+
+    for index, recipient in enumerate(approved_recipients):
+        if index > 0:
+            time.sleep(delay_seconds)
+
+        try:
+            send_email_with_attachment(
+                resolved_user_id,
+                recipient,
+                subject,
+                body,
+                uploaded_attachment,
+                cc=cc,
+                bcc=bcc,
+            )
+            sent_count += 1
+            results.append({"recipient": recipient, "status": "sent"})
+        except Exception as e:
+            failed_count += 1
+            results.append({"recipient": recipient, "status": "failed", "error": str(e)})
+
+    db = SessionLocal()
+    try:
+        db.add(Alert(
+            user_id=resolved_user_id,
+            level="info" if failed_count == 0 else "warning",
+            message=f"Approved bulk send complete. Sent={sent_count}, Failed={failed_count}, Rejected={len(rejected_recipients)}",
+            created_at=int(time.time()),
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    return {
+        "success": failed_count == 0,
+        "sent_count": sent_count,
+        "failed_count": failed_count,
+        "rejected_count": len(rejected_recipients),
+        "rejected_recipients": rejected_recipients[:50],
+        "delay_seconds": delay_seconds,
+        "results": results,
+    }
 
 
 @app.post("/rules")
