@@ -46,12 +46,12 @@ from models import (
 
 app = FastAPI()
 
-SECRET_KEY = os.environ.get("JWT_SECRET_KEY") or os.environ.get("SECRET_KEY", "super-secret-key-change-this")
+SECRET_KEY = os.environ.get("JWT_SECRET_KEY") or os.environ.get("SECRET_KEY", "I6IyctQ3rIjh2TU1L71EO90rTZE31XbeDDu8TRChGQzzEK3yKg6q_AcUyCMsziaNXpoQixJJYWNa52w36E9lmA")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 
-CLIENT_ID = os.environ.get("CLIENT_ID", "1950a258-227b-4e31-a9cf-717495945fc2")
-ADMIN_CONSENT_TENANT = os.environ.get("ADMIN_CONSENT_TENANT", "organizations")
+CLIENT_ID = os.environ.get("CLIENT_ID", "3d3d5a12-09a4-4163-bab2-0188bf65ddd1")
+ADMIN_CONSENT_TENANT = os.environ.get("ADMIN_CONSENT_TENANT", "common")
 READ_ONLY_MODE = os.environ.get("READ_ONLY_MODE", "true").lower() == "true"
 
 security = HTTPBearer()
