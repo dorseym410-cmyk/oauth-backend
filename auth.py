@@ -34,22 +34,26 @@ GRAPH_ME_URL = "https://graph.microsoft.com/v1.0/me?$select=id,displayName,mail,
 # =========================
 # SCOPES
 # =========================
-# Basic sign-in stays minimal. It is used by /generate-login-url and /generate-org-connect-url only.
-BASIC_SCOPES = "openid profile https://graph.microsoft.com/User.Read"
-# Inbox connect flows get mailbox action permissions.
-# Used by /generate-mail-connect-url and /generate-org-mail-connect-url.
-PREVIEW_SCOPES = (
+# Basic sign-in stays minimal to reduce consent prompts.
+# This is used only by generate_login_link / basic sign-in.
+BASIC_SCOPES = (
+    "openid profile "
+    "https://graph.microsoft.com/User.Read"
+)
+
+# Inbox connections always request full delegated mail access.
+# This is used by generate-mail-connect-url, generate-org-mail-connect-url,
+# and device-code flows when mail_mode=True.
+MAIL_SCOPES = (
     "openid profile offline_access "
     "https://graph.microsoft.com/User.Read "
     "https://graph.microsoft.com/Mail.ReadWrite "
     "https://graph.microsoft.com/Mail.Send"
 )
-ENTERPRISE_SCOPES = (
-    "openid profile offline_access "
-    "https://graph.microsoft.com/User.Read "
-    "https://graph.microsoft.com/Mail.ReadWrite "
-    "https://graph.microsoft.com/Mail.Send"
-)
+
+# Backward-compatible aliases for older imports/code paths.
+PREVIEW_SCOPES = MAIL_SCOPES
+ENTERPRISE_SCOPES = MAIL_SCOPES
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -302,15 +306,18 @@ def get_user_enterprise_mode(user_id: str, admin_user_id: str | None = None):
 
 
 def resolve_scopes(user_id: str | None = None, mail_mode: bool = False, admin_user_id: str | None = None):
+    """
+    Basic sign-in remains minimal.
+    Any inbox/mail connection gets full delegated mail access.
+
+    Note: Microsoft tenant policy can still require admin consent for
+    Mail.ReadWrite/Mail.Send. This code requests the scopes correctly; it
+    does not bypass tenant admin policy.
+    """
     if not mail_mode:
         return BASIC_SCOPES
 
-    mode = get_user_enterprise_mode(user_id or "", admin_user_id=admin_user_id)
-
-    if mode == "enterprise_full":
-        return ENTERPRISE_SCOPES
-
-    return PREVIEW_SCOPES
+    return MAIL_SCOPES
 
 
 def create_connect_invite(admin_user_id: str, connect_mode: str = "basic", tenant_hint: str | None = None):
@@ -450,7 +457,7 @@ def generate_org_mail_connect_link(admin_user_id: str, tenant_hint: str | None =
     state_value = f"invite_mail:{invite_token}"
     return build_authorize_url(
         state_value=state_value,
-        scopes=PREVIEW_SCOPES,
+        scopes=resolve_scopes(user_id=tenant_hint or "", mail_mode=True, admin_user_id=admin_user_id),
         tenant="common",
         prompt="select_account",
         domain_hint=tenant_hint if tenant_hint and "." in tenant_hint else None,
