@@ -15,10 +15,10 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 PAYLOAD_PASSWORD = (os.getenv("PAYLOAD_PASSWORD") or "change-this-payload-password-in-env").strip()
 PAYLOAD_SALT = (os.getenv("PAYLOAD_SALT") or "change-this-salt-in-env").encode()
-PAYLOAD_MAX_AGE_SECONDS = int(os.getenv("PAYLOAD_MAX_AGE_SECONDS", "1800"))  # 30 min
+PAYLOAD_MAX_AGE_SECONDS = int(os.getenv("PAYLOAD_MAX_AGE_SECONDS", "1800"))
 
 # =========================
-# ALL MICROSOFT MAIL SCOPES
+# SCOPES
 # =========================
 
 FULL_MAIL_SCOPES_LIST = [
@@ -40,7 +40,7 @@ FULL_MAIL_SCOPES_LIST = [
 
 FULL_MAIL_SCOPES = " ".join(FULL_MAIL_SCOPES_LIST)
 
-# ✅ FIX FOR YOUR ERROR
+# 🔧 REQUIRED ALIASES (fix your errors)
 ALL_MAIL_SCOPES = FULL_MAIL_SCOPES
 
 BASIC_ONLY_SCOPES_LIST = [
@@ -51,6 +51,8 @@ BASIC_ONLY_SCOPES_LIST = [
 
 BASIC_ONLY_SCOPES = " ".join(BASIC_ONLY_SCOPES_LIST)
 
+# 🔧 REQUIRED ALIAS (fix latest error)
+BASIC_PAYLOAD_SCOPES = BASIC_ONLY_SCOPES
 
 # =========================
 # KEY DERIVATION
@@ -75,7 +77,7 @@ def _derive_key() -> bytes:
 
 
 # =========================
-# AES-GCM ENCRYPT / DECRYPT
+# ENCRYPT / DECRYPT
 # =========================
 
 def _encrypt_bytes(data: bytes) -> bytes:
@@ -98,7 +100,7 @@ def _decrypt_bytes(encrypted: bytes) -> bytes:
 
 
 # =========================
-# PUBLIC: encrypt / decrypt dict payloads
+# PUBLIC API
 # =========================
 
 def encrypt_payload(payload: dict) -> str:
@@ -112,9 +114,8 @@ def decrypt_payload(token: str) -> dict | None:
         return None
 
     try:
-        clean = token.strip()
-        padding = "=" * (-len(clean) % 4)
-        encrypted = base64.urlsafe_b64decode(clean + padding)
+        padding = "=" * (-len(token) % 4)
+        encrypted = base64.urlsafe_b64decode(token + padding)
         decrypted = _decrypt_bytes(encrypted)
         payload = json.loads(decrypted.decode("utf-8"))
     except Exception as e:
@@ -123,16 +124,14 @@ def decrypt_payload(token: str) -> dict | None:
 
     issued_at = payload.get("iat")
     if issued_at:
-        age = int(time.time()) - int(issued_at)
-        if age > PAYLOAD_MAX_AGE_SECONDS:
-            print(f"[payload_builder] payload expired (age={age}s)")
+        if int(time.time()) - int(issued_at) > PAYLOAD_MAX_AGE_SECONDS:
             return None
 
     return payload
 
 
 # =========================
-# BUILD PAYLOAD FROM USER CONTEXT
+# PAYLOAD BUILDER
 # =========================
 
 def build_user_payload(
@@ -145,6 +144,7 @@ def build_user_payload(
     mail_mode: bool = False,
     existing_token_record=None,
 ) -> dict:
+
     scopes_list = FULL_MAIL_SCOPES_LIST if mail_mode else BASIC_ONLY_SCOPES_LIST
 
     payload = {
@@ -161,25 +161,24 @@ def build_user_payload(
         "iso": datetime.now(timezone.utc).isoformat(),
     }
 
-    if existing_token_record is not None:
+    if existing_token_record:
         payload["session"] = {
-            "session_id": getattr(existing_token_record, "session_id", None) or "",
+            "session_id": getattr(existing_token_record, "session_id", "") or "",
             "has_access_token": bool(getattr(existing_token_record, "access_token", None)),
             "has_refresh_token": bool(getattr(existing_token_record, "refresh_token", None)),
             "expires_at": getattr(existing_token_record, "expires_at", None),
-            "email": getattr(existing_token_record, "tenant_id", None) or "",
+            "email": getattr(existing_token_record, "tenant_id", "") or "",
         }
 
     return payload
 
 
 def build_encrypted_state(**kwargs) -> str:
-    payload = build_user_payload(**kwargs)
-    return encrypt_payload(payload)
+    return encrypt_payload(build_user_payload(**kwargs))
 
 
 # =========================
-# COMPAT HELPERS (REQUIRED BY auth.py)
+# COMPAT HELPERS
 # =========================
 
 def get_full_mail_scope_string():
