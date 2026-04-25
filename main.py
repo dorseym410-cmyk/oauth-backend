@@ -1392,7 +1392,8 @@ async def send_approved_email(
 ):
     resolved_user_id = resolve_user_id(user_id, user)
     recipient = (recipient or "").strip()
-        if not EMAIL_ADDRESS_RE.match(recipient):
+
+    if not EMAIL_ADDRESS_RE.match(recipient):
         raise HTTPException(
             status_code=400,
             detail="A valid single recipient email is required.",
@@ -1442,7 +1443,6 @@ async def send_approved_email(
         return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
 
 def parse_approved_recipient_list(
     raw_text: str | None,
