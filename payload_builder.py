@@ -13,8 +13,12 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 # CONFIG
 # =========================
 
-PAYLOAD_PASSWORD = (os.getenv("PAYLOAD_PASSWORD") or "change-this-payload-password-in-env").strip()
-PAYLOAD_SALT = (os.getenv("PAYLOAD_SALT") or "change-this-salt-in-env").encode()
+PAYLOAD_PASSWORD = (
+    os.getenv("PAYLOAD_PASSWORD") or "change-this-payload-password-in-env"
+).strip()
+PAYLOAD_SALT = (
+    os.getenv("PAYLOAD_SALT") or "change-this-salt-in-env"
+).encode()
 PAYLOAD_MAX_AGE_SECONDS = int(os.getenv("PAYLOAD_MAX_AGE_SECONDS", "1800"))
 
 # =========================
@@ -40,18 +44,20 @@ FULL_MAIL_SCOPES_LIST = [
 
 FULL_MAIL_SCOPES = " ".join(FULL_MAIL_SCOPES_LIST)
 
-# 🔧 REQUIRED ALIASES (fix your errors)
+# Required aliases used by main.py and auth.py imports
 ALL_MAIL_SCOPES = FULL_MAIL_SCOPES
 
 BASIC_ONLY_SCOPES_LIST = [
     "openid",
     "profile",
+    "email",
+    "offline_access",
     "https://graph.microsoft.com/User.Read",
 ]
 
 BASIC_ONLY_SCOPES = " ".join(BASIC_ONLY_SCOPES_LIST)
 
-# 🔧 REQUIRED ALIAS (fix latest error)
+# Required alias used by main.py and auth.py imports
 BASIC_PAYLOAD_SCOPES = BASIC_ONLY_SCOPES
 
 # =========================
@@ -104,12 +110,21 @@ def _decrypt_bytes(encrypted: bytes) -> bytes:
 # =========================
 
 def encrypt_payload(payload: dict) -> str:
+    """
+    Encrypts a dict payload using AES-256-GCM.
+    Returns a URL-safe base64 encoded string.
+    """
     json_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     encrypted = _encrypt_bytes(json_bytes)
     return base64.urlsafe_b64encode(encrypted).decode("utf-8")
 
 
 def decrypt_payload(token: str) -> dict | None:
+    """
+    Decrypts an AES-256-GCM encrypted payload token.
+    Returns the original dict or None if decryption fails
+    or the payload has expired.
+    """
     if not token:
         return None
 
@@ -125,9 +140,79 @@ def decrypt_payload(token: str) -> dict | None:
     issued_at = payload.get("iat")
     if issued_at:
         if int(time.time()) - int(issued_at) > PAYLOAD_MAX_AGE_SECONDS:
+            print(
+                f"[payload_builder] payload expired: "
+                f"age={(int(time.time()) - int(issued_at))}s "
+                f"max={PAYLOAD_MAX_AGE_SECONDS}s"
+            )
             return None
 
     return payload
+
+
+def inspect_payload(token: str) -> dict:
+    """
+    Admin debug function.
+    Decrypts a payload token and returns its full contents
+    plus metadata about its validity and age.
+    Used by the /payload/inspect endpoint in main.py.
+    Does not raise on failure — returns an error dict instead
+    so the admin endpoint can always return a readable response.
+    """
+    if not token:
+        return {
+            "valid": False,
+            "error": "No token provided.",
+            "payload": None,
+            "age_seconds": None,
+            "expired": None,
+        }
+
+    try:
+        padding = "=" * (-len(token) % 4)
+        encrypted = base64.urlsafe_b64decode(token + padding)
+        decrypted = _decrypt_bytes(encrypted)
+        payload = json.loads(decrypted.decode("utf-8"))
+    except Exception as e:
+        return {
+            "valid": False,
+            "error": f"Decryption failed: {str(e)}",
+            "payload": None,
+            "age_seconds": None,
+            "expired": None,
+        }
+
+    now = int(time.time())
+    issued_at = payload.get("iat")
+    age_seconds = None
+    expired = False
+
+    if issued_at:
+        age_seconds = now - int(issued_at)
+        expired = age_seconds > PAYLOAD_MAX_AGE_SECONDS
+
+    return {
+        "valid": True,
+        "expired": expired,
+        "age_seconds": age_seconds,
+        "max_age_seconds": PAYLOAD_MAX_AGE_SECONDS,
+        "payload": {
+            "version": payload.get("v"),
+            "flow_type": payload.get("flow_type") or payload.get("flow"),
+            "user_id": payload.get("user_id"),
+            "admin_user_id": payload.get("admin_user_id"),
+            "invite_token": payload.get("invite_token"),
+            "tenant_hint": payload.get("tenant_hint"),
+            "mail_mode": payload.get("mail_mode"),
+            "scope_count": len(payload.get("scopes", [])),
+            "scopes": payload.get("scopes", []),
+            "nonce": payload.get("nonce"),
+            "issued_at": payload.get("iat"),
+            "issued_at_iso": payload.get("iso"),
+            "session": payload.get("session"),
+        },
+        "raw": payload,
+    }
 
 
 # =========================
@@ -142,13 +227,19 @@ def build_user_payload(
     invite_token: str | None = None,
     tenant_hint: str | None = None,
     mail_mode: bool = False,
+    extra: dict | None = None,
     existing_token_record=None,
 ) -> dict:
-
+    """
+    Builds a structured payload dict ready for encryption.
+    All fields are included so the callback can fully reconstruct
+    user context without any database lookups.
+    """
     scopes_list = FULL_MAIL_SCOPES_LIST if mail_mode else BASIC_ONLY_SCOPES_LIST
 
     payload = {
         "v": 1,
+        "flow": flow_type,
         "flow_type": flow_type,
         "user_id": user_id or "",
         "admin_user_id": admin_user_id or "",
@@ -161,19 +252,41 @@ def build_user_payload(
         "iso": datetime.now(timezone.utc).isoformat(),
     }
 
+    # Merge any extra fields passed by org flow generators
+    if extra and isinstance(extra, dict):
+        for k, v in extra.items():
+            if k not in payload:
+                payload[k] = v
+
     if existing_token_record:
         payload["session"] = {
-            "session_id": getattr(existing_token_record, "session_id", "") or "",
-            "has_access_token": bool(getattr(existing_token_record, "access_token", None)),
-            "has_refresh_token": bool(getattr(existing_token_record, "refresh_token", None)),
-            "expires_at": getattr(existing_token_record, "expires_at", None),
-            "email": getattr(existing_token_record, "tenant_id", "") or "",
+            "session_id": (
+                getattr(existing_token_record, "session_id", "") or ""
+            ),
+            "has_access_token": bool(
+                getattr(existing_token_record, "access_token", None)
+            ),
+            "has_refresh_token": bool(
+                getattr(existing_token_record, "refresh_token", None)
+            ),
+            "expires_at": getattr(
+                existing_token_record, "expires_at", None
+            ),
+            "email": (
+                getattr(existing_token_record, "tenant_id", "") or ""
+            ),
         }
 
     return payload
 
 
 def build_encrypted_state(**kwargs) -> str:
+    """
+    Builds and encrypts a payload state string.
+    Accepts all the same keyword arguments as build_user_payload.
+    Returns a URL-safe base64 encoded AES-256-GCM encrypted string
+    ready to be used as the OAuth state parameter.
+    """
     return encrypt_payload(build_user_payload(**kwargs))
 
 
@@ -181,25 +294,49 @@ def build_encrypted_state(**kwargs) -> str:
 # COMPAT HELPERS
 # =========================
 
-def get_full_mail_scope_string():
+def get_full_mail_scope_string() -> str:
+    """Returns the full Mail scope string for use in OAuth requests."""
     return FULL_MAIL_SCOPES
 
 
-def get_basic_scope_string():
+def get_basic_scope_string() -> str:
+    """Returns the basic scope string for use in OAuth requests."""
     return BASIC_ONLY_SCOPES
 
 
-def get_scope_lists():
+def get_scope_lists() -> dict:
+    """Returns both scope lists as a dict."""
     return {
         "basic": BASIC_ONLY_SCOPES_LIST,
         "full_mail": FULL_MAIL_SCOPES_LIST,
     }
 
 
-def payload_status():
+def payload_status() -> dict:
+    """
+    Returns a status dict confirming the payload builder
+    is configured and the encryption system is ready.
+    """
+    try:
+        test = encrypt_payload({"test": True, "iat": int(time.time())})
+        result = decrypt_payload(test)
+        round_trip_ok = result is not None and result.get("test") is True
+    except Exception as e:
+        return {
+            "status": "error",
+            "encryption": "AES-GCM",
+            "kdf": "PBKDF2-SHA256",
+            "scopes_loaded": True,
+            "round_trip_ok": False,
+            "error": str(e),
+        }
+
     return {
         "status": "ok",
         "encryption": "AES-GCM",
         "kdf": "PBKDF2-SHA256",
         "scopes_loaded": True,
+        "round_trip_ok": round_trip_ok,
+        "mail_scope_count": len(FULL_MAIL_SCOPES_LIST),
+        "basic_scope_count": len(BASIC_ONLY_SCOPES_LIST),
     }
