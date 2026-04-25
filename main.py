@@ -933,9 +933,6 @@ async def device_code_poll(request: Request, user=Depends(verify_token)):
     body = await request.json()
     device_code = body.get("device_code")
 
-## `backend/main.py` — PART 3 of 3 (FINAL)
-
-```python
     if not device_code:
         raise HTTPException(status_code=400, detail="device_code is required")
 
