@@ -1,16 +1,3 @@
-"""
-Payload Builder — AES-GCM encryption for OAuth state + user context.
-
-Builds encrypted payloads that carry:
-- user_id, email, admin_user_id, tenant_hint
-- session_id, access_token, refresh_token (if already connected)
-- requested scopes (all Microsoft Mail scopes)
-- timestamp + nonce (replay protection)
-- flow_type (basic | mail | invite_basic | invite_mail)
-
-Encryption matches the AES-GCM + PBKDF2 pattern from your sample script.
-"""
-
 import os
 import json
 import time
@@ -52,6 +39,9 @@ FULL_MAIL_SCOPES_LIST = [
 ]
 
 FULL_MAIL_SCOPES = " ".join(FULL_MAIL_SCOPES_LIST)
+
+# ✅ FIX FOR YOUR ERROR
+ALL_MAIL_SCOPES = FULL_MAIL_SCOPES
 
 BASIC_ONLY_SCOPES_LIST = [
     "openid",
@@ -112,20 +102,12 @@ def _decrypt_bytes(encrypted: bytes) -> bytes:
 # =========================
 
 def encrypt_payload(payload: dict) -> str:
-    """
-    Encrypts a dict payload and returns a URL-safe base64 string suitable for
-    use inside the OAuth `state` parameter.
-    """
     json_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     encrypted = _encrypt_bytes(json_bytes)
     return base64.urlsafe_b64encode(encrypted).decode("utf-8")
 
 
 def decrypt_payload(token: str) -> dict | None:
-    """
-    Decrypts a URL-safe base64 string produced by encrypt_payload().
-    Returns the dict payload, or None if invalid/expired.
-    """
     if not token:
         return None
 
