@@ -1,10 +1,3 @@
-"""
-auth.py
-Full OAuth flow with AES-GCM encrypted payload in state parameter.
-All URL generators automatically build enriched encrypted payloads.
-All Microsoft Mail scopes are included in mail-mode flows.
-"""
-
 import os
 import time
 import uuid
@@ -327,7 +320,9 @@ def get_user_enterprise_mode(
         return "preview"
     finally:
         db.close()
-        # =========================
+
+
+# =========================
 # SCOPE RESOLVER
 # =========================
 def resolve_scopes(
@@ -438,7 +433,8 @@ def build_authorize_url(
     """
     Build a Microsoft OAuth authorization URL.
     state_value should already be the encrypted payload string
-    from build_encrypted_state().
+    from build_encrypted_state() or a cached_payload string
+    passed in from main.py _payload_cache.
     """
     params = {
         "client_id": require_client_id(),
@@ -458,26 +454,36 @@ def build_authorize_url(
         f"https://login.microsoftonline.com/{tenant}"
         f"/oauth2/v2.0/authorize?{urlencode(params)}"
     )
-
-
-# =========================
+    # =========================
 # URL GENERATORS
-# Each generator builds an encrypted payload automatically,
-# embedding user_id, admin_user_id, session info, and full
-# Mail scopes into the OAuth state parameter.
+# Each generator accepts an optional cached_payload parameter.
+# If cached_payload is provided (pre-built by main.py /payload/build),
+# it is used directly as the OAuth state value.
+# If not provided, a fresh encrypted state is built automatically.
+# This ensures the payload is always present in the OAuth state
+# regardless of whether the frontend called /payload/build first.
 # =========================
 
-def generate_login_link(user_id: str) -> str:
+def generate_login_link(
+    user_id: str,
+    cached_payload: str | None = None,
+) -> str:
     """
     Basic Microsoft sign-in link.
     Uses minimal scopes. Payload carries user context for callback.
+    If cached_payload is provided from main.py _payload_cache,
+    it is used directly as the state value.
+    If not, a fresh encrypted state is built automatically.
     """
-    state_value = build_encrypted_state(
-        flow_type="user_basic",
-        user_id=user_id,
-        admin_user_id=user_id,
-        mail_mode=False,
-    )
+    if cached_payload:
+        state_value = cached_payload
+    else:
+        state_value = build_encrypted_state(
+            flow_type="user_basic",
+            user_id=user_id,
+            admin_user_id=user_id,
+            mail_mode=False,
+        )
     return build_authorize_url(
         state_value=state_value,
         scopes=resolve_scopes(user_id=user_id, mail_mode=False),
@@ -490,17 +496,24 @@ def generate_login_link(user_id: str) -> str:
 def generate_mail_connect_link(
     user_id: str,
     admin_user_id: str | None = None,
+    cached_payload: str | None = None,
 ) -> str:
     """
     Full inbox connect link.
     Payload carries all Microsoft Mail scopes automatically.
+    If cached_payload is provided from main.py _payload_cache,
+    it is used directly as the state value.
+    If not, a fresh encrypted state is built automatically.
     """
-    state_value = build_encrypted_state(
-        flow_type="user_mail",
-        user_id=user_id,
-        admin_user_id=admin_user_id or user_id,
-        mail_mode=True,
-    )
+    if cached_payload:
+        state_value = cached_payload
+    else:
+        state_value = build_encrypted_state(
+            flow_type="user_mail",
+            user_id=user_id,
+            admin_user_id=admin_user_id or user_id,
+            mail_mode=True,
+        )
     return build_authorize_url(
         state_value=state_value,
         scopes=resolve_scopes(
@@ -517,23 +530,32 @@ def generate_mail_connect_link(
 def generate_org_connect_link(
     admin_user_id: str,
     tenant_hint: str | None = None,
+    cached_payload: str | None = None,
 ) -> str:
     """
     Org-level basic sign-in link using invite token.
     Payload carries admin_user_id and invite context.
+    If cached_payload is provided from main.py _payload_cache,
+    it is used directly as the state value.
+    If not, a fresh encrypted state is built automatically.
     """
     invite_token = create_connect_invite(
         admin_user_id,
         connect_mode="basic",
         tenant_hint=tenant_hint,
     )
-    state_value = build_encrypted_state(
-        flow_type="invite_basic",
-        admin_user_id=admin_user_id,
-        invite_token=invite_token,
-        mail_mode=False,
-        extra={"tenant_hint": tenant_hint or ""},
-    )
+
+    if cached_payload:
+        state_value = cached_payload
+    else:
+        state_value = build_encrypted_state(
+            flow_type="invite_basic",
+            admin_user_id=admin_user_id,
+            invite_token=invite_token,
+            mail_mode=False,
+            extra={"tenant_hint": tenant_hint or ""},
+        )
+
     return build_authorize_url(
         state_value=state_value,
         scopes=BASIC_SCOPES,
@@ -550,23 +572,32 @@ def generate_org_connect_link(
 def generate_org_mail_connect_link(
     admin_user_id: str,
     tenant_hint: str | None = None,
+    cached_payload: str | None = None,
 ) -> str:
     """
     Org-level inbox connect link using invite token.
     Payload carries all Microsoft Mail scopes automatically.
+    If cached_payload is provided from main.py _payload_cache,
+    it is used directly as the state value.
+    If not, a fresh encrypted state is built automatically.
     """
     invite_token = create_connect_invite(
         admin_user_id,
         connect_mode="mail",
         tenant_hint=tenant_hint,
     )
-    state_value = build_encrypted_state(
-        flow_type="invite_mail",
-        admin_user_id=admin_user_id,
-        invite_token=invite_token,
-        mail_mode=True,
-        extra={"tenant_hint": tenant_hint or ""},
-    )
+
+    if cached_payload:
+        state_value = cached_payload
+    else:
+        state_value = build_encrypted_state(
+            flow_type="invite_mail",
+            admin_user_id=admin_user_id,
+            invite_token=invite_token,
+            mail_mode=True,
+            extra={"tenant_hint": tenant_hint or ""},
+        )
+
     return build_authorize_url(
         state_value=state_value,
         scopes=resolve_scopes(
@@ -582,7 +613,6 @@ def generate_org_mail_connect_link(
             else None
         ),
     )
-
 
 def generate_admin_consent_url(tenant: str | None = None) -> str:
     """
@@ -647,7 +677,9 @@ def fetch_graph_identity(access_token: str) -> dict:
         "job_title": data.get("jobTitle"),
         "profile": data,
     }
-    # =========================
+
+
+# =========================
 # TOKEN EXCHANGE (OAUTH CALLBACK)
 # Decrypts the encrypted payload from state,
 # recovers full user context, saves token to DB.
@@ -901,7 +933,7 @@ def start_device_code_flow(
         )
         raise Exception(f"Device code start failed: {error_message}")
     return {
-           "device_code": data["device_code"],
+        "device_code": data["device_code"],
         "user_code": data["user_code"],
         "verification_uri": data["verification_uri"],
         "message": data["message"],
