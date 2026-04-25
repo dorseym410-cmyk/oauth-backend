@@ -1098,7 +1098,7 @@ def search_messages(
     except Exception:
         limit = 25
 
-       limit = max(1, min(limit, 100))
+    limit = max(1, min(limit, 100))
 
     url = f"{GRAPH_BASE_URL}/me/messages"
     params = {
