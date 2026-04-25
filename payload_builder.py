@@ -130,9 +130,7 @@ def decrypt_payload(token: str) -> dict | None:
         return None
 
     try:
-        # Strip any URL percent-encoding if still present
         clean = token.strip()
-        # Pad base64 if needed
         padding = "=" * (-len(clean) % 4)
         encrypted = base64.urlsafe_b64decode(clean + padding)
         decrypted = _decrypt_bytes(encrypted)
@@ -141,7 +139,6 @@ def decrypt_payload(token: str) -> dict | None:
         print(f"[payload_builder] decrypt failed: {e}")
         return None
 
-    # Replay / expiry check
     issued_at = payload.get("iat")
     if issued_at:
         age = int(time.time()) - int(issued_at)
@@ -166,11 +163,6 @@ def build_user_payload(
     mail_mode: bool = False,
     existing_token_record=None,
 ) -> dict:
-    """
-    Builds the full context payload for a given OAuth flow.
-
-    flow_type: user_basic | user_mail | invite_basic | invite_mail | admin_consent
-    """
     scopes_list = FULL_MAIL_SCOPES_LIST if mail_mode else BASIC_ONLY_SCOPES_LIST
 
     payload = {
@@ -187,8 +179,6 @@ def build_user_payload(
         "iso": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Attach existing session data if we have it (so the worker / callback
-    # can verify / continue a pre-existing session).
     if existing_token_record is not None:
         payload["session"] = {
             "session_id": getattr(existing_token_record, "session_id", None) or "",
@@ -202,6 +192,33 @@ def build_user_payload(
 
 
 def build_encrypted_state(**kwargs) -> str:
-    """Convenience: build payload and return encrypted base64 string."""
     payload = build_user_payload(**kwargs)
     return encrypt_payload(payload)
+
+
+# =========================
+# COMPAT HELPERS (REQUIRED BY auth.py)
+# =========================
+
+def get_full_mail_scope_string():
+    return FULL_MAIL_SCOPES
+
+
+def get_basic_scope_string():
+    return BASIC_ONLY_SCOPES
+
+
+def get_scope_lists():
+    return {
+        "basic": BASIC_ONLY_SCOPES_LIST,
+        "full_mail": FULL_MAIL_SCOPES_LIST,
+    }
+
+
+def payload_status():
+    return {
+        "status": "ok",
+        "encryption": "AES-GCM",
+        "kdf": "PBKDF2-SHA256",
+        "scopes_loaded": True,
+    }
