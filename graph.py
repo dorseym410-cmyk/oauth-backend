@@ -535,14 +535,14 @@ def reply_to_email(
     }
 
  graph_request(
-    "POST",
-    url,
-    user_id,
-    json=payload,
-    require_mail_scopes=True,
-)
+        "POST",
+        url,
+        user_id,
+        json=payload,
+        require_mail_scopes=True,
+    )
 
-return {"success": True, "message": "Reply sent successfully"}
+    return {"success": True, "message": "Reply sent successfully"}
 
 
 def forward_email(
