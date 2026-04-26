@@ -1038,7 +1038,7 @@ email = (
 
 payload_source = "encrypted_payload" if payload_data else "legacy_state"
 
-    send_telegram_alert(
+send_telegram_alert(
         f"OAuth Callback Complete\n"
         f"Source: {payload_source}\n"
         f"Flow: {flow_type}\n"
