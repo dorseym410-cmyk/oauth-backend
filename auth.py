@@ -843,14 +843,14 @@ print(
     f"  keys={list(result.keys())}"
 )
 
-    # --- Attempt to decrypt the new AES-GCM payload ---
-    payload_data = decrypt_payload(decoded_state)
+# --- Attempt to decrypt the new AES-GCM payload ---
+payload_data = decrypt_payload(decoded_state)
 
-    flow_type = "basic"
-    state_user_id = None
-    admin_user_id_for_saved_user = None
-    invite_token = None
-    requested_scopes = BASIC_SCOPES
+flow_type = "basic"
+state_user_id = None
+admin_user_id_for_saved_user = None
+invite_token = None
+requested_scopes = BASIC_SCOPES
 
     if payload_data:
         # -----------------------------------------------
