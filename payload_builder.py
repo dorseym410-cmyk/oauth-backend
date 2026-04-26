@@ -1,6 +1,3 @@
-## `backend/payload_builder.py` — FULL FIXED FILE
-
-```python
 import os
 import json
 import time
