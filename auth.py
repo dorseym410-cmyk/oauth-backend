@@ -893,18 +893,18 @@ def exchange_code_for_token(
         flow_type = flow_type_label
 
     # --- Resolve the correct redirect_uri for token exchange ---
-    # Always returns REDIRECT_URI — the direct backend callback URL
-    # This matches what is hidden inside the obfuscated block
-    token_exchange_redirect_uri = resolve_token_exchange_redirect_uri(
-        relay_host=relay_host,
-        relay_path=relay_path,
-    )
+# Always returns REDIRECT_URI — the direct backend callback URL
+# This matches what is hidden inside the obfuscated block
+token_exchange_redirect_uri = resolve_token_exchange_redirect_uri(
+    relay_host=relay_host,
+    relay_path=relay_path,
+)
 
-        print(
-        f"[exchange_code_for_token] REDIRECT URI RESOLVED\n"
-        f"  relay_host={relay_host}\n"
-        f"  token_exchange_redirect_uri={token_exchange_redirect_uri}"
-    )
+print(
+    f"[exchange_code_for_token] REDIRECT URI RESOLVED\n"
+    f"  relay_host={relay_host}\n"
+    f"  token_exchange_redirect_uri={token_exchange_redirect_uri}"
+)
 
     # --- Exchange code for token with Microsoft ---
     token_payload = {
