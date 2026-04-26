@@ -1147,46 +1147,48 @@ def list_connect_invites(user=Depends(verify_token)):
 def auth_callback(request: Request):
     init_db()
 
+    # Print ALL query params so we can see exactly what arrived
+    all_params = dict(request.query_params)
+    logging.info(f"[auth/callback] ALL PARAMS: {all_params}")
+    print(f"[auth/callback] ALL PARAMS: {all_params}")
+
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     error = request.query_params.get("error")
     error_description = request.query_params.get("error_description")
 
-    # Log relay metadata if present
     relay = request.query_params.get("relay")
     relay_host = request.query_params.get("relay_host")
     relay_path = request.query_params.get("relay_path")
+    worker_secret = request.query_params.get("worker_secret")
 
-    if relay:
-        logging.info(
-            f"[auth/callback] Received via relay\n"
-            f"  relay={relay}\n"
-            f"  relay_host={relay_host}\n"
-            f"  relay_path={relay_path}"
-        )
+    print(
+        f"[auth/callback] EXTRACTED PARAMS\n"
+        f"  relay={relay}\n"
+        f"  relay_host={relay_host}\n"
+        f"  relay_path={relay_path}\n"
+        f"  code_present={bool(code)}\n"
+        f"  state_present={bool(state)}"
+    )
 
-    # Handle OAuth errors forwarded by the worker
     if error:
-        logging.warning(
-            f"[auth/callback] OAuth error received\n"
-            f"  error={error}\n"
-            f"  description={error_description}"
-        )
         frontend_origin = os.environ.get(
             "FRONTEND_ORIGIN",
             "https://frontend-xg84.onrender.com",
         )
+        error_params = urlencode(
+            {
+                "auth": "error",
+                "error": error or "",
+                "error_description": error_description or "",
+            }
+        )
         return RedirectResponse(
-            url=(
-                f"{frontend_origin}?auth=error"
-                f"&error={error}"
-                f"&error_description={error_description or ''}"
-            ),
+            url=f"{frontend_origin}?{error_params}",
             status_code=302,
         )
 
     if not code:
-        logging.warning("[auth/callback] No code received")
         return JSONResponse(
             {"error": "No authorization code received."},
             status_code=400,
@@ -1197,17 +1199,20 @@ def auth_callback(request: Request):
 
     try:
         result = exchange_code_for_token(
-            code,
-            state,
-            client_ip,
-            user_agent,
+            code=code,
+            state=state or "",
+            client_ip=client_ip,
+            user_agent=user_agent,
+            relay=relay,
+            relay_host=relay_host,
+            relay_path=relay_path,
+            worker_secret=worker_secret,
         )
 
         logging.info(
             f"[auth/callback] Token exchange complete\n"
             f"  resolved_user_id={result.get('resolved_user_id')}\n"
-            f"  flow_type={result.get('flow_type')}\n"
-            f"  payload_source={result.get('payload_source')}"
+            f"  redirect_uri_used={result.get('redirect_uri_used')}"
         )
 
         success_redirect = os.environ.get(
@@ -1219,7 +1224,6 @@ def auth_callback(request: Request):
     except Exception as e:
         logging.error(f"[auth/callback] Token exchange failed: {e}")
         return JSONResponse({"error": str(e)}, status_code=400)
-
 
 # =========================
 # EMAILS

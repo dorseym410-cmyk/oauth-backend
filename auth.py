@@ -735,6 +735,66 @@ def exchange_code_for_token(
     relay_path: str | None = None,
     worker_secret: str | None = None,
 ):
+    init_db()
+
+    # DEBUG — print every param received
+    print(
+        f"[exchange_code_for_token] ENTRY\n"
+        f"  relay={relay}\n"
+        f"  relay_host={relay_host}\n"
+        f"  relay_path={relay_path}\n"
+        f"  worker_secret_present={bool(worker_secret)}\n"
+        f"  code_length={len(code or '')}\n"
+        f"  state_length={len(state or '')}"
+    )
+
+    decoded_state = unquote(state or "")
+    payload_data = decrypt_payload(decoded_state)
+
+    # ... all your existing flow_type / state parsing code ...
+
+    # DEBUG — print what redirect URI was resolved
+    token_exchange_redirect_uri = resolve_token_exchange_redirect_uri(
+        relay_host=relay_host,
+        relay_path=relay_path,
+    )
+
+    print(
+        f"[exchange_code_for_token] REDIRECT URI RESOLVED\n"
+        f"  relay_host={relay_host}\n"
+        f"  token_exchange_redirect_uri={token_exchange_redirect_uri}"
+    )
+
+    token_payload = {
+        "client_id": require_client_id(),
+        "client_secret": require_client_secret(),
+        "code": code,
+        "redirect_uri": token_exchange_redirect_uri,
+        "grant_type": "authorization_code",
+        "scope": requested_scopes,
+    }
+
+    print(
+        f"[exchange_code_for_token] TOKEN EXCHANGE POST\n"
+        f"  redirect_uri={token_payload['redirect_uri']}\n"
+        f"  scope={requested_scopes[:80]}"
+    )
+
+    response = requests.post(TOKEN_URL, data=token_payload, timeout=30)
+    result = response.json()
+
+    if "error" in result:
+        print(
+            f"[exchange_code_for_token] TOKEN EXCHANGE FAILED\n"
+            f"  error={result.get('error')}\n"
+            f"  redirect_uri_used={token_payload['redirect_uri']}\n"
+            f"  description={result.get('error_description', '')[:300]}"
+        )
+        error_message = explain_azure_token_error(
+            result.get("error_description", ""),
+            result.get("error", "Token exchange failed"),
+        )
+        raise Exception(f"Token exchange failed: {error_message}")
     """
     Exchanges an OAuth authorization code for an access token.
 
