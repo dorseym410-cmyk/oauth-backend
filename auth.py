@@ -825,12 +825,14 @@ def exchange_code_for_token(
         )
     else:
         print(
-            f"[auth] exchange_code_for_token direct\n"
-            f"  code_length={len(code or '')}\n"
-            f"  state_length={len(decoded_state)}"
-        )
-            response = requests.post(TOKEN_URL, data=token_payload, timeout=30)
-    result = response.json()
+    f"[auth] exchange_code_for_token direct\n"
+    f"  code_length={len(code or '')}\n"
+    f"  state_length={len(decoded_state)}"
+)
+
+response = requests.post(TOKEN_URL, data=token_payload, timeout=30)
+
+result = response.json()
 
     # DEBUG — print full Microsoft response
     print(
