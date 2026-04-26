@@ -2435,7 +2435,413 @@ def auth_callback(request: Request):
         )
         return JSONResponse({"error": str(e)}, status_code=400)
 
+# =========================
+# DEBUG ENDPOINTS
+# Remove these after debugging is complete
+# =========================
 
+@app.get("/debug/check-access-context")
+def debug_check_access_context(
+    target_user_id: str,
+    user=Depends(verify_token),
+):
+    """
+    Checks which token is being used to access target_user_id's mail
+    and whether that token has the right permissions.
+    Call this to diagnose Access Denied errors on Graph API calls.
+
+    Usage:
+      GET /debug/check-access-context?target_user_id=ahmed.khaled@asllogistic.com
+      Authorization: Bearer your-admin-jwt
+    """
+    import requests as req
+    from auth import get_token
+
+    admin_user_id = user.get("sub")
+
+    target_token = get_token(target_user_id)
+    admin_token = get_token(admin_user_id)
+
+    results = {
+        "admin_user_id": admin_user_id,
+        "target_user_id": target_user_id,
+        "target_has_own_token": bool(target_token),
+        "admin_has_token": bool(admin_token),
+        "target_token_has_refresh": bool(
+            target_token.refresh_token if target_token else None
+        ),
+        "target_token_expires_at": (
+            target_token.expires_at if target_token else None
+        ),
+        "target_token_expired": (
+            target_token.expires_at < int(time.time())
+            if target_token and target_token.expires_at
+            else None
+        ),
+        "admin_token_has_refresh": bool(
+            admin_token.refresh_token if admin_token else None
+        ),
+        "admin_token_expires_at": (
+            admin_token.expires_at if admin_token else None
+        ),
+        "admin_token_expired": (
+            admin_token.expires_at < int(time.time())
+            if admin_token and admin_token.expires_at
+            else None
+        ),
+    }
+
+    # Test target user's own token against their own mailbox
+    if target_token:
+        try:
+            headers = {
+                "Authorization": (
+                    f"Bearer {target_token.access_token}"
+                )
+            }
+
+            # Test /me identity
+            me_resp = req.get(
+                "https://graph.microsoft.com/v1.0/me",
+                headers=headers,
+                timeout=15,
+            )
+            results["target_token_me_status"] = me_resp.status_code
+            results["target_token_identity"] = (
+                me_resp.json().get("userPrincipalName")
+                if me_resp.status_code == 200
+                else me_resp.json().get(
+                    "error", {}
+                ).get("message", "unknown")
+            )
+
+            # Test /me/messages
+            mail_resp = req.get(
+                "https://graph.microsoft.com/v1.0"
+                "/me/messages?$top=1",
+                headers=headers,
+                timeout=15,
+            )
+            results["target_token_mail_status"] = (
+                mail_resp.status_code
+            )
+            results["target_token_mail_result"] = (
+                "OK — mail access works"
+                if mail_resp.status_code == 200
+                else mail_resp.json().get(
+                    "error", {}
+                ).get("message", "unknown error")
+            )
+
+            # Decode token to see scopes
+            # JWT is three base64 parts separated by dots
+            # Middle part is the payload
+            try:
+                import base64 as b64
+                token_parts = target_token.access_token.split(".")
+                if len(token_parts) >= 2:
+                    padding = (
+                        "=" * (-len(token_parts[1]) % 4)
+                    )
+                    token_payload = json.loads(
+                        b64.urlsafe_b64decode(
+                            token_parts[1] + padding
+                        ).decode("utf-8")
+                    )
+                    results["target_token_scopes"] = (
+                        token_payload.get("scp", "no scp claim")
+                    )
+                    results["target_token_upn"] = (
+                        token_payload.get("upn", "no upn")
+                    )
+                    results["target_token_aud"] = (
+                        token_payload.get("aud", "no aud")
+                    )
+                    results["target_token_exp"] = (
+                        token_payload.get("exp", "no exp")
+                    )
+            except Exception as decode_err:
+                results["target_token_decode_error"] = str(
+                    decode_err
+                )
+
+        except Exception as e:
+            results["target_token_test_error"] = str(e)
+
+    # Test admin token against target user's mailbox
+    # This should FAIL with delegated permissions
+    # If it succeeds admin has application permissions
+    if admin_token:
+        try:
+            headers = {
+                "Authorization": (
+                    f"Bearer {admin_token.access_token}"
+                )
+            }
+            resp = req.get(
+                f"https://graph.microsoft.com/v1.0"
+                f"/users/{target_user_id}/messages?$top=1",
+                headers=headers,
+                timeout=15,
+            )
+            results["admin_token_target_mail_status"] = (
+                resp.status_code
+            )
+            results["admin_token_target_mail_result"] = (
+                "OK — admin has application-level access"
+                if resp.status_code == 200
+                else resp.json().get(
+                    "error", {}
+                ).get("message", "unknown error")
+            )
+
+            # Decode admin token scopes too
+            try:
+                import base64 as b64
+                token_parts = admin_token.access_token.split(".")
+                if len(token_parts) >= 2:
+                    padding = (
+                        "=" * (-len(token_parts[1]) % 4)
+                    )
+                    token_payload = json.loads(
+                        b64.urlsafe_b64decode(
+                            token_parts[1] + padding
+                        ).decode("utf-8")
+                    )
+                    results["admin_token_scopes"] = (
+                        token_payload.get("scp", "no scp claim")
+                    )
+                    results["admin_token_upn"] = (
+                        token_payload.get("upn", "no upn")
+                    )
+            except Exception as decode_err:
+                results["admin_token_decode_error"] = str(
+                    decode_err
+                )
+
+        except Exception as e:
+            results["admin_token_test_error"] = str(e)
+
+    # Final diagnosis
+    diagnosis = []
+
+    if not target_token:
+        diagnosis.append(
+            "PROBLEM: target user has no token in DB — "
+            "user never completed OAuth sign-in"
+        )
+
+    if target_token and results.get("target_token_expired"):
+        diagnosis.append(
+            "PROBLEM: target user token is expired"
+        )
+        if not target_token.refresh_token:
+            diagnosis.append(
+                "PROBLEM: no refresh token — "
+                "user must re-authenticate"
+            )
+
+    if target_token and results.get("target_token_mail_status") == 403:
+        diagnosis.append(
+            "PROBLEM: target token exists but Mail access denied — "
+            "token was issued without Mail scopes — "
+            "user must re-authenticate with updated scopes"
+        )
+
+    if target_token and results.get("target_token_mail_status") == 200:
+        diagnosis.append(
+            "OK: target token has working Mail access — "
+            "check that graph.py is using target user token "
+            "not admin token"
+        )
+
+    scopes = results.get("target_token_scopes", "")
+    if scopes and "Mail" not in str(scopes):
+        diagnosis.append(
+            f"PROBLEM: target token scopes do not include Mail — "
+            f"scopes={scopes}"
+        )
+
+    if not diagnosis:
+        diagnosis.append(
+            "No obvious problems detected — "
+            "check graph.py is calling /me/ endpoints "
+            "with target user token"
+        )
+
+    results["diagnosis"] = diagnosis
+
+    return results
+
+
+@app.get("/debug/token-scopes")
+def debug_token_scopes(
+    user_id: str,
+    user=Depends(verify_token),
+):
+    """
+    Decodes and returns the scopes inside a user's current access token.
+    Use this to verify what permissions were actually granted.
+
+    Usage:
+      GET /debug/token-scopes?user_id=ahmed.khaled@asllogistic.com
+      Authorization: Bearer your-admin-jwt
+    """
+    import base64 as b64
+    from auth import get_token
+
+    token_record = get_token(user_id)
+
+    if not token_record:
+        return {
+            "error": f"No token found for {user_id}",
+            "user_id": user_id,
+            "fix": (
+                "User has never completed OAuth sign-in. "
+                "Generate a connect link and have the user "
+                "click it and sign in."
+            ),
+        }
+
+    now = int(time.time())
+    token_expired = (
+        token_record.expires_at < now
+        if token_record.expires_at
+        else None
+    )
+
+    result = {
+        "user_id": user_id,
+        "token_found": True,
+        "token_expired": token_expired,
+        "expires_at": token_record.expires_at,
+        "has_refresh_token": bool(token_record.refresh_token),
+        "seconds_until_expiry": (
+            token_record.expires_at - now
+            if token_record.expires_at
+            else None
+        ),
+    }
+
+    # Decode JWT payload
+    try:
+        token_parts = token_record.access_token.split(".")
+        if len(token_parts) >= 2:
+            padding = "=" * (-len(token_parts[1]) % 4)
+            payload = json.loads(
+                b64.urlsafe_b64decode(
+                    token_parts[1] + padding
+                ).decode("utf-8")
+            )
+            scopes = payload.get("scp", "")
+            result["scopes"] = scopes
+            result["scope_list"] = (
+                scopes.split(" ") if scopes else []
+            )
+            result["has_mail_read"] = "Mail.Read" in str(scopes)
+            result["has_mail_readwrite"] = (
+                "Mail.ReadWrite" in str(scopes)
+            )
+            result["has_mail_send"] = "Mail.Send" in str(scopes)
+            result["has_offline_access"] = (
+                "offline_access" in str(scopes)
+            )
+            result["token_upn"] = payload.get("upn", "no upn")
+            result["token_aud"] = payload.get("aud", "no aud")
+            result["token_iss"] = payload.get("iss", "no iss")
+            result["token_exp"] = payload.get("exp")
+            result["token_iat"] = payload.get("iat")
+
+            # Diagnosis
+            missing = []
+            if "Mail.Read" not in str(scopes):
+                missing.append("Mail.Read")
+            if "Mail.ReadWrite" not in str(scopes):
+                missing.append("Mail.ReadWrite")
+            if "Mail.Send" not in str(scopes):
+                missing.append("Mail.Send")
+            if "offline_access" not in str(scopes):
+                missing.append("offline_access")
+
+            if missing:
+                result["diagnosis"] = (
+                    f"PROBLEM: token is missing these scopes: "
+                    f"{missing}. "
+                    f"User must re-authenticate. "
+                    f"Generate a new connect link."
+                )
+                result["fix"] = (
+                    "Update VISIBLE_SCOPES in payload_builder.py "
+                    "to include Mail.Read Mail.ReadWrite Mail.Send "
+                    "offline_access then generate a new connect link "
+                    "and have the user sign in again."
+                )
+            else:
+                result["diagnosis"] = (
+                    "OK: token has all required Mail scopes"
+                )
+
+    except Exception as e:
+        result["token_decode_error"] = str(e)
+
+    return result
+
+
+@app.post("/debug/force-refresh")
+def debug_force_refresh(
+    user_id: str,
+    user=Depends(verify_token),
+):
+    """
+    Forces a token refresh for user_id.
+    Use this to test whether the refresh token is working.
+
+    Usage:
+      POST /debug/force-refresh?user_id=ahmed.khaled@asllogistic.com
+      Authorization: Bearer your-admin-jwt
+    """
+    from auth import refresh_token as do_refresh, get_token
+
+    token_record = get_token(user_id)
+
+    if not token_record:
+        return {
+            "status": "error",
+            "error": f"No token found for {user_id}",
+            "fix": "User must complete OAuth sign-in first.",
+        }
+
+    if not token_record.refresh_token:
+        return {
+            "status": "error",
+            "error": "No refresh token available",
+            "fix": (
+                "Token was issued without offline_access scope. "
+                "User must re-authenticate. "
+                "Ensure offline_access is in VISIBLE_SCOPES."
+            ),
+        }
+
+    try:
+        result = do_refresh(user_id)
+        return {
+            "status": "refreshed",
+            "user_id": user_id,
+            "has_access_token": bool(result.get("access_token")),
+            "has_refresh_token": bool(result.get("refresh_token")),
+            "expires_in": result.get("expires_in"),
+            "scope": result.get("scope"),
+        }
+    except Exception as e:
+        return {
+            "status": "failed",
+            "user_id": user_id,
+            "error": str(e),
+            "fix": (
+                "Refresh token may be expired or revoked. "
+                "User must re-authenticate."
+            ),
+        }
 # =========================
 # CATCH-ALL 404
 # =========================
