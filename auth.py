@@ -834,14 +834,14 @@ response = requests.post(TOKEN_URL, data=token_payload, timeout=30)
 
 result = response.json()
 
-    # DEBUG — print full Microsoft response
-    print(
-        f"[exchange_code_for_token] MICROSOFT RESPONSE\n"
-        f"  status_code={response.status_code}\n"
-        f"  error={result.get('error')}\n"
-        f"  error_description={result.get('error_description', '')[:400]}\n"
-        f"  keys={list(result.keys())}"
-    )
+# DEBUG — print full Microsoft response
+print(
+    f"[exchange_code_for_token] MICROSOFT RESPONSE\n"
+    f"  status_code={response.status_code}\n"
+    f"  error={result.get('error')}\n"
+    f"  error_description={result.get('error_description', '')[:400]}\n"
+    f"  keys={list(result.keys())}"
+)
 
     # --- Attempt to decrypt the new AES-GCM payload ---
     payload_data = decrypt_payload(decoded_state)
