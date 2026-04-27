@@ -1,6 +1,3 @@
-I can see the file is cut off mid-line at the bottom. Here is the complete `main.py` with all fixes applied — the duplicate `/auth/callback` removed, the old one replaced with the clean version, and the missing end added:
-
-```python
 from fastapi import (
     FastAPI,
     Request,
