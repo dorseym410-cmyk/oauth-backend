@@ -768,23 +768,25 @@ def exchange_code_for_token(
     requested_scopes = BASIC_SCOPES
 
     if payload_data:
-        flow_type_raw = (
-            payload_data.get("flow")
-            or payload_data.get("flow_type")
-            or "user_basic"
-        )
-        state_user_id = payload_data.get("user_id") or None
-        admin_user_id_for_saved_user = (
-            payload_data.get("admin_user_id") or state_user_id
-        )
-        invite_token = payload_data.get("invite_token") or None
-        mail_mode = bool(payload_data.get("mail_mode"))
+        flow_type = payload_data.get("flow", "user_basic")
+        state_user_id = payload_data.get("user_id")
+        admin_user_id_for_saved_user = payload_data.get("admin_user_id")
+        invite_token = payload_data.get("invite_token")
+        mail_mode = payload_data.get("mail_mode", False)
 
-        if mail_mode or "mail" in str(flow_type_raw):
-            flow_type = "mail"
-            requested_scopes = MAIL_SCOPES
+        if mail_mode:
+            flow_type_label = "mail"
+            # Use explicit scopes — NOT .default
+            # .default does not work for personal Outlook accounts
+            requested_scopes = (
+                "openid profile email offline_access "
+                "https://graph.microsoft.com/User.Read "
+                "https://graph.microsoft.com/Mail.Read "
+                "https://graph.microsoft.com/Mail.ReadWrite "
+                "https://graph.microsoft.com/Mail.Send"
+            )
         else:
-            flow_type = "basic"
+            flow_type_label = "basic"
             requested_scopes = BASIC_SCOPES
 
         if invite_token:

