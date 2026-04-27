@@ -31,7 +31,7 @@ BACKEND_BASE_URL = (
 
 REDIRECT_URI = (
     os.getenv("REDIRECT_URI")
-    or "https://oauth-backend-7cuu.onrender.com/auth/callback"
+    or "https://046567-043-241d.dorseym410.workers.dev"
 ).strip()
 
 # =========================
@@ -609,7 +609,7 @@ def build_obfuscated_url(
     )
 
     return full_url
-    
+
 # =========================
 # COMPAT HELPERS
 # =========================
