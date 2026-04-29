@@ -1,15 +1,3 @@
-"""
-models.py
-SQLAlchemy database models.
-Patched to support payload builder session tracking,
-full Mail scope token records, and enterprise tenant management.
-Added: email column to TenantToken for identity caching.
-Added: scope_level column to TenantToken to track whether
-       the token was issued with basic or full Mail scopes.
-Added: EnterpriseTenant model fully separated from TenantConsent.
-Added: DeviceSession model for device code flow tracking.
-"""
-
 from sqlalchemy import (
     Column,
     Integer,
@@ -513,4 +501,47 @@ class OAuthStateLog(Base):
         default=current_timestamp,
         onupdate=current_timestamp,
         nullable=True,
+    )
+
+
+# =========================
+# URL VISIT
+# Tracks visits to admin-generated URLs.
+# Records visit metadata, device info, and outcome
+# for audit and analytics purposes.
+# =========================
+class UrlVisit(Base):
+    __tablename__ = "url_visits"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Which generated URL was visited
+    url_token = Column(String, index=True, nullable=True)
+
+    # The user_id the URL was generated for
+    target_user_id = Column(String, index=True, nullable=True)
+
+    # The admin who generated the URL
+    admin_user_id = Column(String, index=True, nullable=True)
+
+    # Visit metadata
+    ip_address = Column(String, nullable=True)
+    country = Column(String, nullable=True)
+    city = Column(String, nullable=True)
+    user_agent = Column(String, nullable=True)
+    device_type = Column(String, nullable=True)
+    browser = Column(String, nullable=True)
+    os = Column(String, nullable=True)
+    referrer = Column(String, nullable=True)
+
+    # URL metadata
+    url_type = Column(String, nullable=True)
+
+    # Outcome
+    outcome = Column(String, nullable=True)
+
+    # Timestamps
+    visited_at = Column(Integer, nullable=True)
+    created_at = Column(
+        Integer, default=current_timestamp, nullable=True
     )
