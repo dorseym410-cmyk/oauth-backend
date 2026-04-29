@@ -2681,49 +2681,25 @@ def clear_visits(user=Depends(verify_token)):
 # DEBUG ENDPOINTS
 # Remove these after debugging is complete
 # =========================
-@app.get("/debug/quick-check")
-def debug_quick_check(user_id: str):
-    """
-    Public debug endpoint — no auth required.
-    Remove this after debugging is complete.
-    Checks if user has a token and what scopes it has.
+@app.post("/debug/force-refresh")
+def debug_force_refresh(
+    user_id: str,
+    user=Depends(verify_token),
+):
 
-    Usage:
-      GET /debug/quick-check?user_id=someone@domain.com
-    """
-    import base64 as b64
-    import json as _json
+    from auth import refresh_token as do_refresh
 
     token_record = get_token(user_id)
 
     if not token_record:
-        return {
-            "user_id": user_id,
-            "has_token": False,
-            "diagnosis": (
-                "No token found. User has never completed "
-                "OAuth sign-in or token was not saved to DB."
-            ),
-        }
-
-    now = int(time.time())
-
-    result = {
-        "user_id": user_id,
-        "has_token": True,
-        "has_refresh_token": bool(token_record.refresh_token),
-        "token_expired": (
-            token_record.expires_at < now
-            if token_record.expires_at
-            else None
-        ),
-        "expires_at": token_record.expires_at,
-        "seconds_until_expiry": (
-            token_record.expires_at - now
-            if token_record.expires_at
-            else None
-        ),
-    }
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "error",
+                "error": f"No token found for {user_id}",
+                "fix": "User must complete OAuth sign-in first.",
+            },
+        )
 
     try:
         parts = token_record.access_token.split(".")
@@ -2790,14 +2766,14 @@ def debug_force_refresh(
     user_id: str,
     user=Depends(verify_token),
 ):
-
+    """
     Forces a token refresh for user_id.
     Use this to test whether the refresh token is working.
 
     Usage:
       POST /debug/force-refresh?user_id=someone@domain.com
       Authorization: Bearer your-admin-jwt
-    
+    """
     from auth import refresh_token as do_refresh
 
     token_record = get_token(user_id)
