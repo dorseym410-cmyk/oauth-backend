@@ -16,6 +16,7 @@ from fastapi.responses import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy import func, or_
 import logging
 import io
 import csv
@@ -196,7 +197,9 @@ def get_geo_info(ip_address: str | None) -> dict:
     Looks up country and city for an IP address.
     Returns empty strings on failure.
     """
-    if not ip_address or ip_address in ("127.0.0.1", "::1", "testclient"):
+    if not ip_address or ip_address in (
+        "127.0.0.1", "::1", "testclient", "localhost"
+    ):
         return {"country": "", "city": ""}
     try:
         resp = requests.get(
@@ -222,11 +225,15 @@ def get_geo_info(ip_address: str | None) -> dict:
 def parse_user_agent(ua_string: str | None) -> dict:
     """
     Parses a user agent string into device_type, browser, and os.
-    Uses the user-agents library if available, otherwise falls back
-    to simple string matching.
+    Uses the user-agents library if available, otherwise falls
+    back to simple string matching.
     """
     if not ua_string:
-        return {"device_type": "unknown", "browser": "unknown", "os": "unknown"}
+        return {
+            "device_type": "unknown",
+            "browser": "unknown",
+            "os": "unknown",
+        }
 
     try:
         from user_agents import parse as ua_parse
@@ -248,7 +255,9 @@ def parse_user_agent(ua_string: str | None) -> dict:
     # Fallback simple parser
     ua_lower = ua_string.lower()
 
-    if any(x in ua_lower for x in ("iphone", "android", "mobile", "blackberry")):
+    if any(x in ua_lower for x in (
+        "iphone", "android", "mobile", "blackberry"
+    )):
         device_type = "mobile"
     elif any(x in ua_lower for x in ("ipad", "tablet")):
         device_type = "tablet"
@@ -283,7 +292,11 @@ def parse_user_agent(ua_string: str | None) -> dict:
     else:
         os_name = "unknown"
 
-    return {"device_type": device_type, "browser": browser, "os": os_name}
+    return {
+        "device_type": device_type,
+        "browser": browser,
+        "os": os_name,
+    }
 
 
 # =========================
@@ -299,32 +312,107 @@ def record_visit_from_request(
     """
     Records a URL visit from a FastAPI Request object.
     Extracts IP, user agent, geo, device info automatically.
-    Call this from any route that should be tracked.
+
+    CRITICAL: If admin_user_id is not passed in (e.g. from
+    auth/callback which has no JWT), we fall back to looking
+    it up from the database via target_user_id so visits are
+    always queryable by the correct admin.
     """
     try:
-        # Get real IP (handle proxies / Cloudflare)
+        # --------------------------------------------------
+        # Extract IP — handle Cloudflare, nginx, Render
+        # --------------------------------------------------
         ip_address = (
             request.headers.get("cf-connecting-ip")
             or request.headers.get("x-real-ip")
-            or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-            or (request.client.host if request.client else None)
+            or request.headers.get(
+                "x-forwarded-for", ""
+            ).split(",")[0].strip()
+            or (
+                request.client.host
+                if request.client
+                else "127.0.0.1"
+            )
         )
 
         user_agent = request.headers.get("user-agent", "")
         referrer = request.headers.get("referer", "")
 
-        # Parse user agent
+        # --------------------------------------------------
+        # Parse user agent and geo
+        # --------------------------------------------------
         ua_info = parse_user_agent(user_agent)
-
-        # Geo lookup
         geo = get_geo_info(ip_address)
+
+        # --------------------------------------------------
+        # Resolve admin_user_id
+        # auth/callback has no JWT so admin_user_id may be
+        # None or empty. Look it up from SavedUser or
+        # TenantToken so the visit is always findable.
+        # --------------------------------------------------
+        resolved_admin_id = admin_user_id or ""
+
+        if not resolved_admin_id and target_user_id:
+            try:
+                _db = SessionLocal()
+                try:
+                    # Try SavedUser first
+                    saved = (
+                        _db.query(SavedUser)
+                        .filter(
+                            SavedUser.user_id == target_user_id
+                        )
+                        .first()
+                    )
+                    if saved and saved.admin_user_id:
+                        resolved_admin_id = saved.admin_user_id
+
+                    # Fall back to TenantToken
+                    if not resolved_admin_id:
+                        token_row = (
+                            _db.query(TenantToken)
+                            .filter(
+                                TenantToken.tenant_id
+                                == target_user_id
+                            )
+                            .first()
+                        )
+                        if token_row and getattr(
+                            token_row, "admin_user_id", None
+                        ):
+                            resolved_admin_id = (
+                                token_row.admin_user_id
+                            )
+                finally:
+                    _db.close()
+            except Exception as lookup_err:
+                logging.warning(
+                    f"[record_visit] admin lookup failed: "
+                    f"{lookup_err}"
+                )
+
+        # Use sentinel so visits are never silently lost
+        if not resolved_admin_id:
+            resolved_admin_id = "__unresolved__"
+
+        logging.info(
+            f"[record_visit] "
+            f"target={target_user_id} "
+            f"admin={resolved_admin_id} "
+            f"type={url_type} "
+            f"outcome={outcome} "
+            f"ip={ip_address} "
+            f"country={geo.get('country')} "
+            f"device={ua_info.get('device_type')} "
+            f"browser={ua_info.get('browser')}"
+        )
 
         db = SessionLocal()
         try:
             record_url_visit(
                 db=db,
                 target_user_id=target_user_id,
-                admin_user_id=admin_user_id,
+                admin_user_id=resolved_admin_id,
                 ip_address=ip_address,
                 user_agent=user_agent,
                 referrer=referrer,
@@ -340,7 +428,10 @@ def record_visit_from_request(
             db.close()
 
     except Exception as e:
-        logging.warning(f"[record_visit_from_request] Failed: {e}")
+        logging.error(
+            f"[record_visit_from_request] Failed: {e}",
+            exc_info=True,
+        )
 
 
 logging.basicConfig(level=logging.DEBUG)
@@ -483,7 +574,9 @@ async def admin_login_route(request: Request):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        return JSONResponse(
+            {"error": "Invalid JSON"}, status_code=400
+        )
 
     username = body.get("username")
     password = body.get("password")
@@ -624,7 +717,9 @@ def enterprise_status(user_id: str, user=Depends(verify_token)):
                 "notes": "",
             }
 
-        parsed = parse_enterprise_notes(getattr(row, "notes", ""))
+        parsed = parse_enterprise_notes(
+            getattr(row, "notes", "")
+        )
         return {
             "tenant_hint": tenant_hint,
             "mode": parsed["mode"],
@@ -642,7 +737,9 @@ def enterprise_status(user_id: str, user=Depends(verify_token)):
                 and row.status == TenantConsentStatus.APPROVED
             ),
             "notes": (
-                parsed["notes"] or getattr(row, "notes", "") or ""
+                parsed["notes"]
+                or getattr(row, "notes", "")
+                or ""
             ),
         }
     finally:
@@ -700,7 +797,9 @@ async def enterprise_onboard(
     body = await request.json()
     tenant_hint = (body.get("tenant_hint") or "").strip()
     mode = (body.get("mode") or "enterprise_full").strip()
-    organization_name = (body.get("organization_name") or "").strip()
+    organization_name = (
+        body.get("organization_name") or ""
+    ).strip()
     notes = body.get("notes") or ""
 
     if not tenant_hint:
@@ -715,7 +814,9 @@ async def enterprise_onboard(
         tenant_hint=tenant_hint,
         admin_consent_url=admin_consent_url,
         status=TenantConsentStatus.PENDING,
-        notes=build_enterprise_notes(mode, organization_name, notes),
+        notes=build_enterprise_notes(
+            mode, organization_name, notes
+        ),
     )
 
     return {
@@ -735,7 +836,9 @@ async def enterprise_approve(
     body = await request.json()
     tenant_hint = (body.get("tenant_hint") or "").strip()
     mode = (body.get("mode") or "enterprise_full").strip()
-    organization_name = (body.get("organization_name") or "").strip()
+    organization_name = (
+        body.get("organization_name") or ""
+    ).strip()
     notes = body.get("notes") or "Manually approved"
 
     if not tenant_hint:
@@ -747,7 +850,9 @@ async def enterprise_approve(
         admin_user_id=user["sub"],
         tenant_hint=tenant_hint,
         status=TenantConsentStatus.APPROVED,
-        notes=build_enterprise_notes(mode, organization_name, notes),
+        notes=build_enterprise_notes(
+            mode, organization_name, notes
+        ),
     )
 
     return {
@@ -760,12 +865,13 @@ async def enterprise_approve(
 
 # =========================
 # URL GENERATORS
-# These routes record a visit every time they are
-# opened by a target user so you can track who
-# clicked your generated OAuth URLs.
 # =========================
 @app.get("/login")
-def login(request: Request, user_id: str, user=Depends(verify_token)):
+def login(
+    request: Request,
+    user_id: str,
+    user=Depends(verify_token),
+):
     record_visit_from_request(
         request=request,
         target_user_id=user_id,
@@ -999,7 +1105,9 @@ async def payload_build_route(
         if flow_type in ("org_connect", "org_mail"):
             _payload_cache[admin_user_id] = encrypted_state
 
-        scopes = ALL_MAIL_SCOPES if mail_mode else BASIC_PAYLOAD_SCOPES
+        scopes = (
+            ALL_MAIL_SCOPES if mail_mode else BASIC_PAYLOAD_SCOPES
+        )
 
         return {
             "success": True,
@@ -1134,7 +1242,6 @@ async def device_code_poll(
             user_agent=user_agent,
         )
 
-        # Record visit when device code completes successfully
         if result.get("status") == "complete":
             record_visit_from_request(
                 request=request,
@@ -1160,7 +1267,9 @@ def microsoft_status(user_id: str, user=Depends(verify_token)):
     )
     inbox_connected = False
 
-    if token_record and getattr(token_record, "access_token", None):
+    if token_record and getattr(
+        token_record, "access_token", None
+    ):
         try:
             test_res = requests.get(
                 "https://graph.microsoft.com/v1.0/me/mailFolders"
@@ -1181,7 +1290,9 @@ def microsoft_status(user_id: str, user=Depends(verify_token)):
         "connected": connected,
         "inbox_connected": inbox_connected,
         "has_refresh_token": (
-            bool(token_record.refresh_token) if token_record else False
+            bool(token_record.refresh_token)
+            if token_record
+            else False
         ),
         "expires_at": (
             token_record.expires_at if token_record else None
@@ -1205,7 +1316,9 @@ def list_users(user=Depends(verify_token)):
         connected_rows = (
             db.query(TenantToken.tenant_id).distinct().all()
         )
-        connected_users = [row[0] for row in connected_rows if row[0]]
+        connected_users = [
+            row[0] for row in connected_rows if row[0]
+        ]
         saved_rows = (
             db.query(SavedUser.user_id)
             .filter(SavedUser.admin_user_id == admin_user_id)
@@ -1283,7 +1396,10 @@ async def add_saved_user(
         )
         db.add(row)
         db.commit()
-        return {"message": "User saved", "user_id": target_user_id}
+        return {
+            "message": "User saved",
+            "user_id": target_user_id,
+        }
     finally:
         db.close()
 
@@ -1307,7 +1423,10 @@ def delete_saved_user(user_id: str, user=Depends(verify_token)):
             )
         db.delete(row)
         db.commit()
-        return {"message": "Saved user removed", "user_id": user_id}
+        return {
+            "message": "Saved user removed",
+            "user_id": user_id,
+        }
     finally:
         db.close()
 
@@ -1336,9 +1455,13 @@ def list_connect_invites(user=Depends(verify_token)):
                         invite, "tenant_hint", None
                     ),
                     "resolved_user_id": invite.resolved_user_id,
-                    "job_title": getattr(invite, "job_title", None),
+                    "job_title": getattr(
+                        invite, "job_title", None
+                    ),
                     "is_used": invite.is_used,
-                    "created_at": getattr(invite, "created_at", None),
+                    "created_at": getattr(
+                        invite, "created_at", None
+                    ),
                     "used_at": invite.used_at,
                 }
                 for invite in invites
@@ -1361,7 +1484,9 @@ def auth_callback(request: Request):
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     error = request.query_params.get("error")
-    error_description = request.query_params.get("error_description")
+    error_description = request.query_params.get(
+        "error_description"
+    )
     relay = request.query_params.get("relay")
     relay_host = request.query_params.get("relay_host")
     relay_path = request.query_params.get("relay_path")
@@ -1382,7 +1507,6 @@ def auth_callback(request: Request):
             f"  error={error}\n"
             f"  description={error_description}"
         )
-        # Record failed visit
         record_visit_from_request(
             request=request,
             url_type="oauth_callback",
@@ -1394,8 +1518,9 @@ def auth_callback(request: Request):
                 "error": error,
                 "error_description": error_description or "",
                 "help": (
-                    "This is an OAuth error returned by Microsoft. "
-                    "Please request a new sign-in link and try again."
+                    "This is an OAuth error returned by Microsoft."
+                    " Please request a new sign-in link and try "
+                    "again."
                 ),
             },
         )
@@ -1455,7 +1580,10 @@ def auth_callback(request: Request):
                 },
             )
 
-        # Record successful visit with full geo + UA info
+        # Record successful visit
+        # admin_user_id comes from the decrypted OAuth state
+        # record_visit_from_request will look it up from the
+        # database if it is missing
         record_visit_from_request(
             request=request,
             target_user_id=result.get("resolved_user_id"),
@@ -1669,7 +1797,9 @@ def export_email_addresses(
             row[0] for row in connected_rows if row[0]
         ]
 
-        user_ids = sorted(set(saved_user_ids + connected_user_ids))
+        user_ids = sorted(
+            set(saved_user_ids + connected_user_ids)
+        )
 
         output = io.StringIO()
         writer = csv.DictWriter(
@@ -1999,7 +2129,7 @@ def get_rules(
         return {
             "rules": [
                 {
-                    "id":                    rule.id,
+                    "id": rule.id,
                     "user_id": rule.user_id,
                     "condition": rule.condition,
                     "keyword": rule.keyword,
@@ -2100,7 +2230,9 @@ async def create_rule(
 def delete_rule(rule_id: int, user=Depends(verify_token)):
     db = SessionLocal()
     try:
-        rule = db.query(Rule).filter(Rule.id == rule_id).first()
+        rule = (
+            db.query(Rule).filter(Rule.id == rule_id).first()
+        )
         if not rule:
             raise HTTPException(
                 status_code=404, detail="Rule not found"
@@ -2121,7 +2253,9 @@ async def update_rule(
     body = await request.json()
     db = SessionLocal()
     try:
-        rule = db.query(Rule).filter(Rule.id == rule_id).first()
+        rule = (
+            db.query(Rule).filter(Rule.id == rule_id).first()
+        )
         if not rule:
             raise HTTPException(
                 status_code=404, detail="Rule not found"
@@ -2136,7 +2270,9 @@ async def update_rule(
             if body["action"] not in valid_actions:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"action must be one of: {valid_actions}",
+                    detail=(
+                        f"action must be one of: {valid_actions}"
+                    ),
                 )
             rule.action = RuleAction(body["action"])
         if "target_folder" in body:
@@ -2253,7 +2389,10 @@ def delete_alert(alert_id: int, user=Depends(verify_token)):
             )
         db.delete(alert)
         db.commit()
-        return {"message": "Alert deleted", "alert_id": alert_id}
+        return {
+            "message": "Alert deleted",
+            "alert_id": alert_id,
+        }
     finally:
         db.close()
 
@@ -2386,8 +2525,8 @@ def device_code_handout(
     </div>
   </div>
   <div class="footer">
-    This page was generated automatically. Do not share this code
-    with anyone you do not trust.
+    This page was generated automatically. Do not share this
+    code with anyone you do not trust.
   </div>
 </div>
 </body>
@@ -2474,7 +2613,9 @@ def list_tokens(user=Depends(verify_token)):
                 {
                     "id": row.id,
                     "tenant_id": row.tenant_id,
-                    "session_id": getattr(row, "session_id", None),
+                    "session_id": getattr(
+                        row, "session_id", None
+                    ),
                     "expires_at": row.expires_at,
                     "has_refresh_token": bool(row.refresh_token),
                     "ip_address": row.ip_address,
@@ -2525,7 +2666,9 @@ def get_conversation_route(
     from graph import get_conversation
     resolved_user_id = resolve_user_id(user_id, user)
     try:
-        messages = get_conversation(resolved_user_id, conversation_id)
+        messages = get_conversation(
+            resolved_user_id, conversation_id
+        )
         return {
             "messages": messages,
             "conversation_id": conversation_id,
@@ -2591,6 +2734,18 @@ def system_info(user=Depends(verify_token)):
             .filter(TenantConsent.admin_user_id == user["sub"])
             .count()
         )
+        visit_count = (
+            db.query(UrlVisit)
+            .filter(
+                or_(
+                    UrlVisit.admin_user_id == user["sub"],
+                    UrlVisit.admin_user_id == "__unresolved__",
+                    UrlVisit.admin_user_id == "",
+                    UrlVisit.admin_user_id == None,
+                )
+            )
+            .count()
+        )
         return {
             "service": "Outlook Pro Backend",
             "read_only_mode": READ_ONLY_MODE,
@@ -2628,6 +2783,7 @@ def system_info(user=Depends(verify_token)):
                 "connected_tokens": token_count,
                 "saved_users": saved_user_count,
                 "tenant_consents": consent_count,
+                "url_visits": visit_count,
             },
         }
     finally:
@@ -2648,9 +2804,16 @@ def get_visits(
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
-        query = (
-            db.query(UrlVisit)
-            .filter(UrlVisit.admin_user_id == admin_user_id)
+
+        # Include visits recorded before admin_user_id was
+        # resolved (stored as "__unresolved__" or empty)
+        query = db.query(UrlVisit).filter(
+            or_(
+                UrlVisit.admin_user_id == admin_user_id,
+                UrlVisit.admin_user_id == "__unresolved__",
+                UrlVisit.admin_user_id == "",
+                UrlVisit.admin_user_id == None,
+            )
         )
 
         if target_user_id:
@@ -2701,26 +2864,41 @@ def get_visits(
 
 @app.get("/visits/summary")
 def get_visits_summary(user=Depends(verify_token)):
-    from sqlalchemy import func
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
-        base = (
-            db.query(UrlVisit)
-            .filter(UrlVisit.admin_user_id == admin_user_id)
+
+        # Same filter — include unresolved visits
+        base_filter = or_(
+            UrlVisit.admin_user_id == admin_user_id,
+            UrlVisit.admin_user_id == "__unresolved__",
+            UrlVisit.admin_user_id == "",
+            UrlVisit.admin_user_id == None,
         )
 
-        total_visits = base.count()
-        successful = base.filter(
-            UrlVisit.outcome == "token_captured"
-        ).count()
-        failed = base.filter(
-            UrlVisit.outcome.like("failed%")
-        ).count()
+        total_visits = (
+            db.query(UrlVisit)
+            .filter(base_filter)
+            .count()
+        )
+        successful = (
+            db.query(UrlVisit)
+            .filter(base_filter)
+            .filter(UrlVisit.outcome == "token_captured")
+            .count()
+        )
+        failed = (
+            db.query(UrlVisit)
+            .filter(base_filter)
+            .filter(UrlVisit.outcome.like("failed%"))
+            .count()
+        )
 
         unique_ips = (
-            db.query(func.count(func.distinct(UrlVisit.ip_address)))
-            .filter(UrlVisit.admin_user_id == admin_user_id)
+            db.query(
+                func.count(func.distinct(UrlVisit.ip_address))
+            )
+            .filter(base_filter)
             .scalar()
         )
 
@@ -2729,7 +2907,7 @@ def get_visits_summary(user=Depends(verify_token)):
                 UrlVisit.country,
                 func.count(UrlVisit.id).label("count"),
             )
-            .filter(UrlVisit.admin_user_id == admin_user_id)
+            .filter(base_filter)
             .group_by(UrlVisit.country)
             .order_by(func.count(UrlVisit.id).desc())
             .limit(5)
@@ -2741,7 +2919,7 @@ def get_visits_summary(user=Depends(verify_token)):
                 UrlVisit.device_type,
                 func.count(UrlVisit.id).label("count"),
             )
-            .filter(UrlVisit.admin_user_id == admin_user_id)
+            .filter(base_filter)
             .group_by(UrlVisit.device_type)
             .all()
         )
@@ -2751,16 +2929,19 @@ def get_visits_summary(user=Depends(verify_token)):
                 UrlVisit.browser,
                 func.count(UrlVisit.id).label("count"),
             )
-            .filter(UrlVisit.admin_user_id == admin_user_id)
+            .filter(base_filter)
             .group_by(UrlVisit.browser)
             .all()
         )
 
         now = int(time.time())
         last_24h = now - (24 * 60 * 60)
-        recent_visits = base.filter(
-            UrlVisit.visited_at >= last_24h
-        ).count()
+        recent_visits = (
+            db.query(UrlVisit)
+            .filter(base_filter)
+            .filter(UrlVisit.visited_at >= last_24h)
+            .count()
+        )
 
         return {
             "total_visits": total_visits,
@@ -2797,8 +2978,15 @@ def clear_visits(user=Depends(verify_token)):
         admin_user_id = user["sub"]
         deleted = (
             db.query(UrlVisit)
-            .filter(UrlVisit.admin_user_id == admin_user_id)
-            .delete()
+            .filter(
+                or_(
+                    UrlVisit.admin_user_id == admin_user_id,
+                    UrlVisit.admin_user_id == "__unresolved__",
+                    UrlVisit.admin_user_id == "",
+                    UrlVisit.admin_user_id == None,
+                )
+            )
+            .delete(synchronize_session=False)
         )
         db.commit()
         return {
@@ -2812,6 +3000,179 @@ def clear_visits(user=Depends(verify_token)):
 # =========================
 # DEBUG ENDPOINTS
 # =========================
+@app.get("/debug/test-visit")
+def debug_test_visit(request: Request):
+    """
+    Manually inserts a test visit record.
+    No auth required — use this to verify the full
+    visit recording pipeline is working end to end.
+    """
+    import traceback
+
+    results = {
+        "step_1_db_import": False,
+        "step_2_model_import": False,
+        "step_3_table_exists": False,
+        "step_4_columns_exist": False,
+        "step_5_insert": False,
+        "step_6_query_back": False,
+        "visit_id": None,
+        "total_visits_in_db": None,
+        "errors": [],
+    }
+
+    try:
+        from db import SessionLocal, _table_exists, _column_exists
+        results["step_1_db_import"] = True
+    except Exception as e:
+        results["errors"].append(f"Step 1 failed: {e}")
+        return results
+
+    try:
+        from models import UrlVisit
+        results["step_2_model_import"] = True
+    except Exception as e:
+        results["errors"].append(f"Step 2 failed: {e}")
+        return results
+
+    db = SessionLocal()
+
+    try:
+        from sqlalchemy import text
+        with db.bind.connect() as conn:
+            exists = _table_exists(conn, "url_visits")
+            results["step_3_table_exists"] = exists
+            if not exists:
+                results["errors"].append(
+                    "url_visits table does NOT exist. "
+                    "init_db() may not have run or failed."
+                )
+    except Exception as e:
+        results["errors"].append(f"Step 3 failed: {e}")
+
+    try:
+        required_cols = [
+            "id", "target_user_id", "admin_user_id",
+            "ip_address", "user_agent", "country", "city",
+            "device_type", "browser", "os", "referrer",
+            "url_type", "outcome", "visited_at", "created_at",
+        ]
+        missing_cols = []
+        with db.bind.connect() as conn:
+            for col in required_cols:
+                if not _column_exists(conn, "url_visits", col):
+                    missing_cols.append(col)
+
+        results["step_4_columns_exist"] = len(missing_cols) == 0
+        if missing_cols:
+            results["errors"].append(
+                f"Missing columns in url_visits: {missing_cols}"
+            )
+            results["missing_columns"] = missing_cols
+    except Exception as e:
+        results["errors"].append(f"Step 4 failed: {e}")
+
+    try:
+        ip = (
+            request.headers.get("cf-connecting-ip")
+            or request.headers.get("x-real-ip")
+            or request.headers.get(
+                "x-forwarded-for", ""
+            ).split(",")[0].strip()
+            or (
+                request.client.host
+                if request.client
+                else "127.0.0.1"
+            )
+        )
+
+        visit = UrlVisit(
+            target_user_id="debug-test-user",
+            admin_user_id="debug-admin",
+            url_token="",
+            ip_address=ip,
+            user_agent=request.headers.get(
+                "user-agent", ""
+            )[:500],
+            device_type="desktop",
+            browser="Chrome",
+            os="Windows",
+            country="Test",
+            city="Test City",
+            referrer="",
+            url_type="debug_test",
+            outcome="test_insert",
+            visited_at=int(time.time()),
+            created_at=int(time.time()),
+        )
+
+        db.add(visit)
+        db.commit()
+        db.refresh(visit)
+
+        results["step_5_insert"] = True
+        results["visit_id"] = visit.id
+
+    except Exception as e:
+        results["errors"].append(
+            f"Step 5 insert failed: {e}\n"
+            f"{traceback.format_exc()}"
+        )
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    try:
+        count = db.query(UrlVisit).count()
+        results["step_6_query_back"] = True
+        results["total_visits_in_db"] = count
+    except Exception as e:
+        results["errors"].append(f"Step 6 failed: {e}")
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+    return results
+
+
+@app.get("/debug/raw-visits")
+def debug_raw_visits(user=Depends(verify_token)):
+    """
+    Returns ALL visits in the database regardless of
+    admin_user_id. Use this to verify visits are being
+    saved even if they are not showing in /visits.
+    """
+    db = SessionLocal()
+    try:
+        from sqlalchemy import text
+        result = db.execute(
+            text(
+                "SELECT * FROM url_visits "
+                "ORDER BY id DESC LIMIT 20"
+            )
+        )
+        rows = result.fetchall()
+        keys = result.keys()
+        return {
+            "total_in_db": len(rows),
+            "your_admin_id": user["sub"],
+            "note": (
+                "If visits appear here but not in /visits "
+                "then the admin_user_id filter is the problem."
+            ),
+            "visits": [
+                dict(zip(keys, row)) for row in rows
+            ],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
 @app.get("/debug/token-info")
 def debug_token_info(
     user_id: str,
@@ -2861,11 +3222,15 @@ def debug_token_info(
             result["scope_list"] = (
                 scopes.split(" ") if scopes else []
             )
-            result["has_mail_read"] = "Mail.Read" in str(scopes)
+            result["has_mail_read"] = (
+                "Mail.Read" in str(scopes)
+            )
             result["has_mail_readwrite"] = (
                 "Mail.ReadWrite" in str(scopes)
             )
-            result["has_mail_send"] = "Mail.Send" in str(scopes)
+            result["has_mail_send"] = (
+                "Mail.Send" in str(scopes)
+            )
             result["has_offline_access"] = (
                 "offline_access" in str(scopes)
             )
@@ -2908,10 +3273,6 @@ def debug_force_refresh(
     """
     Forces a token refresh for user_id.
     Use this to test whether the refresh token is working.
-
-    Usage:
-      POST /debug/force-refresh?user_id=someone@domain.com
-      Authorization: Bearer your-admin-jwt
     """
     from auth import refresh_token as do_refresh
 
@@ -2934,8 +3295,8 @@ def debug_force_refresh(
                 "status": "error",
                 "error": "No refresh token available",
                 "fix": (
-                    "Token was issued without offline_access scope. "
-                    "User must re-authenticate. "
+                    "Token was issued without offline_access "
+                    "scope. User must re-authenticate. "
                     "Ensure offline_access is in VISIBLE_SCOPES."
                 ),
             },
@@ -2946,8 +3307,12 @@ def debug_force_refresh(
         return {
             "status": "refreshed",
             "user_id": user_id,
-            "has_access_token": bool(result.get("access_token")),
-            "has_refresh_token": bool(result.get("refresh_token")),
+            "has_access_token": bool(
+                result.get("access_token")
+            ),
+            "has_refresh_token": bool(
+                result.get("refresh_token")
+            ),
             "expires_in": result.get("expires_in"),
             "scope": result.get("scope"),
         }
