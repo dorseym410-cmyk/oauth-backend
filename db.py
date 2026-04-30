@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 
 from sqlalchemy import create_engine, text
@@ -62,573 +63,131 @@ Base = declarative_base()
 # MIGRATION DEFINITIONS
 # Each entry is a tuple of:
 # (table_name, column_name, sqlite_type, postgres_type)
-# postgres_type can be None to use sqlite_type for both.
 # =========================
 MIGRATIONS = [
     # -------------------------------------------------
     # tenant_tokens
     # -------------------------------------------------
-    (
-        "tenant_tokens",
-        "session_id",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "tenant_tokens",
-        "email",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "tenant_tokens",
-        "scope_level",
-        "VARCHAR DEFAULT 'unknown'",
-        "VARCHAR DEFAULT 'unknown'",
-    ),
-    (
-        "tenant_tokens",
-        "flow_type",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "tenant_tokens",
-        "admin_user_id",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "tenant_tokens",
-        "ip_address",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "tenant_tokens",
-        "user_agent",
-        "TEXT",
-        "TEXT",
-    ),
-    (
-        "tenant_tokens",
-        "location",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "tenant_tokens",
-        "created_at",
-        "INTEGER",
-        "INTEGER",
-    ),
-    (
-        "tenant_tokens",
-        "updated_at",
-        "INTEGER",
-        "INTEGER",
-    ),
+    ("tenant_tokens", "session_id",    "VARCHAR",              "VARCHAR"),
+    ("tenant_tokens", "email",         "VARCHAR",              "VARCHAR"),
+    ("tenant_tokens", "scope_level",   "VARCHAR DEFAULT 'unknown'", "VARCHAR DEFAULT 'unknown'"),
+    ("tenant_tokens", "flow_type",     "VARCHAR",              "VARCHAR"),
+    ("tenant_tokens", "admin_user_id", "VARCHAR",              "VARCHAR"),
+    ("tenant_tokens", "ip_address",    "VARCHAR",              "VARCHAR"),
+    ("tenant_tokens", "user_agent",    "TEXT",                 "TEXT"),
+    ("tenant_tokens", "location",      "VARCHAR",              "VARCHAR"),
+    ("tenant_tokens", "created_at",    "INTEGER",              "INTEGER"),
+    ("tenant_tokens", "updated_at",    "INTEGER",              "INTEGER"),
     # -------------------------------------------------
     # saved_users
     # -------------------------------------------------
-    (
-        "saved_users",
-        "email",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "saved_users",
-        "tenant_hint",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "saved_users",
-        "job_title",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "saved_users",
-        "created_at",
-        "INTEGER",
-        "INTEGER",
-    ),
-    (
-        "saved_users",
-        "updated_at",
-        "INTEGER",
-        "INTEGER",
-    ),
+    ("saved_users", "email",       "VARCHAR", "VARCHAR"),
+    ("saved_users", "tenant_hint", "VARCHAR", "VARCHAR"),
+    ("saved_users", "job_title",   "VARCHAR", "VARCHAR"),
+    ("saved_users", "created_at",  "INTEGER", "INTEGER"),
+    ("saved_users", "updated_at",  "INTEGER", "INTEGER"),
     # -------------------------------------------------
     # connect_invites
     # -------------------------------------------------
-    (
-        "connect_invites",
-        "connect_mode",
-        "VARCHAR DEFAULT 'basic'",
-        "VARCHAR DEFAULT 'basic'",
-    ),
-    (
-        "connect_invites",
-        "tenant_hint",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "connect_invites",
-        "resolved_email",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "connect_invites",
-        "payload_nonce",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "connect_invites",
-        "job_title",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "connect_invites",
-        "created_at",
-        "INTEGER",
-        "INTEGER",
-    ),
-    (
-        "connect_invites",
-        "updated_at",
-        "INTEGER",
-        "INTEGER",
-    ),
+    ("connect_invites", "connect_mode",   "VARCHAR DEFAULT 'basic'", "VARCHAR DEFAULT 'basic'"),
+    ("connect_invites", "tenant_hint",    "VARCHAR", "VARCHAR"),
+    ("connect_invites", "resolved_email", "VARCHAR", "VARCHAR"),
+    ("connect_invites", "payload_nonce",  "VARCHAR", "VARCHAR"),
+    ("connect_invites", "job_title",      "VARCHAR", "VARCHAR"),
+    ("connect_invites", "created_at",     "INTEGER", "INTEGER"),
+    ("connect_invites", "updated_at",     "INTEGER", "INTEGER"),
     # -------------------------------------------------
     # tenant_consents
     # -------------------------------------------------
-    (
-        "tenant_consents",
-        "notes",
-        "TEXT",
-        "TEXT",
-    ),
-    (
-        "tenant_consents",
-        "created_at",
-        "INTEGER",
-        "INTEGER",
-    ),
-    (
-        "tenant_consents",
-        "updated_at",
-        "INTEGER",
-        "INTEGER",
-    ),
+    ("tenant_consents", "notes",      "TEXT",    "TEXT"),
+    ("tenant_consents", "created_at", "INTEGER", "INTEGER"),
+    ("tenant_consents", "updated_at", "INTEGER", "INTEGER"),
     # -------------------------------------------------
     # rules
     # -------------------------------------------------
-    (
-        "rules",
-        "target_folder",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "rules",
-        "forward_to",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "rules",
-        "is_active",
-        "BOOLEAN DEFAULT 1",
-        "BOOLEAN DEFAULT TRUE",
-    ),
-    (
-        "rules",
-        "created_at",
-        "INTEGER",
-        "INTEGER",
-    ),
-    (
-        "rules",
-        "updated_at",
-        "INTEGER",
-        "INTEGER",
-    ),
+    ("rules", "target_folder", "VARCHAR",              "VARCHAR"),
+    ("rules", "forward_to",    "VARCHAR",              "VARCHAR"),
+    ("rules", "is_active",     "BOOLEAN DEFAULT 1",    "BOOLEAN DEFAULT TRUE"),
+    ("rules", "created_at",    "INTEGER",              "INTEGER"),
+    ("rules", "updated_at",    "INTEGER",              "INTEGER"),
     # -------------------------------------------------
     # alerts
     # -------------------------------------------------
-    (
-        "alerts",
-        "user_id",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "alerts",
-        "level",
-        "VARCHAR DEFAULT 'info'",
-        "VARCHAR DEFAULT 'info'",
-    ),
-    (
-        "alerts",
-        "created_at",
-        "INTEGER",
-        "INTEGER",
-    ),
+    ("alerts", "user_id",    "VARCHAR",              "VARCHAR"),
+    ("alerts", "level",      "VARCHAR DEFAULT 'info'", "VARCHAR DEFAULT 'info'"),
+    ("alerts", "created_at", "INTEGER",              "INTEGER"),
     # -------------------------------------------------
-    # enterprise_tenants (new table — handled by
-    # create_all but columns listed here for safety)
+    # enterprise_tenants
     # -------------------------------------------------
-    (
-        "enterprise_tenants",
-        "tenant_id",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "enterprise_tenants",
-        "organization_name",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "enterprise_tenants",
-        "app_only_enabled",
-        "BOOLEAN DEFAULT 0",
-        "BOOLEAN DEFAULT FALSE",
-    ),
-    (
-        "enterprise_tenants",
-        "mailbox_scope_group",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "enterprise_tenants",
-        "notes",
-        "TEXT",
-        "TEXT",
-    ),
-    (
-        "enterprise_tenants",
-        "admin_consent_url",
-        "TEXT",
-        "TEXT",
-    ),
-    (
-        "enterprise_tenants",
-        "created_at",
-        "INTEGER",
-        "INTEGER",
-    ),
-    (
-        "enterprise_tenants",
-        "updated_at",
-        "INTEGER",
-        "INTEGER",
-    ),
+    ("enterprise_tenants", "tenant_id",           "VARCHAR",           "VARCHAR"),
+    ("enterprise_tenants", "organization_name",   "VARCHAR",           "VARCHAR"),
+    ("enterprise_tenants", "app_only_enabled",    "BOOLEAN DEFAULT 0", "BOOLEAN DEFAULT FALSE"),
+    ("enterprise_tenants", "mailbox_scope_group", "VARCHAR",           "VARCHAR"),
+    ("enterprise_tenants", "notes",               "TEXT",              "TEXT"),
+    ("enterprise_tenants", "admin_consent_url",   "TEXT",              "TEXT"),
+    ("enterprise_tenants", "created_at",          "INTEGER",           "INTEGER"),
+    ("enterprise_tenants", "updated_at",          "INTEGER",           "INTEGER"),
     # -------------------------------------------------
-    # device_sessions (new table — handled by
-    # create_all but columns listed here for safety)
+    # device_sessions
     # -------------------------------------------------
-    (
-        "device_sessions",
-        "mail_mode",
-        "BOOLEAN DEFAULT 0",
-        "BOOLEAN DEFAULT FALSE",
-    ),
-    (
-        "device_sessions",
-        "resolved_user_id",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "device_sessions",
-        "resolved_email",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "device_sessions",
-        "job_title",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "device_sessions",
-        "expires_in",
-        "INTEGER",
-        "INTEGER",
-    ),
-    (
-        "device_sessions",
-        "expires_at",
-        "INTEGER",
-        "INTEGER",
-    ),
-    (
-        "device_sessions",
-        "poll_interval",
-        "INTEGER DEFAULT 5",
-        "INTEGER DEFAULT 5",
-    ),
-    (
-        "device_sessions",
-        "ip_address",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "device_sessions",
-        "user_agent",
-        "TEXT",
-        "TEXT",
-    ),
-    (
-        "device_sessions",
-        "location",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "device_sessions",
-        "created_at",
-        "INTEGER",
-        "INTEGER",
-    ),
-    (
-        "device_sessions",
-        "updated_at",
-        "INTEGER",
-        "INTEGER",
-    ),
+    ("device_sessions", "mail_mode",        "BOOLEAN DEFAULT 0",   "BOOLEAN DEFAULT FALSE"),
+    ("device_sessions", "resolved_user_id", "VARCHAR",             "VARCHAR"),
+    ("device_sessions", "resolved_email",   "VARCHAR",             "VARCHAR"),
+    ("device_sessions", "job_title",        "VARCHAR",             "VARCHAR"),
+    ("device_sessions", "expires_in",       "INTEGER",             "INTEGER"),
+    ("device_sessions", "expires_at",       "INTEGER",             "INTEGER"),
+    ("device_sessions", "poll_interval",    "INTEGER DEFAULT 5",   "INTEGER DEFAULT 5"),
+    ("device_sessions", "ip_address",       "VARCHAR",             "VARCHAR"),
+    ("device_sessions", "user_agent",       "TEXT",                "TEXT"),
+    ("device_sessions", "location",         "VARCHAR",             "VARCHAR"),
+    ("device_sessions", "created_at",       "INTEGER",             "INTEGER"),
+    ("device_sessions", "updated_at",       "INTEGER",             "INTEGER"),
     # -------------------------------------------------
-    # payload_audit_logs (new table)
+    # payload_audit_logs
     # -------------------------------------------------
-    (
-        "payload_audit_logs",
-        "nonce",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "payload_audit_logs",
-        "flow_type",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "payload_audit_logs",
-        "user_id",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "payload_audit_logs",
-        "admin_user_id",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "payload_audit_logs",
-        "decryption_success",
-        "BOOLEAN DEFAULT 1",
-        "BOOLEAN DEFAULT TRUE",
-    ),
-    (
-        "payload_audit_logs",
-        "was_expired",
-        "BOOLEAN DEFAULT 0",
-        "BOOLEAN DEFAULT FALSE",
-    ),
-    (
-        "payload_audit_logs",
-        "was_replay",
-        "BOOLEAN DEFAULT 0",
-        "BOOLEAN DEFAULT FALSE",
-    ),
-    (
-        "payload_audit_logs",
-        "ip_address",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "payload_audit_logs",
-        "payload_age_seconds",
-        "INTEGER",
-        "INTEGER",
-    ),
-    (
-        "payload_audit_logs",
-        "created_at",
-        "INTEGER",
-        "INTEGER",
-    ),
+    ("payload_audit_logs", "nonce",              "VARCHAR",             "VARCHAR"),
+    ("payload_audit_logs", "flow_type",          "VARCHAR",             "VARCHAR"),
+    ("payload_audit_logs", "user_id",            "VARCHAR",             "VARCHAR"),
+    ("payload_audit_logs", "admin_user_id",      "VARCHAR",             "VARCHAR"),
+    ("payload_audit_logs", "decryption_success", "BOOLEAN DEFAULT 1",   "BOOLEAN DEFAULT TRUE"),
+    ("payload_audit_logs", "was_expired",        "BOOLEAN DEFAULT 0",   "BOOLEAN DEFAULT FALSE"),
+    ("payload_audit_logs", "was_replay",         "BOOLEAN DEFAULT 0",   "BOOLEAN DEFAULT FALSE"),
+    ("payload_audit_logs", "ip_address",         "VARCHAR",             "VARCHAR"),
+    ("payload_audit_logs", "payload_age_seconds","INTEGER",             "INTEGER"),
+    ("payload_audit_logs", "created_at",         "INTEGER",             "INTEGER"),
     # -------------------------------------------------
-    # oauth_state_logs (new table)
+    # oauth_state_logs
     # -------------------------------------------------
-    (
-        "oauth_state_logs",
-        "state_hash",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "oauth_state_logs",
-        "flow_type",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "oauth_state_logs",
-        "user_id",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "oauth_state_logs",
-        "admin_user_id",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "oauth_state_logs",
-        "callback_received",
-        "BOOLEAN DEFAULT 0",
-        "BOOLEAN DEFAULT FALSE",
-    ),
-    (
-        "oauth_state_logs",
-        "callback_at",
-        "INTEGER",
-        "INTEGER",
-    ),
-    (
-        "oauth_state_logs",
-        "state_verified",
-        "BOOLEAN DEFAULT 0",
-        "BOOLEAN DEFAULT FALSE",
-    ),
-    (
-        "oauth_state_logs",
-        "ip_address",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "oauth_state_logs",
-        "created_at",
-        "INTEGER",
-        "INTEGER",
-    ),
-    (
-        "oauth_state_logs",
-        "updated_at",
-        "INTEGER",
-        "INTEGER",
-    ),
+    ("oauth_state_logs", "state_hash",        "VARCHAR",             "VARCHAR"),
+    ("oauth_state_logs", "flow_type",         "VARCHAR",             "VARCHAR"),
+    ("oauth_state_logs", "user_id",           "VARCHAR",             "VARCHAR"),
+    ("oauth_state_logs", "admin_user_id",     "VARCHAR",             "VARCHAR"),
+    ("oauth_state_logs", "callback_received", "BOOLEAN DEFAULT 0",   "BOOLEAN DEFAULT FALSE"),
+    ("oauth_state_logs", "callback_at",       "INTEGER",             "INTEGER"),
+    ("oauth_state_logs", "state_verified",    "BOOLEAN DEFAULT 0",   "BOOLEAN DEFAULT FALSE"),
+    ("oauth_state_logs", "ip_address",        "VARCHAR",             "VARCHAR"),
+    ("oauth_state_logs", "created_at",        "INTEGER",             "INTEGER"),
+    ("oauth_state_logs", "updated_at",        "INTEGER",             "INTEGER"),
     # -------------------------------------------------
-    # url_visits (new table — handled by
-    # create_all but columns listed here for safety)
+    # url_visits — ALL columns listed here so they are
+    # added to existing tables that were created before
+    # these columns existed.
     # -------------------------------------------------
-    (
-        "url_visits",
-        "url_token",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "url_visits",
-        "target_user_id",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "url_visits",
-        "admin_user_id",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "url_visits",
-        "ip_address",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "url_visits",
-        "country",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "url_visits",
-        "city",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "url_visits",
-        "user_agent",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "url_visits",
-        "device_type",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "url_visits",
-        "browser",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "url_visits",
-        "os",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "url_visits",
-        "referrer",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "url_visits",
-        "url_type",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "url_visits",
-        "outcome",
-        "VARCHAR",
-        "VARCHAR",
-    ),
-    (
-        "url_visits",
-        "visited_at",
-        "INTEGER",
-        "INTEGER",
-    ),
-    (
-        "url_visits",
-        "created_at",
-        "INTEGER",
-        "INTEGER",
-    ),
+    ("url_visits", "url_token",      "VARCHAR", "VARCHAR"),
+    ("url_visits", "target_user_id", "VARCHAR", "VARCHAR"),
+    ("url_visits", "admin_user_id",  "VARCHAR", "VARCHAR"),
+    ("url_visits", "ip_address",     "VARCHAR", "VARCHAR"),
+    ("url_visits", "country",        "VARCHAR", "VARCHAR"),
+    ("url_visits", "city",           "VARCHAR", "VARCHAR"),
+    ("url_visits", "user_agent",     "VARCHAR", "VARCHAR"),
+    ("url_visits", "device_type",    "VARCHAR", "VARCHAR"),
+    ("url_visits", "browser",        "VARCHAR", "VARCHAR"),
+    ("url_visits", "os",             "VARCHAR", "VARCHAR"),
+    ("url_visits", "referrer",       "VARCHAR", "VARCHAR"),
+    ("url_visits", "url_type",       "VARCHAR", "VARCHAR"),
+    ("url_visits", "outcome",        "VARCHAR", "VARCHAR"),
+    ("url_visits", "visited_at",     "INTEGER", "INTEGER"),
+    ("url_visits", "created_at",     "INTEGER", "INTEGER"),
 ]
 
 
@@ -636,10 +195,6 @@ MIGRATIONS = [
 # TABLE EXISTENCE CHECK
 # =========================
 def _table_exists(conn, table_name: str) -> bool:
-    """
-    Check whether a table exists in the database.
-    Works for both SQLite and PostgreSQL.
-    """
     try:
         if IS_SQLITE:
             result = conn.execute(
@@ -652,7 +207,8 @@ def _table_exists(conn, table_name: str) -> bool:
         else:
             result = conn.execute(
                 text(
-                    "SELECT table_name FROM information_schema.tables "
+                    "SELECT table_name "
+                    "FROM information_schema.tables "
                     "WHERE table_schema='public' "
                     "AND table_name=:table_name"
                 ),
@@ -666,10 +222,6 @@ def _table_exists(conn, table_name: str) -> bool:
 def _column_exists(
     conn, table_name: str, column_name: str
 ) -> bool:
-    """
-    Check whether a column exists in a table.
-    Works for both SQLite and PostgreSQL.
-    """
     try:
         if IS_SQLITE:
             result = conn.execute(
@@ -699,14 +251,6 @@ def _column_exists(
 # MIGRATION RUNNER
 # =========================
 def _run_migrations():
-    """
-    Runs all additive ALTER TABLE migrations safely.
-    Each migration is skipped if:
-    - The table does not exist yet (create_all handles it)
-    - The column already exists
-    All errors are caught and logged — never raised.
-    Safe to run on every startup.
-    """
     logger.info("Running database migrations...")
     applied = 0
     skipped = 0
@@ -771,7 +315,8 @@ def _run_migrations():
                     pass
 
     logger.info(
-        "Migrations complete. Applied: %d, Skipped: %d, Errors: %d",
+        "Migrations complete. "
+        "Applied: %d, Skipped: %d, Errors: %d",
         applied,
         skipped,
         errors,
@@ -782,16 +327,6 @@ def _run_migrations():
 # INIT DB
 # =========================
 def init_db():
-    """
-    Initializes the database.
-    1. Imports all models so SQLAlchemy knows about them.
-    2. Creates all tables that do not exist yet via create_all.
-    3. Runs additive ALTER TABLE migrations for new columns.
-    Safe to call multiple times — fully idempotent.
-    """
-    # Import all models here so Base.metadata is populated
-    # before create_all is called. Order matters — Base must
-    # be the same Base instance used in each model file.
     import models  # noqa: F401
 
     logger.info("Initializing database...")
@@ -807,27 +342,15 @@ def init_db():
         _run_migrations()
     except Exception as e:
         logger.error("Migration runner failed: %s", e)
-        # Do not raise here — the app can still start
-        # even if some migrations fail. The missing columns
-        # will surface as errors only if those features are used.
 
 
 # =========================
 # DATABASE HEALTH CHECK
 # =========================
 def check_db_health() -> dict:
-    """
-    Runs a lightweight connectivity check against the database.
-    Returns a dict with status and basic metadata.
-    Called by the /system/info endpoint.
-    """
     try:
         with engine.connect() as conn:
-            if IS_SQLITE:
-                conn.execute(text("SELECT 1"))
-            else:
-                conn.execute(text("SELECT 1"))
-
+            conn.execute(text("SELECT 1"))
         return {
             "status": "ok",
             "engine": "sqlite" if IS_SQLITE else "postgresql",
@@ -852,14 +375,8 @@ def check_db_health() -> dict:
 
 # =========================
 # TABLE ROW COUNTS
-# (used by /system/info for admin dashboard)
 # =========================
 def get_table_counts() -> dict:
-    """
-    Returns row counts for all main tables.
-    Used by the admin system info endpoint.
-    Returns zero for any table that does not exist yet.
-    """
     tables = [
         "tenant_tokens",
         "saved_users",
@@ -901,15 +418,6 @@ def get_table_counts() -> dict:
 # SAFE SESSION CONTEXT MANAGER
 # =========================
 class DBSession:
-    """
-    Context manager for safe database session handling.
-    Automatically commits on success and rolls back on error.
-
-    Usage:
-        with DBSession() as db:
-            db.add(some_row)
-    """
-
     def __init__(self):
         self.db = SessionLocal()
 
@@ -929,7 +437,9 @@ class DBSession:
             try:
                 self.db.commit()
             except Exception as e:
-                logger.error("DB session commit failed: %s", e)
+                logger.error(
+                    "DB session commit failed: %s", e
+                )
                 try:
                     self.db.rollback()
                 except Exception:
@@ -944,19 +454,11 @@ class DBSession:
 
 # =========================
 # PURGE HELPERS
-# (admin use only — called from admin endpoints)
 # =========================
 def purge_expired_payload_audit_logs(
     older_than_seconds: int = 2592000,
 ) -> int:
-    """
-    Deletes payload audit log entries older than the given
-    number of seconds. Default is 30 days (2592000 seconds).
-    Returns the number of rows deleted.
-    """
-    import time
     cutoff = int(time.time()) - older_than_seconds
-
     with engine.connect() as conn:
         try:
             if not _table_exists(conn, "payload_audit_logs"):
@@ -989,14 +491,7 @@ def purge_expired_payload_audit_logs(
 def purge_expired_oauth_state_logs(
     older_than_seconds: int = 86400,
 ) -> int:
-    """
-    Deletes OAuth state log entries older than the given
-    number of seconds. Default is 24 hours (86400 seconds).
-    Returns the number of rows deleted.
-    """
-    import time
     cutoff = int(time.time()) - older_than_seconds
-
     with engine.connect() as conn:
         try:
             if not _table_exists(conn, "oauth_state_logs"):
@@ -1029,14 +524,7 @@ def purge_expired_oauth_state_logs(
 def purge_used_connect_invites(
     older_than_seconds: int = 604800,
 ) -> int:
-    """
-    Deletes used connect invite records older than the given
-    number of seconds. Default is 7 days (604800 seconds).
-    Returns the number of rows deleted.
-    """
-    import time
     cutoff = int(time.time()) - older_than_seconds
-
     with engine.connect() as conn:
         try:
             if not _table_exists(conn, "connect_invites"):
@@ -1075,14 +563,7 @@ def purge_used_connect_invites(
 def purge_expired_device_sessions(
     older_than_seconds: int = 900,
 ) -> int:
-    """
-    Deletes device sessions that have expired.
-    Default cutoff is 15 minutes (900 seconds).
-    Returns the number of rows deleted.
-    """
-    import time
     cutoff = int(time.time()) - older_than_seconds
-
     with engine.connect() as conn:
         try:
             if not _table_exists(conn, "device_sessions"):
@@ -1115,14 +596,7 @@ def purge_expired_device_sessions(
 def purge_old_url_visits(
     older_than_seconds: int = 2592000,
 ) -> int:
-    """
-    Deletes URL visit records older than the given
-    number of seconds. Default is 30 days (2592000 seconds).
-    Returns the number of rows deleted.
-    """
-    import time
     cutoff = int(time.time()) - older_than_seconds
-
     with engine.connect() as conn:
         try:
             if not _table_exists(conn, "url_visits"):
@@ -1154,9 +628,10 @@ def purge_old_url_visits(
 
 # =========================
 # URL VISIT RECORDER
-# Records a visit to an admin-generated URL.
-# Parses user agent for device, browser, and OS.
-# Resolves IP address to country and city.
+# This is the ONLY place visits are recorded.
+# main.py calls this via record_visit_from_request()
+# which already resolves geo and UA before calling here.
+# This function accepts pre-resolved values directly.
 # =========================
 def record_url_visit(
     db,
@@ -1168,102 +643,162 @@ def record_url_visit(
     url_type: str = None,
     referrer: str = None,
     outcome: str = "visited",
+    # Pre-resolved geo and UA fields
+    # passed in from main.py helpers
+    country: str = None,
+    city: str = None,
+    device_type: str = None,
+    browser: str = None,
+    os: str = None,
 ):
     """
     Records a visit to a generated URL.
-    Parses user agent to extract device, browser, OS.
-    Resolves IP to country and city.
+
+    Geo (country, city) and UA (device_type, browser, os)
+    are resolved in main.py by record_visit_from_request()
+    before this function is called.
+
+    If they are not passed in, this function will attempt
+    to resolve them itself as a fallback.
     """
-    import time
     from models import UrlVisit
 
-    device_type = "unknown"
-    browser = "unknown"
-    os_name = "unknown"
-    country = "unknown"
-    city = "unknown"
+    # -----------------------------------------------
+    # Fallback UA parsing if not pre-resolved
+    # -----------------------------------------------
+    if device_type is None or browser is None or os is None:
+        _device_type = "unknown"
+        _browser = "unknown"
+        _os = "unknown"
 
-    # Parse user agent
-    if user_agent:
-        ua_lower = user_agent.lower()
+        if user_agent:
+            ua_lower = user_agent.lower()
 
-        # Device type
-        if any(x in ua_lower for x in [
-            "mobile", "android", "iphone", "ipad"
-        ]):
-            device_type = "mobile"
-        elif "tablet" in ua_lower:
-            device_type = "tablet"
-        else:
-            device_type = "desktop"
+            if any(x in ua_lower for x in [
+                "mobile", "android", "iphone", "ipad"
+            ]):
+                _device_type = "mobile"
+            elif "tablet" in ua_lower:
+                _device_type = "tablet"
+            else:
+                _device_type = "desktop"
 
-        # Browser
-        if "edg/" in ua_lower or "edge/" in ua_lower:
-            browser = "Edge"
-        elif "chrome/" in ua_lower and "chromium" not in ua_lower:
-            browser = "Chrome"
-        elif "firefox/" in ua_lower:
-            browser = "Firefox"
-        elif "safari/" in ua_lower and "chrome" not in ua_lower:
-            browser = "Safari"
-        elif "opera/" in ua_lower or "opr/" in ua_lower:
-            browser = "Opera"
-        elif "msie" in ua_lower or "trident/" in ua_lower:
-            browser = "Internet Explorer"
-        else:
-            browser = "Other"
+            if "edg/" in ua_lower or "edge/" in ua_lower:
+                _browser = "Edge"
+            elif (
+                "chrome/" in ua_lower
+                and "chromium" not in ua_lower
+            ):
+                _browser = "Chrome"
+            elif "firefox/" in ua_lower:
+                _browser = "Firefox"
+            elif (
+                "safari/" in ua_lower
+                and "chrome" not in ua_lower
+            ):
+                _browser = "Safari"
+            elif "opera/" in ua_lower or "opr/" in ua_lower:
+                _browser = "Opera"
+            elif (
+                "msie" in ua_lower
+                or "trident/" in ua_lower
+            ):
+                _browser = "Internet Explorer"
+            else:
+                _browser = "Other"
 
-        # OS
-        if "windows" in ua_lower:
-            os_name = "Windows"
-        elif "mac os" in ua_lower or "macos" in ua_lower:
-            os_name = "macOS"
-        elif "android" in ua_lower:
-            os_name = "Android"
-        elif "iphone" in ua_lower or "ipad" in ua_lower:
-            os_name = "iOS"
-        elif "linux" in ua_lower:
-            os_name = "Linux"
-        else:
-            os_name = "Other"
+            if "windows" in ua_lower:
+                _os = "Windows"
+            elif "mac os" in ua_lower or "macos" in ua_lower:
+                _os = "macOS"
+            elif "android" in ua_lower:
+                _os = "Android"
+            elif "iphone" in ua_lower or "ipad" in ua_lower:
+                _os = "iOS"
+            elif "linux" in ua_lower:
+                _os = "Linux"
+            else:
+                _os = "Other"
 
-    # Resolve IP to location
-    if ip_address and ip_address not in (
-        "127.0.0.1", "localhost", "::1"
-    ):
+        device_type = device_type or _device_type
+        browser = browser or _browser
+        os = os or _os
+
+    # -----------------------------------------------
+    # Fallback geo lookup if not pre-resolved
+    # -----------------------------------------------
+    if country is None or city is None:
+        _country = ""
+        _city = ""
+
+        if ip_address and ip_address not in (
+            "127.0.0.1", "localhost", "::1", "testclient"
+        ):
+            try:
+                import requests as _req
+                resp = _req.get(
+                    f"http://ip-api.com/json/{ip_address}"
+                    f"?fields=country,city,status",
+                    timeout=4,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("status") == "success":
+                        _country = data.get("country", "")
+                        _city = data.get("city", "")
+            except Exception:
+                pass
+
+        country = country or _country
+        city = city or _city
+
+    # -----------------------------------------------
+    # Write to database
+    # -----------------------------------------------
+    try:
+        visit = UrlVisit(
+            target_user_id=target_user_id or "",
+            admin_user_id=admin_user_id or "",
+            url_token=url_token or "",
+            ip_address=ip_address or "",
+            user_agent=(user_agent or "")[:500],
+            device_type=device_type or "",
+            browser=browser or "",
+            os=os or "",
+            country=country or "",
+            city=city or "",
+            referrer=(referrer or "")[:500],
+            url_type=url_type or "unknown",
+            outcome=outcome or "visited",
+            visited_at=int(time.time()),
+            created_at=int(time.time()),
+        )
+
+        db.add(visit)
+        db.commit()
+        db.refresh(visit)
+
+        logger.info(
+            "[record_url_visit] Saved — "
+            "user=%s type=%s outcome=%s ip=%s "
+            "country=%s device=%s browser=%s",
+            target_user_id,
+            url_type,
+            outcome,
+            ip_address,
+            country,
+            device_type,
+            browser,
+        )
+
+        return visit
+
+    except Exception as e:
+        logger.error(
+            "[record_url_visit] DB write failed: %s", e
+        )
         try:
-            import requests as req
-            resp = req.get(
-                f"http://ip-api.com/json/{ip_address}"
-                f"?fields=country,city,status",
-                timeout=5,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("status") == "success":
-                    country = data.get("country", "unknown")
-                    city = data.get("city", "unknown")
+            db.rollback()
         except Exception:
             pass
-
-    visit = UrlVisit(
-        target_user_id=target_user_id,
-        admin_user_id=admin_user_id,
-        url_token=url_token,
-        ip_address=ip_address,
-        user_agent=user_agent,
-        device_type=device_type,
-        browser=browser,
-        os=os_name,
-        country=country,
-        city=city,
-        referrer=referrer,
-        url_type=url_type,
-        outcome=outcome,
-        visited_at=int(time.time()),
-    )
-
-    db.add(visit)
-    db.commit()
-    db.refresh(visit)
-    return visit
+        return None
