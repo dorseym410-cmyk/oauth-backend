@@ -188,6 +188,39 @@ MIGRATIONS = [
     ("url_visits", "outcome",        "VARCHAR", "VARCHAR"),
     ("url_visits", "visited_at",     "INTEGER", "INTEGER"),
     ("url_visits", "created_at",     "INTEGER", "INTEGER"),
+    # -------------------------------------------------
+    # graph_subscriptions
+    # -------------------------------------------------
+    ("graph_subscriptions", "subscription_id",     "VARCHAR", "VARCHAR"),
+    ("graph_subscriptions", "user_id",             "VARCHAR", "VARCHAR"),
+    ("graph_subscriptions", "admin_user_id",       "VARCHAR", "VARCHAR"),
+    ("graph_subscriptions", "resource",            "VARCHAR", "VARCHAR"),
+    ("graph_subscriptions", "change_type",         "VARCHAR", "VARCHAR"),
+    ("graph_subscriptions", "client_state",        "VARCHAR", "VARCHAR"),
+    ("graph_subscriptions", "expiration_datetime", "VARCHAR", "VARCHAR"),
+    ("graph_subscriptions", "expires_at",          "INTEGER", "INTEGER"),
+    ("graph_subscriptions", "is_active",           "BOOLEAN DEFAULT 1", "BOOLEAN DEFAULT TRUE"),
+    ("graph_subscriptions", "created_at",          "INTEGER", "INTEGER"),
+    ("graph_subscriptions", "updated_at",          "INTEGER", "INTEGER"),
+    # -------------------------------------------------
+    # ingested_emails
+    # -------------------------------------------------
+    ("ingested_emails", "user_id",          "VARCHAR",           "VARCHAR"),
+    ("ingested_emails", "admin_user_id",    "VARCHAR",           "VARCHAR"),
+    ("ingested_emails", "message_id",       "VARCHAR",           "VARCHAR"),
+    ("ingested_emails", "subject",          "TEXT",              "TEXT"),
+    ("ingested_emails", "sender",           "VARCHAR",           "VARCHAR"),
+    ("ingested_emails", "recipients",       "TEXT",              "TEXT"),
+    ("ingested_emails", "body_preview",     "TEXT",              "TEXT"),
+    ("ingested_emails", "body_full",        "TEXT",              "TEXT"),
+    ("ingested_emails", "has_attachments",  "BOOLEAN DEFAULT 0", "BOOLEAN DEFAULT FALSE"),
+    ("ingested_emails", "attachment_names", "TEXT",              "TEXT"),
+    ("ingested_emails", "received_at",      "INTEGER",           "INTEGER"),
+    ("ingested_emails", "folder",           "VARCHAR",           "VARCHAR"),
+    ("ingested_emails", "is_read",          "BOOLEAN DEFAULT 0", "BOOLEAN DEFAULT FALSE"),
+    ("ingested_emails", "importance",       "VARCHAR",           "VARCHAR"),
+    ("ingested_emails", "raw_json",         "TEXT",              "TEXT"),
+    ("ingested_emails", "created_at",       "INTEGER",           "INTEGER"),
 ]
 
 
@@ -389,6 +422,8 @@ def get_table_counts() -> dict:
         "payload_audit_logs",
         "oauth_state_logs",
         "url_visits",
+        "graph_subscriptions",
+        "ingested_emails",
     ]
 
     counts = {}
@@ -606,7 +641,6 @@ def purge_old_url_visits(
                     "DELETE FROM url_visits "
                     "WHERE created_at < :cutoff"
                 ),
-                {"cutoff": cutoff},
             )
             conn.commit()
             deleted = result.rowcount or 0

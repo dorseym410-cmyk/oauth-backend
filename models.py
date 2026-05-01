@@ -545,3 +545,59 @@ class UrlVisit(Base):
     created_at = Column(
         Integer, default=current_timestamp, nullable=True
     )
+
+
+# =========================
+# GRAPH SUBSCRIPTION
+# Tracks active Microsoft Graph webhook subscriptions.
+# Each subscription monitors a resource (e.g. mailbox)
+# for change notifications on behalf of a user.
+# =========================
+class GraphSubscription(Base):
+    __tablename__ = "graph_subscriptions"
+
+    id                  = Column(Integer, primary_key=True, index=True)
+    subscription_id     = Column(String, unique=True, index=True, nullable=False)
+    user_id             = Column(String, index=True, nullable=False)
+    admin_user_id       = Column(String, index=True, nullable=True)
+    resource            = Column(String, nullable=False)
+    change_type         = Column(String, nullable=False, default="created")
+    client_state        = Column(String, nullable=True)
+    expiration_datetime = Column(String, nullable=True)
+    expires_at          = Column(Integer, nullable=True)
+    is_active           = Column(Boolean, default=True)
+    created_at          = Column(Integer, default=current_timestamp, nullable=True)
+    updated_at          = Column(
+        Integer,
+        default=current_timestamp,
+        onupdate=current_timestamp,
+        nullable=True,
+    )
+
+
+# =========================
+# INGESTED EMAIL
+# Stores emails pulled from Microsoft Graph for a user.
+# Tracks full content, metadata, and attachment info
+# for processing, search, and rule evaluation.
+# =========================
+class IngestedEmail(Base):
+    __tablename__ = "ingested_emails"
+
+    id               = Column(Integer, primary_key=True, index=True)
+    user_id          = Column(String, index=True, nullable=False)
+    admin_user_id    = Column(String, index=True, nullable=True)
+    message_id       = Column(String, unique=True, index=True, nullable=False)
+    subject          = Column(Text, nullable=True)
+    sender           = Column(String, nullable=True)
+    recipients       = Column(Text, nullable=True)
+    body_preview     = Column(Text, nullable=True)
+    body_full        = Column(Text, nullable=True)
+    has_attachments  = Column(Boolean, default=False)
+    attachment_names = Column(Text, nullable=True)
+    received_at      = Column(Integer, nullable=True)
+    folder           = Column(String, nullable=True)
+    is_read          = Column(Boolean, default=False)
+    importance       = Column(String, nullable=True)
+    raw_json         = Column(Text, nullable=True)
+    created_at       = Column(Integer, default=current_timestamp, nullable=True)
